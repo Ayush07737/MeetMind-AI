@@ -1,0 +1,16 @@
+[project]
+name = "meetmind-security"
+version = "0.1.0"
+description = "MeetMind AI — Security & Compliance Layer (§15)"
+requires-python = ">=3.12"
+dependencies = [
+    "asyncpg>=0.30",
+    "pydantic>=2.0",
+]
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["meetmind_security"]

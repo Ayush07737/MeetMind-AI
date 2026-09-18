@@ -1,0 +1,19 @@
+{
+  "name": "@meetmind-ai/extension",
+  "version": "0.1.0",
+  "private": true,
+  "description": "MeetMind AI — Chrome/Chromium Extension Capture Adapter (§3)",
+  "type": "module",
+  "scripts": {
+    "build": "tsc",
+    "test": "vitest run",
+    "test:watch": "vitest"
+  },
+  "devDependencies": {
+    "vitest": "^3.0.0",
+    "typescript": "^5.6.0"
+  },
+  "dependencies": {
+    "@meetmind-ai/shared-schemas": "workspace:*"
+  }
+}

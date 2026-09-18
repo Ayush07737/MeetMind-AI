@@ -1,0 +1,20 @@
+{
+  "name": "@meetmind-ai/frontend",
+  "version": "0.1.0",
+  "private": true,
+  "description": "MeetMind AI — Side Panel / Dashboard (§16)",
+  "type": "module",
+  "scripts": {
+    "dev": "echo 'Frontend dev server — not yet configured (§16)'",
+    "build": "tsc",
+    "test": "vitest run",
+    "test:watch": "vitest"
+  },
+  "devDependencies": {
+    "vitest": "^3.0.0",
+    "typescript": "^5.6.0"
+  },
+  "dependencies": {
+    "@meetmind-ai/shared-schemas": "workspace:*"
+  }
+}

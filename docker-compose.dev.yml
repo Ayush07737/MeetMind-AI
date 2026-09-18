@@ -1,0 +1,99 @@
+# =============================================================================
+# MeetMind AI — Local Development Infrastructure
+# =============================================================================
+# Usage:
+#   docker compose -f docker-compose.dev.yml up -d
+#   docker compose -f docker-compose.dev.yml ps       # check health
+#   docker compose -f docker-compose.dev.yml down -v   # teardown + volumes
+# =============================================================================
+
+services:
+  # ── PostgreSQL 16 ──────────────────────────────────────────────────────────
+  postgres:
+    image: postgres:16-alpine
+    container_name: meetmind-postgres
+    restart: unless-stopped
+    ports:
+      - "5432:5432"
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER:-meetmind}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-meetmind_dev}
+      POSTGRES_DB: ${POSTGRES_DB:-meetmind_ai}
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-meetmind} -d ${POSTGRES_DB:-meetmind_ai}"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+    networks:
+      - meetmind-net
+
+  # ── Redis 7 ────────────────────────────────────────────────────────────────
+  redis:
+    image: redis:7-alpine
+    container_name: meetmind-redis
+    restart: unless-stopped
+    ports:
+      - "6379:6379"
+    volumes:
+      - redisdata:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+    networks:
+      - meetmind-net
+
+  # ── Neo4j Community Edition ────────────────────────────────────────────────
+  neo4j:
+    image: neo4j:5-community
+    container_name: meetmind-neo4j
+    restart: unless-stopped
+    ports:
+      - "7474:7474"   # HTTP / Browser
+      - "7687:7687"   # Bolt
+    environment:
+      NEO4J_AUTH: ${NEO4J_USER:-neo4j}/${NEO4J_PASSWORD:-meetmind_neo4j_dev}
+      NEO4J_PLUGINS: '["apoc"]'
+    volumes:
+      - neo4jdata:/data
+      - neo4jlogs:/logs
+    healthcheck:
+      test: ["CMD-SHELL", "wget --quiet --tries=1 --spider http://localhost:7474 || exit 1"]
+      interval: 10s
+      timeout: 10s
+      retries: 10
+      start_period: 30s
+    networks:
+      - meetmind-net
+
+  # ── Qdrant ─────────────────────────────────────────────────────────────────
+  qdrant:
+    image: qdrant/qdrant:latest
+    container_name: meetmind-qdrant
+    restart: unless-stopped
+    ports:
+      - "6333:6333"   # REST API
+      - "6334:6334"   # gRPC
+    volumes:
+      - qdrantdata:/qdrant/storage
+    healthcheck:
+      test: ["CMD-SHELL", "bash -c ':> /dev/tcp/localhost/6333' || exit 1"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+    networks:
+      - meetmind-net
+
+volumes:
+  pgdata:
+  redisdata:
+  neo4jdata:
+  neo4jlogs:
+  qdrantdata:
+
+networks:
+  meetmind-net:
+    driver: bridge

@@ -1,0 +1,57 @@
+# =============================================================================
+# MeetMind AI — Root Python Project Configuration
+# =============================================================================
+# This is a VIRTUAL workspace root. It is not a distributable package.
+# Individual services live under backend/*.
+# Use `uv sync` to install all workspace members.
+# Use `uv run pytest` to run all Python tests.
+# =============================================================================
+
+[tool.uv.workspace]
+members = [
+    "backend/gateway",
+    "backend/asr",
+    "backend/classifier",
+    "backend/orchestration",
+    "backend/decision-genome",
+    "backend/semantic-memory",
+    "backend/agents",
+    "backend/trust-gate",
+    "backend/integrations",
+    "backend/security",
+    "backend/web-enrichment",
+]
+
+[tool.uv]
+dev-dependencies = [
+    "pytest>=8.0",
+    "pytest-asyncio>=0.24",
+    "ruff>=0.8",
+]
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+testpaths = [
+    "backend/gateway/tests",
+    "backend/asr/tests",
+    "backend/classifier/tests",
+    "backend/orchestration/tests",
+    "backend/decision-genome/tests",
+    "backend/semantic-memory/tests",
+    "backend/agents/tests",
+    "backend/trust-gate/tests",
+    "backend/integrations/tests",
+    "backend/security/tests",
+    "backend/web-enrichment/tests",
+]
+
+[tool.ruff]
+line-length = 100
+target-version = "py312"
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP", "B", "SIM"]
+
+[tool.ruff.format]
+quote-style = "double"
+indent-style = "space"

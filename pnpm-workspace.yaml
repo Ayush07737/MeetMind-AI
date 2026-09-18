@@ -1,0 +1,6 @@
+packages:
+  - "extension"
+  - "frontend"
+  - "packages/*"
+allowBuilds:
+  esbuild: true

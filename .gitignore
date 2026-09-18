@@ -1,0 +1,54 @@
+# =============================================================================
+# MeetMind AI — .gitignore
+# =============================================================================
+
+# ---------- Python ----------
+__pycache__/
+*.py[cod]
+*$py.class
+*.egg-info/
+*.egg
+dist/
+build/
+.venv/
+venv/
+*.so
+.mypy_cache/
+.ruff_cache/
+.pytest_cache/
+htmlcov/
+.coverage
+.coverage.*
+coverage.xml
+
+# ---------- Node / TypeScript ----------
+node_modules/
+.pnpm-store/
+*.tsbuildinfo
+dist/
+.next/
+.turbo/
+.vercel/
+
+# ---------- Environment ----------
+.env
+.env.local
+.env.*.local
+!.env.example
+
+# ---------- Docker ----------
+docker-compose.override.yml
+
+# ---------- IDE ----------
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+.DS_Store
+Thumbs.db
+
+# ---------- OS ----------
+*.log
+*.tmp
+*.bak
