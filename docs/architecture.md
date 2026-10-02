@@ -74,56 +74,72 @@ graph TB
 
 ## Build Order
 
-| # | Component | Depends On | Phase |
-|---|-----------|------------|-------|
-| 0 | Development & Operations Standards | None | Foundation |
-| 1 | Backend Ingestion Gateway & WebSocket Core | #0 | Foundation |
-| 2 | Speech-to-Text Streaming Pipeline | #1 | Foundation |
-| 3 | Chrome/Chromium Extension Capture Adapter | #1, #2 | Foundation |
-| 4 | Native Desktop Capture Adapter | #1, #2 | Foundation |
-| 5 | Meeting Bot Capture Adapter | #1, #2 | Foundation |
-| 6 | Trigger Classification Model | #2 | Intelligence |
-| 7 | Agent Orchestration Layer (LangGraph) | #6 | Intelligence |
-| 8 | Decision Genome (Neo4j) | #7 | Intelligence |
-| 9 | Semantic Memory Layer (Qdrant) | #7, #8 | Intelligence |
-| 10 | Pre-Meeting Brief & Battlecard Agent | #8, #9 | Workflow |
-| 11 | Live In-Meeting Strategy Agent | #6, #7, #9 | Workflow |
-| 12 | Post-Meeting Workflow Agents | #7, #8 | Workflow |
-| 13 | Action & Trust Gate | #12 | Workflow |
-| 14 | Integration Fabric (Composio) | #13 | Workflow |
-| 15 | Security & Compliance Layer | Parallel from #0 | Cross-cutting |
-| 16 | Frontend Side Panel / Dashboard | #7, #10, #11, #12, #13 | Cross-cutting |
-| 17 | Web Enrichment Tool | #7, #10, #11 | Cross-cutting |
-| 18 | Advanced Agent Cognition Upgrade | #7, #11 | Cross-cutting |
-| 19 | Domain Pack Framework | #6, #7 | Extensibility |
-| 20 | Engineering Domain Pack | #19 | Extensibility |
+| #   | Component                                  | Depends On             | Phase         |
+| --- | ------------------------------------------ | ---------------------- | ------------- |
+| 0   | Development & Operations Standards         | None                   | Foundation    |
+| 1   | Backend Ingestion Gateway & WebSocket Core | #0                     | Foundation    |
+| 2   | Speech-to-Text Streaming Pipeline          | #1                     | Foundation    |
+| 3   | Chrome/Chromium Extension Capture Adapter  | #1, #2                 | Foundation    |
+| 4   | Native Desktop Capture Adapter             | #1, #2                 | Foundation    |
+| 5   | Meeting Bot Capture Adapter                | #1, #2                 | Foundation    |
+| 6   | Trigger Classification Model               | #2                     | Intelligence  |
+| 7   | Agent Orchestration Layer (LangGraph)      | #6                     | Intelligence  |
+| 8   | Decision Genome (Neo4j)                    | #7                     | Intelligence  |
+| 9   | Semantic Memory Layer (Qdrant)             | #7, #8                 | Intelligence  |
+| 10  | Pre-Meeting Brief & Battlecard Agent       | #8, #9                 | Workflow      |
+| 11  | Live In-Meeting Strategy Agent             | #6, #7, #9             | Workflow      |
+| 12  | Post-Meeting Workflow Agents               | #7, #8                 | Workflow      |
+| 13  | Action & Trust Gate                        | #12                    | Workflow      |
+| 14  | Integration Fabric (Composio)              | #13                    | Workflow      |
+| 15  | Security & Compliance Layer                | Parallel from #0       | Cross-cutting |
+| 16  | Frontend Side Panel / Dashboard            | #7, #10, #11, #12, #13 | Cross-cutting |
+| 17  | Web Enrichment Tool                        | #7, #10, #11           | Cross-cutting |
+| 18  | Advanced Agent Cognition Upgrade           | #7, #11                | Cross-cutting |
+| 19  | Domain Pack Framework                      | #6, #7                 | Extensibility |
+| 20  | Engineering Domain Pack                    | #19                    | Extensibility |
 
 ## Technology Stack
 
-| Layer | Technology | Rationale |
-|-------|------------|-----------|
-| Backend Runtime | Python 3.12+, FastAPI | Async-first, WebSocket native |
-| Agent Orchestration | LangGraph | Stateful agent graphs with checkpointing |
-| Graph Database | Neo4j Community Edition | Decision lineage, relationship-rich queries |
-| Vector Database | Qdrant | Low-latency semantic search |
-| Relational Database | PostgreSQL 16 | ACID compliance, JSONB for flexible payloads |
-| Cache / PubSub | Redis 7 | Session state, real-time event distribution |
-| Authentication | Clerk | Managed auth, JWT validation via backend SDK |
-| Frontend | TypeScript, Vite | Fast builds, HMR, modern tooling |
-| Extension | Chrome Manifest V3 | Cross-browser, service worker based |
-| Python Tooling | uv, ruff, pytest | Fast, deterministic, async-native |
-| JS/TS Tooling | pnpm, ESLint, Prettier, Vitest | Workspace support, consistent formatting |
+| Layer               | Technology                         | Rationale                                              |
+| ------------------- | ---------------------------------- | ------------------------------------------------------ |
+| Backend Runtime     | Python 3.12+, FastAPI              | Async-first, WebSocket native                          |
+| Agent Orchestration | LangGraph                          | Stateful agent graphs with checkpointing               |
+| Graph Database      | Neo4j Community Edition            | Decision lineage, relationship-rich queries            |
+| Vector Database     | Qdrant                             | Low-latency semantic search                            |
+| Relational Database | Neon (managed serverless Postgres) | Zero ops burden, branching for dev/prod, scale-to-zero |
+| Cache / PubSub      | Redis 7                            | Session state, real-time event distribution            |
+| Authentication      | Clerk                              | Managed auth, JWT validation via backend SDK           |
+| Frontend            | TypeScript, Vite                   | Fast builds, HMR, modern tooling                       |
+| Extension           | Chrome Manifest V3                 | Cross-browser, service worker based                    |
+| Python Tooling      | uv, ruff, pytest                   | Fast, deterministic, async-native                      |
+| JS/TS Tooling       | pnpm, ESLint, Prettier, Vitest     | Workspace support, consistent formatting               |
+
+## Database Strategy — Neon
+
+MeetMind AI uses **Neon** (managed serverless Postgres) for all relational data
+in both development and production environments. Local Docker Postgres is NOT used.
+
+**Dev/Prod branching**: Both environments connect to the same Neon project:
+
+- Dev work uses a `dev` branch (via `NEON_DATABASE_URL` in `.env`)
+- Production uses a `prod` branch created from the same project
+- Schema migrations are traceable across both branches
+
+**Per-tenant carve-out**: If a regulated customer requires physical data isolation,
+that one tenant gets a dedicated self-hosted Postgres instance. Every other tenant
+stays on Neon. This is the same pattern as the Decision Genome's tenant isolation —
+a per-customer carve-out, not a platform-wide migration. (See [ADR 003](adr/003-neon-database.md))
 
 ## Multi-Tenancy Strategy
 
-| Infrastructure | Isolation Strategy | Notes |
-|----------------|-------------------|-------|
-| PostgreSQL | Schema-based (`tenant_{id}`) | One schema per tenant within a shared database |
-| Neo4j CE | Namespace-prefixed labels | CE lacks multi-database; upgrade path to Enterprise |
-| Qdrant | Collection-name prefix (`{tenant}_{collection}`) | Logical isolation |
-| Redis | Key prefix (`{tenant}:key`) | Namespace isolation |
+| Infrastructure  | Isolation Strategy                               | Notes                                               |
+| --------------- | ------------------------------------------------ | --------------------------------------------------- |
+| Neon (Postgres) | Schema-based (`tenant_{id}`)                     | One schema per tenant within a shared Neon database |
+| Neo4j CE        | Namespace-prefixed labels                        | CE lacks multi-database; upgrade path to Enterprise |
+| Qdrant          | Collection-name prefix (`{tenant}_{collection}`) | Logical isolation                                   |
+| Redis           | Key prefix (`{tenant}:key`)                      | Namespace isolation                                 |
 
-All services resolve connections through `TenantRouter` in `backend/security/src/tenant.py`.
+All services resolve connections through `TenantRouter` in `backend/security/meetmind_security/tenant.py`.
 
 ## Security Invariants
 
