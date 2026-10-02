@@ -13,15 +13,15 @@
 
 ```
 meetmind-ai/
-├── backend/           # All Python services (one sub-directory per service)
-├── extension/         # Chrome/Chromium Extension (TypeScript)
-├── frontend/          # Dashboard / Side Panel (TypeScript)
-├── packages/          # Shared packages (shared-schemas used by extension + frontend)
-├── ml/                # ML training pipelines
-├── docs/              # Architecture docs, ADRs, security docs
-├── docker-compose.dev.yml
-├── .env.example
-└── (this file)
++-- backend/           # All Python services (one sub-directory per service)
++-- extension/         # Chrome/Chromium Extension (TypeScript)
++-- frontend/          # Dashboard / Side Panel (TypeScript)
++-- packages/          # Shared packages (shared-schemas used by extension + frontend)
++-- ml/                # ML training pipelines
++-- docs/              # Architecture docs, ADRs, security docs
++-- docker-compose.dev.yml
++-- .env.example
++-- (this file)
 ```
 
 The `desktop/` directory (§4 Native Desktop Capture Adapter) is **not scaffolded** until that
@@ -29,28 +29,28 @@ section is actively started. Do not create it preemptively.
 
 ## Package Managers — LOCKED
 
-| Scope | Manager | Reason |
-|-------|---------|--------|
-| Python (all `backend/` services, `ml/`) | `uv` | Speed, lockfile determinism, workspace support |
-| TypeScript/JavaScript (`extension/`, `frontend/`, `packages/`) | `pnpm` | Workspace linking for `shared-schemas` |
+| Scope                                                          | Manager | Reason                                         |
+| -------------------------------------------------------------- | ------- | ---------------------------------------------- |
+| Python (all `backend/` services, `ml/`)                        | `uv`    | Speed, lockfile determinism, workspace support |
+| TypeScript/JavaScript (`extension/`, `frontend/`, `packages/`) | `pnpm`  | Workspace linking for `shared-schemas`         |
 
 **Do not** introduce `pip`, `poetry`, `npm`, or `yarn` anywhere in this repository.
 
 ## Testing Frameworks — LOCKED
 
-| Language | Framework | Notes |
-|----------|-----------|-------|
-| Python | `pytest` + `pytest-asyncio` | `asyncio_mode = "auto"` — matches async FastAPI/WebSocket code |
-| TypeScript | `vitest` | Pairs with Vite-based extension and frontend builds |
+| Language   | Framework                   | Notes                                                          |
+| ---------- | --------------------------- | -------------------------------------------------------------- |
+| Python     | `pytest` + `pytest-asyncio` | `asyncio_mode = "auto"` — matches async FastAPI/WebSocket code |
+| TypeScript | `vitest`                    | Pairs with Vite-based extension and frontend builds            |
 
 **Do not** introduce `unittest`, `jest`, `mocha`, or any other test framework.
 
 ## Lint & Format — LOCKED
 
-| Language | Tools |
-|----------|-------|
-| Python | `ruff` (lint + format) |
-| TypeScript | `eslint` + `prettier` |
+| Language   | Tools                  |
+| ---------- | ---------------------- |
+| Python     | `ruff` (lint + format) |
+| TypeScript | `eslint` + `prettier`  |
 
 ## Authentication
 
@@ -64,7 +64,7 @@ section is actively started. Do not create it preemptively.
 Every service that will eventually need tenant isolation **must** route through the
 `TenantRouter` in `backend/security/meetmind_security/tenant.py` from its very first commit.
 
-- PostgreSQL: schema-based isolation (`tenant_{id}` schemas)
+- Neon (Postgres): schema-based isolation (`tenant_{id}` schemas)
 - Neo4j: namespace-prefixed labels (CE doesn't support multi-database)
 - Qdrant: collection-name prefixes (`{tenant_id}_collection_name`)
 - Redis: key prefixes (`{tenant_id}:key`)
@@ -87,8 +87,20 @@ Every service that will eventually need tenant isolation **must** route through 
   not just verified manually once.
 - Preserve all existing comments and docstrings unrelated to your changes.
 
+## Database — Neon (Managed Serverless Postgres)
+
+- **DEV/PROD**: Both environments use Neon — not local Docker Postgres.
+- `docker-compose.dev.yml` starts **Neo4j + Qdrant + Redis only**.
+- The `NEON_DATABASE_URL` env var points at a Neon "dev" branch for local work.
+- For production, create a separate "prod" branch from the same Neon project
+  (keeps schema migrations traceable across both).
+- If a regulated customer requires physical data isolation, carve out a dedicated
+  self-hosted Postgres instance for that one tenant — don't migrate the whole platform
+  off Neon. (See ADR 003 for the full rationale.)
+
 ## Environment
 
 - Local development: Docker Desktop with WSL2 backend on Windows.
-- `docker-compose.dev.yml` brings up PostgreSQL 16, Redis 7, Neo4j CE, Qdrant.
+- `docker-compose.dev.yml` brings up Redis 7, Neo4j CE, and Qdrant.
+- Neon handles all PostgreSQL needs (dev branch for local, prod branch for deploy).
 - All env vars documented in `.env.example`.

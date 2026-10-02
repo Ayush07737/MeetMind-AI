@@ -1,6 +1,15 @@
 # =============================================================================
-# MeetMind AI — Local Development Infrastructure
+# MeetMind AI - Local Development Infrastructure
 # =============================================================================
+# PostgreSQL is NOT included here. MeetMind AI uses Neon (managed serverless
+# Postgres) for both dev and prod environments. See .env.example for the
+# NEON_DATABASE_URL connection string.
+#
+# This compose file brings up the three services that DO run locally:
+#   - Redis 7        (cache, pub/sub, session state)
+#   - Neo4j CE       (Decision Genome graph database)
+#   - Qdrant         (Semantic Memory vector database)
+#
 # Usage:
 #   docker compose -f docker-compose.dev.yml up -d
 #   docker compose -f docker-compose.dev.yml ps       # check health
@@ -8,28 +17,7 @@
 # =============================================================================
 
 services:
-  # ── PostgreSQL 16 ──────────────────────────────────────────────────────────
-  postgres:
-    image: postgres:16-alpine
-    container_name: meetmind-postgres
-    restart: unless-stopped
-    ports:
-      - "5432:5432"
-    environment:
-      POSTGRES_USER: ${POSTGRES_USER:-meetmind}
-      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-meetmind_dev}
-      POSTGRES_DB: ${POSTGRES_DB:-meetmind_ai}
-    volumes:
-      - pgdata:/var/lib/postgresql/data
-    healthcheck:
-      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-meetmind} -d ${POSTGRES_DB:-meetmind_ai}"]
-      interval: 5s
-      timeout: 5s
-      retries: 5
-    networks:
-      - meetmind-net
-
-  # ── Redis 7 ────────────────────────────────────────────────────────────────
+  # -- Redis 7 ----------------------------------------------------------------
   redis:
     image: redis:7-alpine
     container_name: meetmind-redis
@@ -46,14 +34,14 @@ services:
     networks:
       - meetmind-net
 
-  # ── Neo4j Community Edition ────────────────────────────────────────────────
+  # -- Neo4j Community Edition ------------------------------------------------
   neo4j:
     image: neo4j:5-community
     container_name: meetmind-neo4j
     restart: unless-stopped
     ports:
-      - "7474:7474"   # HTTP / Browser
-      - "7687:7687"   # Bolt
+      - "7474:7474" # HTTP / Browser
+      - "7687:7687" # Bolt
     environment:
       NEO4J_AUTH: ${NEO4J_USER:-neo4j}/${NEO4J_PASSWORD:-meetmind_neo4j_dev}
       NEO4J_PLUGINS: '["apoc"]'
@@ -69,14 +57,14 @@ services:
     networks:
       - meetmind-net
 
-  # ── Qdrant ─────────────────────────────────────────────────────────────────
+  # -- Qdrant ------------------------------------------------------------------
   qdrant:
     image: qdrant/qdrant:latest
     container_name: meetmind-qdrant
     restart: unless-stopped
     ports:
-      - "6333:6333"   # REST API
-      - "6334:6334"   # gRPC
+      - "6333:6333" # REST API
+      - "6334:6334" # gRPC
     volumes:
       - qdrantdata:/qdrant/storage
     healthcheck:
@@ -88,7 +76,6 @@ services:
       - meetmind-net
 
 volumes:
-  pgdata:
   redisdata:
   neo4jdata:
   neo4jlogs:

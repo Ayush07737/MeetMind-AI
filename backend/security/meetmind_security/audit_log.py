@@ -25,13 +25,12 @@ from __future__ import annotations
 
 import json
 import uuid
-from datetime import datetime
+from datetime import UTC, datetime
 from typing import Any
 
 from pydantic import BaseModel, Field
 
 from . import db
-
 
 # ── Pydantic model ──────────────────────────────────────────────────────────
 
@@ -44,7 +43,7 @@ class AuditEvent(BaseModel):
     user_id: str
     event_type: str
     payload: dict[str, Any] = Field(default_factory=dict)
-    created_at: datetime = Field(default_factory=datetime.utcnow)
+    created_at: datetime = Field(default_factory=lambda: datetime.now(UTC))
 
 
 # ── Table initialization ───────────────────────────────────────────────────
@@ -154,7 +153,11 @@ async def query_events_by_type(
             tenant_id=row["tenant_id"],
             user_id=row["user_id"],
             event_type=row["event_type"],
-            payload=row["payload"] if isinstance(row["payload"], dict) else json.loads(row["payload"]),
+            payload=(
+                row["payload"]
+                if isinstance(row["payload"], dict)
+                else json.loads(row["payload"])
+            ),
             created_at=row["created_at"],
         )
         for row in rows

@@ -25,14 +25,12 @@ Table schema::
 from __future__ import annotations
 
 import uuid
-from datetime import datetime
-from typing import Any
+from datetime import UTC, datetime
 
 from pydantic import BaseModel, Field
 
 from . import db
 from .audit_log import write_audit_event
-
 
 # ── Pydantic model ──────────────────────────────────────────────────────────
 
@@ -45,7 +43,7 @@ class ConsentRecord(BaseModel):
     user_id: str
     meeting_id: str
     consent_type: str  # e.g. "audio_capture", "transcript_storage", "ai_analysis"
-    granted_at: datetime = Field(default_factory=datetime.utcnow)
+    granted_at: datetime = Field(default_factory=lambda: datetime.now(UTC))
     revoked_at: datetime | None = None
 
 

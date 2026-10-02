@@ -12,8 +12,6 @@ docker-compose.dev.yml infrastructure.
 
 import inspect
 
-import pytest
-
 from meetmind_security.audit_log import AuditEvent, write_audit_event
 
 
