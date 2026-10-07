@@ -154,9 +154,7 @@ async def query_events_by_type(
             user_id=row["user_id"],
             event_type=row["event_type"],
             payload=(
-                row["payload"]
-                if isinstance(row["payload"], dict)
-                else json.loads(row["payload"])
+                row["payload"] if isinstance(row["payload"], dict) else json.loads(row["payload"])
             ),
             created_at=row["created_at"],
         )

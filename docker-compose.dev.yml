@@ -22,10 +22,9 @@ services:
     image: redis:7-alpine
     container_name: meetmind-redis
     restart: unless-stopped
+    command: ["redis-server", "--save", "", "--appendonly", "no"]
     ports:
       - "6379:6379"
-    volumes:
-      - redisdata:/data
     healthcheck:
       test: ["CMD", "redis-cli", "ping"]
       interval: 5s
@@ -43,7 +42,7 @@ services:
       - "7474:7474" # HTTP / Browser
       - "7687:7687" # Bolt
     environment:
-      NEO4J_AUTH: ${NEO4J_USER:-neo4j}/${NEO4J_PASSWORD:-meetmind_neo4j_dev}
+      NEO4J_AUTH: neo4j/${NEO4J_PASSWORD:-meetmind_neo4j_dev}
       NEO4J_PLUGINS: '["apoc"]'
     volumes:
       - neo4jdata:/data
@@ -76,7 +75,6 @@ services:
       - meetmind-net
 
 volumes:
-  redisdata:
   neo4jdata:
   neo4jlogs:
   qdrantdata:

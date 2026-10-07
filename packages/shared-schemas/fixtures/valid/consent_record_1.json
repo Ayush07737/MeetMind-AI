@@ -1,0 +1,7 @@
+{
+  "tenantId": "tenant_123",
+  "userId": "user_456",
+  "meetingId": "mtg_789",
+  "consentType": "audio_capture",
+  "grantedAt": "2026-10-07T12:00:00Z"
+}

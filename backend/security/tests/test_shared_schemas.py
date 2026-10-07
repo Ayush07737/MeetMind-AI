@@ -6,18 +6,9 @@ Verifies that schemas_py models match the expected contract:
 - Empty tenant_id/user_id are rejected
 """
 
-import sys
-from pathlib import Path
-
 import pytest
+from meetmind_schemas.events import AuditEventSchema, ConsentRecordSchema
 from pydantic import ValidationError
-
-repo_root = Path(__file__).resolve().parents[3]
-shared_schemas_path = repo_root / "packages" / "shared-schemas"
-if str(shared_schemas_path) not in sys.path:
-    sys.path.insert(0, str(shared_schemas_path))
-
-from schemas_py.events import AuditEventSchema, ConsentRecordSchema  # noqa: E402
 
 
 class TestSharedSchemas:

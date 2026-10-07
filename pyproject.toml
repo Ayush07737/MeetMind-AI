@@ -9,6 +9,7 @@
 
 [tool.uv.workspace]
 members = [
+    "packages/shared-schemas/schemas_py",
     "backend/gateway",
     "backend/asr",
     "backend/classifier",
@@ -26,13 +27,19 @@ members = [
 dev-dependencies = [
     "pytest>=8.0",
     "pytest-asyncio>=0.24",
+    "pytest-timeout>=2.3",
     "ruff>=0.8",
     "httpx>=0.27",
 ]
 
 [tool.pytest.ini_options]
 asyncio_mode = "auto"
+timeout = 30
+markers = [
+    "integration: marks tests as integration tests requiring live services",
+]
 testpaths = [
+    "packages/shared-schemas/schemas_py/tests",
     "backend/gateway/tests",
     "backend/asr/tests",
     "backend/classifier/tests",
