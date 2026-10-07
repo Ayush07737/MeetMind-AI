@@ -235,4 +235,41 @@ The current test suite extensively mocks downstream security and storage systems
 
 ## 14. Work Package Baseline Status
 
-*(Work Package definitions and task assignments to be provided by user for subsequent execution steps).*
+* **WP1 — Repo, tooling, infra hygiene**: **PARTIAL**
+  - Git history exists on `main`; `.gitignore` ignores `.env`.
+  - Missing `.gitattributes` (`* text=auto eol=lf`) and `.editorconfig`.
+  - `.prettierignore` does not include `pnpm-lock.yaml`.
+  - `pytest-timeout` is missing; no global timeout in `pyproject.toml`.
+  - `docker-compose.dev.yml`: Redis currently defines `redisdata` volume and has default persistence rather than `--save "" --appendonly no`.
+  - GitHub Actions CI workflow missing integration job with Redis service and Neon test branch.
+  - `packages/shared-schemas/schemas_py` is not an installable uv workspace member (`meetmind_schemas`); gateway currently relies on `sys.path` hacks.
+  - Shared JSON fixture contract test (`fixtures/valid/*.json`, `invalid/*.json`) missing.
+
+* **WP2 — Database layer and audit immutability**: **MISSING / PARTIAL**
+  - No migration tooling or versioned `.sql` files; tables created lazily via runtime `CREATE TABLE IF NOT EXISTS`.
+  - Role separation missing: app connects as database owner with unrestricted DDL/DML.
+  - Immutability triggers missing: UPDATE/DELETE/TRUNCATE permitted on `audit_events` and `consent_records`.
+  - Consent revocation uses in-place `UPDATE` instead of append-only `consent_events` table.
+  - `db.py` evaluates `os.environ` at import time; lacks connection retry/backoff for Neon cold starts; lacks schema name validation (`^[a-z0-9_]{1,48}$`); creates per-tenant pools instead of a shared pool with `tenant_conn(tenant_id)` setting `search_path`.
+  - Audit failure policy: gateway does not fail closed on connection / meeting start / consent audit failures.
+  - Real Neon integration tests (@pytest.mark.integration) missing.
+
+* **WP3 — Authentication rewrite**: **MISSING / PARTIAL**
+  - Production code path uses HS256 fallback with shared secret.
+  - JWKS endpoint configured as Clerk Backend API (`/v1/jwks`) instead of Clerk Frontend API domain; synchronous HTTP call blocks event loop.
+  - Missing `iss` validation, `azp` validation against allowed origins, and `nbf` leeway.
+  - Missing org claim silently falls back to `"default"` tenant.
+  - Authentication token passed via WebSocket URL query string (`?token=`) instead of one-time ticket flow (`POST /v1/ws-ticket` + Redis `GETDEL`).
+  - Pre-accept rejection with code 1008 causes browsers to see generic 1006; needs post-accept custom application close codes (4401, 4403, 4400, etc.).
+  - RS256/JWKS test suite and `scripts/clerk_smoke.py` missing.
+
+* **WP4 — Single-writer lease & sequencing**: **MISSING**
+  - Uses non-atomic `INCR`-then-`XADD` pattern.
+  - Single-writer lease via Redis `SET ... NX EX` missing. Client sequence tracking missing.
+
+* **WP5 — Protocol, frames & close codes**: **PARTIAL**
+  - Pydantic frame models exist, but need alignment with application close codes, ticket authentication, and append-only consent schema.
+
+* **WP6 — Real acceptance test suite (no mocks)**: **MISSING**
+  - Current `test_acceptance_criteria.py` relies 100% on `FakeRedis` and mocked security calls (`AsyncMock`).
+  - Guard test forbidding mocks under `backend/gateway/tests/acceptance/` missing.
