@@ -1,13 +1,14 @@
-"""MeetMind AI — Multi-Tenancy Routing Layer.
+"""MeetMind AI - Multi-Tenancy Routing Layer.
 
 Every service that needs tenant isolation MUST resolve infrastructure connections
-through this router — never via hardcoded connection strings.
+through this router - never via hardcoded connection strings.
 
 Design decisions:
 - Neo4j CE doesn't support multiple databases, so we use namespace-prefixed
   labels/properties within a single database. The routing function returns the
   prefix, not a separate connection.
 - PostgreSQL uses schema-based isolation (one schema per tenant).
+  Schema names are strictly validated against ^[a-z0-9_]{1,48}$ to prevent SQL injection.
 - Qdrant uses collection-name prefixes.
 - Redis uses key prefixes.
 
@@ -17,7 +18,11 @@ Adding tenant #2 is a config change (add an entry to TENANT_CONFIGS), not a rewr
 from __future__ import annotations
 
 import os
+import re
 from dataclasses import dataclass
+
+SCHEMA_NAME_REGEX = re.compile(r"^[a-z0-9_]{1,48}$")
+TENANT_ID_REGEX = re.compile(r"^[a-zA-Z0-9_-]{1,64}$")
 
 
 @dataclass(frozen=True)
@@ -29,20 +34,27 @@ class TenantConfig:
     # PostgreSQL
     pg_schema: str
 
-    # Neo4j — namespace prefix for labels (CE doesn't support multi-database)
+    # Neo4j - namespace prefix for labels (CE doesn't support multi-database)
     neo4j_namespace: str
 
-    # Qdrant — collection name prefix
+    # Qdrant - collection name prefix
     qdrant_prefix: str
 
-    # Redis — key prefix
+    # Redis - key prefix
     redis_prefix: str
 
+    def __post_init__(self) -> None:
+        if not SCHEMA_NAME_REGEX.match(self.pg_schema):
+            raise ValueError(
+                f"Invalid pg_schema '{self.pg_schema}': must match ^[a-z0-9_]{{1,48}}$"
+            )
+        if not TENANT_ID_REGEX.match(self.tenant_id):
+            raise ValueError(
+                f"Invalid tenant_id '{self.tenant_id}': must match ^[a-zA-Z0-9_-]{{1,64}}$"
+            )
 
-# ── Default tenant registry ────────────────────────────────────────────────
-# Currently a single entry. Adding tenant #2 = adding one more entry here
-# (or loading from a database/config service).
 
+# Default tenant registry
 _DEFAULT_TENANT_ID = os.getenv("DEFAULT_TENANT_ID", "default")
 
 TENANT_CONFIGS: dict[str, TenantConfig] = {
@@ -52,6 +64,13 @@ TENANT_CONFIGS: dict[str, TenantConfig] = {
         neo4j_namespace=f"{_DEFAULT_TENANT_ID}",
         qdrant_prefix=f"{_DEFAULT_TENANT_ID}",
         redis_prefix=f"{_DEFAULT_TENANT_ID}",
+    ),
+    "test_tenant": TenantConfig(
+        tenant_id="test_tenant",
+        pg_schema="tenant_test_tenant",
+        neo4j_namespace="test_tenant",
+        qdrant_prefix="test_tenant",
+        redis_prefix="test_tenant",
     ),
 }
 
@@ -78,14 +97,20 @@ class TenantRouter:
     """
 
     def __init__(self, configs: dict[str, TenantConfig] | None = None) -> None:
-        self._configs = configs if configs is not None else TENANT_CONFIGS
+        self._configs = dict(configs) if configs is not None else dict(TENANT_CONFIGS)
 
     def resolve(self, tenant_id: str) -> TenantConfig:
         """Return the TenantConfig for the given tenant_id.
 
         Raises:
+            ValueError: If tenant_id format is invalid or attempts injection.
             TenantNotFoundError: If no config exists for the tenant.
         """
+        if not isinstance(tenant_id, str) or not TENANT_ID_REGEX.match(tenant_id):
+            raise ValueError(
+                f"Invalid tenant identifier '{tenant_id}': must match ^[a-zA-Z0-9_-]{{1,64}}$"
+            )
+
         config = self._configs.get(tenant_id)
         if config is None:
             raise TenantNotFoundError(tenant_id)
@@ -103,19 +128,19 @@ class TenantRouter:
         self._configs[config.tenant_id] = config
 
     def pg_schema(self, tenant_id: str) -> str:
-        """Shortcut: resolve tenant → PostgreSQL schema name."""
+        """Shortcut: resolve tenant -> PostgreSQL schema name."""
         return self.resolve(tenant_id).pg_schema
 
     def neo4j_namespace(self, tenant_id: str) -> str:
-        """Shortcut: resolve tenant → Neo4j label namespace prefix."""
+        """Shortcut: resolve tenant -> Neo4j label namespace prefix."""
         return self.resolve(tenant_id).neo4j_namespace
 
     def qdrant_collection(self, tenant_id: str, base_name: str) -> str:
-        """Shortcut: resolve tenant → full Qdrant collection name."""
+        """Shortcut: resolve tenant -> full Qdrant collection name."""
         prefix = self.resolve(tenant_id).qdrant_prefix
         return f"{prefix}_{base_name}"
 
     def redis_key(self, tenant_id: str, key: str) -> str:
-        """Shortcut: resolve tenant → prefixed Redis key."""
+        """Shortcut: resolve tenant -> prefixed Redis key."""
         prefix = self.resolve(tenant_id).redis_prefix
         return f"{prefix}:{key}"

@@ -15,11 +15,28 @@ export type TenantId = z.infer<typeof TenantIdSchema>;
 
 // ── Consent ─────────────────────────────────────────────────────────────────
 
+export const ConsentTypeSchema = z.enum(["audio_capture", "transcript_storage", "ai_analysis"]);
+export type ConsentType = z.infer<typeof ConsentTypeSchema>;
+
+export const ConsentActionSchema = z.enum(["granted", "revoked"]);
+export type ConsentAction = z.infer<typeof ConsentActionSchema>;
+
+export const ConsentEventSchema = z.object({
+  id: z.string().uuid().optional(),
+  tenantId: TenantIdSchema,
+  userId: z.string().min(1),
+  meetingId: z.string().min(1),
+  consentType: ConsentTypeSchema,
+  action: ConsentActionSchema.default("granted"),
+  createdAt: z.string().datetime().optional(),
+});
+export type ConsentEvent = z.infer<typeof ConsentEventSchema>;
+
 export const ConsentRecordSchema = z.object({
   tenantId: TenantIdSchema,
   userId: z.string().min(1),
   meetingId: z.string().min(1),
-  consentType: z.enum(["audio_capture", "transcript_storage", "ai_analysis"]),
+  consentType: ConsentTypeSchema,
   grantedAt: z.string().datetime(),
   revokedAt: z.string().datetime().nullable().optional(),
 });
@@ -37,3 +54,16 @@ export const AuditEventSchema = z.object({
 });
 
 export type AuditEvent = z.infer<typeof AuditEventSchema>;
+
+// ── WebSocket Close Codes ───────────────────────────────────────────────────
+
+export enum WSCloseCode {
+  NORMAL_CLOSURE = 1000,
+  INTERNAL_ERROR = 1011,
+  PROTOCOL_VIOLATION = 4400,
+  UNAUTHORIZED = 4401,
+  FORBIDDEN = 4403,
+  IDLE_TIMEOUT = 4408,
+  WRITER_CONFLICT = 4409,
+  RATE_LIMITED = 4429,
+}

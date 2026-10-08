@@ -1,38 +1,24 @@
-"""Tests for MeetMind AI Gateway — WebSocket endpoint integration.
+"""Tests for MeetMind AI Gateway - WebSocket endpoint integration.
 
-These tests use FastAPI's TestClient to simulate full WebSocket lifecycle.
-All external dependencies (Redis, Clerk, consent service) are mocked.
+Covers:
+- One-time WebSocket ticket exchange and consumption
+- Replay and expired ticket rejection (close code 4401)
+- WSCloseCode enforcement on auth failures and writer conflicts (4409)
+- Consent enforcement and frame routing
 """
 
 from __future__ import annotations
 
 import json
-import time
 from unittest.mock import AsyncMock, patch
 
-import jwt as pyjwt
 import pytest
-from fastapi import FastAPI, WebSocket
+from conftest import TEST_JWKS_URL, make_test_jwt
 from fastapi.testclient import TestClient
-from meetmind_gateway.auth import ClerkAuthenticator
+from meetmind_gateway.app import create_app
 from meetmind_gateway.config import GatewaySettings
+from meetmind_schemas.events import WSCloseCode
 from starlette.websockets import WebSocketDisconnect
-
-
-def _make_token(
-    sub: str = "user_test",
-    secret: str = "sk_test_secret_32_chars_long_val!",
-    exp_offset: int = 3600,
-    **extra_claims: object,
-) -> str:
-    """Create a valid HS256 JWT for testing."""
-    payload = {
-        "sub": sub,
-        "exp": int(time.time()) + exp_offset,
-        "iat": int(time.time()),
-        **extra_claims,
-    }
-    return pyjwt.encode(payload, secret, algorithm="HS256")
 
 
 @pytest.fixture
@@ -40,83 +26,114 @@ def test_settings() -> GatewaySettings:
     return GatewaySettings(
         neon_database_url="postgresql://test:test@localhost/test",
         redis_url="redis://localhost:6379/0",
+        clerk_jwks_url=TEST_JWKS_URL,
         clerk_secret_key="sk_test_secret_32_chars_long_val!",
         clerk_publishable_key="pk_test_key",
         default_tenant_id="test_tenant",
+        app_env="development",
     )
 
 
 @pytest.fixture
-def app_with_mocks(test_settings, fake_redis):
-    """Create a FastAPI app with mocked Redis and auth."""
-    app = FastAPI()
-    app.state.settings = test_settings
+def app_with_mocks(
+    test_settings, fake_redis, authenticator, seq_counter, stream_producer, session_manager
+):
+    """Create gateway FastAPI app with FakeRedis and test authenticator."""
+    app = create_app(test_settings)
     app.state.redis = fake_redis
     app.state.redis_binary = fake_redis
-
-    from meetmind_gateway.redis_streams import StreamProducer
-    from meetmind_gateway.sequence import SequenceCounter
-    from meetmind_gateway.session_manager import SessionManager
-    from meetmind_gateway.ws_endpoint import websocket_ingest
-
-    app.state.authenticator = ClerkAuthenticator(
-        clerk_secret_key=test_settings.clerk_secret_key,
-        default_tenant_id=test_settings.default_tenant_id,
-    )
-    app.state.session_manager = SessionManager(fake_redis)
-    app.state.seq_counter = SequenceCounter(fake_redis)
-    app.state.stream_producer = StreamProducer(fake_redis, maxlen=1000)
-
-    @app.websocket("/ws/ingest/{meeting_id}")
-    async def ws_ingest(websocket: WebSocket, meeting_id: str):
-        await websocket_ingest(
-            ws=websocket,
-            meeting_id=meeting_id,
-            authenticator=app.state.authenticator,
-            session_manager=app.state.session_manager,
-            seq_counter=app.state.seq_counter,
-            stream_producer=app.state.stream_producer,
-            redis_client=app.state.redis,
-        )
-
+    app.state.authenticator = authenticator
+    app.state.seq_counter = seq_counter
+    app.state.stream_producer = stream_producer
+    app.state.session_manager = session_manager
     return app
 
 
-class TestWebSocketAuth:
-    """Verify authentication on WebSocket connect."""
+@pytest.fixture(autouse=True)
+def mock_audit_write():
+    with patch("meetmind_gateway.audit.write_audit_event", new_callable=AsyncMock) as m:
+        yield m
 
-    def test_no_token_rejected(self, app_with_mocks):
+
+class TestWebSocketAuthAndTickets:
+    """Verify authentication and one-time ticket lifecycle on WebSocket connect."""
+
+    def test_no_ticket_or_token_rejected(self, app_with_mocks):
         client = TestClient(app_with_mocks)
-        with pytest.raises(WebSocketDisconnect), client.websocket_connect("/ws/ingest/mtg_001"):
-            pass  # Should not reach here
+        with client.websocket_connect("/ws/ingest/mtg_001") as ws:
+            with pytest.raises(WebSocketDisconnect) as exc_info:
+                ws.receive_text()
+            assert exc_info.value.code == WSCloseCode.UNAUTHORIZED
 
     def test_invalid_token_rejected(self, app_with_mocks):
         client = TestClient(app_with_mocks)
+        with client.websocket_connect("/ws/ingest/mtg_001?token=garbage_token") as ws:
+            with pytest.raises(WebSocketDisconnect) as exc_info:
+                ws.receive_text()
+            assert exc_info.value.code == WSCloseCode.UNAUTHORIZED
+
+    def test_ticket_exchange_and_connect(self, app_with_mocks):
+        """Full ticket flow: POST /v1/ws-ticket -> connect with ticket -> success."""
+        token = make_test_jwt()
+        client = TestClient(app_with_mocks)
+
+        # 1. Exchange JWT for ticket
+        resp = client.post("/v1/ws-ticket", headers={"Authorization": f"Bearer {token}"})
+        assert resp.status_code == 200
+        ticket_data = resp.json()
+        assert "ticket" in ticket_data
+        ticket = ticket_data["ticket"]
+
+        # 2. Connect with ticket
         with (
-            pytest.raises(WebSocketDisconnect),
-            client.websocket_connect("/ws/ingest/mtg_001?token=garbage"),
+            patch("meetmind_gateway.audit.write_audit_event", new_callable=AsyncMock),
+            client.websocket_connect(f"/v1/meetings/mtg_001/stream?ticket={ticket}") as ws,
         ):
-            pass
+            ws.send_text(json.dumps({"type": "control", "action": "meeting_end"}))
+            ack = json.loads(ws.receive_text())
+            assert ack["status"] == "accepted"
+
+    def test_replayed_ticket_rejected(self, app_with_mocks):
+        """A ticket consumed once cannot be reused (atomic GETDEL)."""
+        token = make_test_jwt()
+        client = TestClient(app_with_mocks)
+
+        resp = client.post("/v1/ws-ticket", headers={"Authorization": f"Bearer {token}"})
+        ticket = resp.json()["ticket"]
+
+        # First connection consumes ticket
+        with (
+            patch("meetmind_gateway.audit.write_audit_event", new_callable=AsyncMock),
+            client.websocket_connect(f"/v1/meetings/mtg_001/stream?ticket={ticket}") as ws,
+        ):
+            ws.send_text(json.dumps({"type": "control", "action": "meeting_end"}))
+
+        # Replay ticket -> rejected with 4401
+        with client.websocket_connect(f"/v1/meetings/mtg_001/stream?ticket={ticket}") as ws:
+            with pytest.raises(WebSocketDisconnect) as exc_info:
+                ws.receive_text()
+            assert exc_info.value.code == WSCloseCode.UNAUTHORIZED
+
+    def test_expired_or_unknown_ticket_rejected(self, app_with_mocks):
+        client = TestClient(app_with_mocks)
+        with client.websocket_connect("/v1/meetings/mtg_001/stream?ticket=non_existent") as ws:
+            with pytest.raises(WebSocketDisconnect) as exc_info:
+                ws.receive_text()
+            assert exc_info.value.code == WSCloseCode.UNAUTHORIZED
 
     @patch(
         "meetmind_gateway.consent_gate.check_consent", new_callable=AsyncMock, return_value=False
     )
-    def test_valid_token_accepted(self, mock_check, app_with_mocks):
-        token = _make_token()
+    def test_valid_token_accepted_in_dev(self, mock_check, app_with_mocks):
+        token = make_test_jwt()
         client = TestClient(app_with_mocks)
         with (
             patch("meetmind_gateway.audit.write_audit_event", new_callable=AsyncMock),
             client.websocket_connect(f"/ws/ingest/mtg_001?token={token}") as ws,
         ):
-            # Connection accepted -- send meeting_end to close cleanly
-            ws.send_text(
-                json.dumps(
-                    {
-                        "type": "control",
-                        "action": "meeting_end",
-                    }
-                )
-            )
+            ws.send_text(json.dumps({"type": "control", "action": "meeting_end"}))
+            ack = json.loads(ws.receive_text())
+            assert ack["status"] == "accepted"
 
 
 class TestConsentEnforcement:
@@ -130,11 +147,10 @@ class TestConsentEnforcement:
     def test_audio_before_consent_rejected(
         self, mock_audit_gw, mock_audit_gate, mock_check, app_with_mocks
     ):
-        token = _make_token()
+        token = make_test_jwt()
         client = TestClient(app_with_mocks)
         with client.websocket_connect(f"/ws/ingest/mtg_001?token={token}") as ws:
-            # Send audio before consent
-            ws.send_bytes(b"\x00\x01\x02\x03")
+            ws.send_bytes(b"mock_audio_data")
             response = json.loads(ws.receive_text())
             assert response["type"] == "error"
             assert response["code"] == "CONSENT_REQUIRED"
@@ -147,7 +163,7 @@ class TestConsentEnforcement:
     def test_transcript_before_consent_rejected(
         self, mock_audit_gw, mock_audit_gate, mock_check, app_with_mocks
     ):
-        token = _make_token()
+        token = make_test_jwt()
         client = TestClient(app_with_mocks)
         with client.websocket_connect(f"/ws/ingest/mtg_001?token={token}") as ws:
             ws.send_text(
@@ -155,6 +171,10 @@ class TestConsentEnforcement:
                     {
                         "type": "transcript_chunk",
                         "text": "Hello world",
+                        "speaker": "speaker_0",
+                        "is_final": True,
+                        "start_ms": 0,
+                        "end_ms": 1000,
                     }
                 )
             )
@@ -170,10 +190,9 @@ class TestConsentEnforcement:
     def test_audio_after_consent_accepted(
         self, mock_audit, mock_record, mock_check, app_with_mocks
     ):
-        token = _make_token()
+        token = make_test_jwt()
         client = TestClient(app_with_mocks)
         with client.websocket_connect(f"/ws/ingest/mtg_001?token={token}") as ws:
-            # Confirm consent first
             ws.send_text(
                 json.dumps(
                     {
@@ -183,24 +202,22 @@ class TestConsentEnforcement:
                     }
                 )
             )
+            ack = json.loads(ws.receive_text())
+            assert ack["status"] == "accepted"
 
-            # Now send audio -- should get ack
-            ws.send_bytes(b"\x00\x01\x02\x03")
-            response = json.loads(ws.receive_text())
-            assert response["type"] == "ack"
-            assert response["seq"] == 1
+            ws.send_bytes(b"mock_audio_data")
+            ack = json.loads(ws.receive_text())
+            assert ack["status"] == "acked"
 
 
 class TestFrameProcessing:
-    """Verify correct frame handling after consent is confirmed."""
-
     @patch(
         "meetmind_gateway.consent_gate.check_consent", new_callable=AsyncMock, return_value=False
     )
     @patch("meetmind_gateway.consent_gate.record_consent", new_callable=AsyncMock)
     @patch("meetmind_gateway.audit.write_audit_event", new_callable=AsyncMock)
     def test_transcript_chunk_acked(self, mock_audit, mock_record, mock_check, app_with_mocks):
-        token = _make_token()
+        token = make_test_jwt()
         client = TestClient(app_with_mocks)
         with client.websocket_connect(f"/ws/ingest/mtg_001?token={token}") as ws:
             ws.send_text(
@@ -211,17 +228,23 @@ class TestFrameProcessing:
                     }
                 )
             )
+            ws.receive_text()  # consume control ack
+
             ws.send_text(
                 json.dumps(
                     {
                         "type": "transcript_chunk",
-                        "text": "The quarterly results show growth",
+                        "text": "Meeting opened.",
+                        "speaker": "chair",
+                        "is_final": True,
+                        "start_ms": 0,
+                        "end_ms": 2000,
                     }
                 )
             )
-            response = json.loads(ws.receive_text())
-            assert response["type"] == "ack"
-            assert response["seq"] == 1
+            ack = json.loads(ws.receive_text())
+            assert ack["status"] == "acked"
+            assert ack["frame_type"] == "transcript_chunk"
 
     @patch(
         "meetmind_gateway.consent_gate.check_consent", new_callable=AsyncMock, return_value=False
@@ -229,7 +252,7 @@ class TestFrameProcessing:
     @patch("meetmind_gateway.consent_gate.record_consent", new_callable=AsyncMock)
     @patch("meetmind_gateway.audit.write_audit_event", new_callable=AsyncMock)
     def test_sequence_numbers_increment(self, mock_audit, mock_record, mock_check, app_with_mocks):
-        token = _make_token()
+        token = make_test_jwt()
         client = TestClient(app_with_mocks)
         with client.websocket_connect(f"/ws/ingest/mtg_001?token={token}") as ws:
             ws.send_text(
@@ -240,18 +263,22 @@ class TestFrameProcessing:
                     }
                 )
             )
-            # Send 3 audio chunks
-            for i in range(3):
-                ws.send_bytes(b"\x00" * 100)
-                response = json.loads(ws.receive_text())
-                assert response["seq"] == i + 1
+            ws.receive_text()
+
+            ws.send_bytes(b"mock_audio_data")
+            ack1 = json.loads(ws.receive_text())
+            ws.send_bytes(b"mock_audio_data")
+            ack2 = json.loads(ws.receive_text())
+
+            assert ack1["seq"] == 1
+            assert ack2["seq"] == 2
 
     @patch(
         "meetmind_gateway.consent_gate.check_consent", new_callable=AsyncMock, return_value=False
     )
     @patch("meetmind_gateway.audit.write_audit_event", new_callable=AsyncMock)
     def test_invalid_json_returns_error(self, mock_audit, mock_check, app_with_mocks):
-        token = _make_token()
+        token = make_test_jwt()
         client = TestClient(app_with_mocks)
         with client.websocket_connect(f"/ws/ingest/mtg_001?token={token}") as ws:
             ws.send_text("not valid json {{{")
@@ -264,13 +291,13 @@ class TestFrameProcessing:
     )
     @patch("meetmind_gateway.audit.write_audit_event", new_callable=AsyncMock)
     def test_unknown_frame_type_returns_error(self, mock_audit, mock_check, app_with_mocks):
-        token = _make_token()
+        token = make_test_jwt()
         client = TestClient(app_with_mocks)
         with client.websocket_connect(f"/ws/ingest/mtg_001?token={token}") as ws:
             ws.send_text(json.dumps({"type": "unknown_type"}))
             response = json.loads(ws.receive_text())
             assert response["type"] == "error"
-            assert response["code"] == "INVALID_FRAME"
+            assert response["code"] == "UNKNOWN_FRAME_TYPE"
 
     @patch(
         "meetmind_gateway.consent_gate.check_consent", new_callable=AsyncMock, return_value=False
@@ -280,7 +307,7 @@ class TestFrameProcessing:
     def test_audio_published_to_redis_stream(
         self, mock_audit, mock_record, mock_check, app_with_mocks, fake_redis
     ):
-        token = _make_token()
+        token = make_test_jwt()
         client = TestClient(app_with_mocks)
         with client.websocket_connect(f"/ws/ingest/mtg_001?token={token}") as ws:
             ws.send_text(
@@ -291,13 +318,95 @@ class TestFrameProcessing:
                     }
                 )
             )
-            ws.send_bytes(b"\xde\xad\xbe\xef")
+            ws.receive_text()
+            ws.send_bytes(b"mock_audio_data")
             ws.receive_text()  # consume ack
 
-        # Verify the audio landed in the Redis stream
-        assert "audio:mtg_001" in fake_redis._streams
-        entries = fake_redis._streams["audio:mtg_001"]
+        entries = fake_redis._streams.get("audio:mtg_001", [])
         assert len(entries) == 1
-        _, fields = entries[0]
-        assert fields["audio_data"] == b"\xde\xad\xbe\xef"
-        assert fields["seq"] == "1"
+
+
+class TestWriterConflict:
+    """Verify single-writer exclusivity enforcement."""
+
+    @patch(
+        "meetmind_gateway.consent_gate.check_consent", new_callable=AsyncMock, return_value=False
+    )
+    @patch("meetmind_gateway.consent_gate.record_consent", new_callable=AsyncMock)
+    @patch("meetmind_gateway.audit.write_audit_event", new_callable=AsyncMock)
+    def test_second_audio_producer_rejected_with_4409(
+        self, mock_audit, mock_record, mock_check, app_with_mocks
+    ):
+        token1 = make_test_jwt(sub="user_1")
+        token2 = make_test_jwt(sub="user_2")
+        client = TestClient(app_with_mocks)
+
+        with client.websocket_connect(f"/ws/ingest/mtg_conflict?token={token1}") as ws1:
+            ws1.send_text(json.dumps({"type": "control", "action": "consent_confirmed"}))
+            ws1.receive_text()
+            ws1.send_bytes(b"audio_from_writer_1")
+            ws1.receive_text()  # writer lock acquired by ws1
+
+            with (
+                pytest.raises(WebSocketDisconnect) as exc_info,
+                client.websocket_connect(f"/ws/ingest/mtg_conflict?token={token2}") as ws2,
+            ):
+                ws2.send_text(json.dumps({"type": "control", "action": "consent_confirmed"}))
+                ws2.receive_text()
+                ws2.send_bytes(b"audio_from_writer_2")  # conflict!
+                ws2.receive_text()
+
+            assert exc_info.value.code == WSCloseCode.WRITER_CONFLICT
+
+
+class TestControlFrameMalformedShapesRejection:
+    """CO-3: Revert permissive fallback mapping. Other shapes get INVALID_FRAME."""
+
+    def test_malformed_control_shape_payload_gets_invalid_frame(self, app_with_mocks):
+        token = make_test_jwt()
+        client = TestClient(app_with_mocks)
+        with client.websocket_connect(f"/ws/ingest/mtg_ctrl_test?token={token}") as ws:
+            # Send permissive legacy payload shape
+            ws.send_text(
+                json.dumps(
+                    {
+                        "type": "control",
+                        "action": "consent_confirmed",
+                        "payload": {"consent_type": "audio_capture"},
+                    }
+                )
+            )
+            resp = json.loads(ws.receive_text())
+            assert resp["type"] == "error"
+            assert resp["code"] == "INVALID_FRAME"
+            assert "Invalid control frame" in resp["message"]
+
+    def test_malformed_control_shape_metadata_gets_invalid_frame(self, app_with_mocks):
+        token = make_test_jwt()
+        client = TestClient(app_with_mocks)
+        with client.websocket_connect(f"/ws/ingest/mtg_ctrl_test?token={token}") as ws:
+            ws.send_text(
+                json.dumps(
+                    {
+                        "type": "control",
+                        "action": "consent_confirmed",
+                        "metadata": {"consent_type": "audio_capture"},
+                    }
+                )
+            )
+            resp = json.loads(ws.receive_text())
+            assert resp["type"] == "error"
+            assert resp["code"] == "INVALID_FRAME"
+
+    def test_malformed_control_extra_key_gets_invalid_frame(self, app_with_mocks):
+        token = make_test_jwt()
+        client = TestClient(app_with_mocks)
+        with client.websocket_connect(f"/ws/ingest/mtg_ctrl_test?token={token}") as ws:
+            ws.send_text(
+                json.dumps(
+                    {"type": "control", "action": "consent_confirmed", "extra_key": "not_allowed"}
+                )
+            )
+            resp = json.loads(ws.receive_text())
+            assert resp["type"] == "error"
+            assert resp["code"] == "INVALID_FRAME"

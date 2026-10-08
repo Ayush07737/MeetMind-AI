@@ -20,6 +20,8 @@ from unittest.mock import AsyncMock, patch
 
 import jwt as pyjwt
 import pytest
+from conftest import TEST_JWKS_URL, make_test_jwt
+from cryptography.hazmat.primitives.asymmetric import rsa
 from fastapi import FastAPI, WebSocket
 from fastapi.testclient import TestClient
 from meetmind_gateway.auth import ClerkAuthenticator
@@ -29,6 +31,7 @@ from meetmind_gateway.redis_streams import EventSubscriber, StreamProducer
 from meetmind_gateway.sequence import SequenceCounter
 from meetmind_gateway.session_manager import SessionManager
 from meetmind_gateway.ws_endpoint import websocket_ingest
+from meetmind_schemas.events import WSCloseCode
 from starlette.websockets import WebSocketDisconnect
 
 SECRET = "sk_test_secret_32_chars_long_val!"
@@ -36,17 +39,10 @@ SECRET = "sk_test_secret_32_chars_long_val!"
 
 def _make_token(
     sub: str = "user_test",
-    secret: str = SECRET,
     exp_offset: int = 3600,
     **extra_claims: object,
 ) -> str:
-    payload = {
-        "sub": sub,
-        "exp": int(time.time()) + exp_offset,
-        "iat": int(time.time()),
-        **extra_claims,
-    }
-    return pyjwt.encode(payload, secret, algorithm="HS256")
+    return make_test_jwt(sub=sub, exp_offset=exp_offset, **extra_claims)
 
 
 def _build_test_app(fake_redis, settings: GatewaySettings | None = None) -> FastAPI:
@@ -54,17 +50,20 @@ def _build_test_app(fake_redis, settings: GatewaySettings | None = None) -> Fast
         settings = GatewaySettings(
             neon_database_url="postgresql://test:test@localhost/test",
             redis_url="redis://localhost:6379/0",
+            clerk_jwks_url=TEST_JWKS_URL,
             clerk_secret_key=SECRET,
             clerk_publishable_key="pk_test_key",
             default_tenant_id="test_tenant",
+            app_env="development",
         )
     app = FastAPI()
     app.state.settings = settings
     app.state.redis = fake_redis
     app.state.redis_binary = fake_redis
     app.state.authenticator = ClerkAuthenticator(
-        clerk_secret_key=settings.clerk_secret_key,
+        jwks_url=settings.clerk_jwks_url,
         default_tenant_id=settings.default_tenant_id,
+        app_env="development",
     )
     app.state.session_manager = SessionManager(fake_redis)
     app.state.seq_counter = SequenceCounter(fake_redis)
@@ -156,7 +155,9 @@ class TestRoutingByFrameShape:
                         }
                     )
                 )
+                ws.receive_text()  # consume meeting_start ack
                 ws.send_text(json.dumps({"type": "control", "action": "consent_confirmed"}))
+                ws.receive_text()  # consume consent_confirmed ack
 
                 # Send binary frame (audio) -> goes to audio stream
                 ws.send_bytes(b"PCM_AUDIO_BYTES_TEST")
@@ -229,7 +230,9 @@ class TestWorkerFailover:
 
         with client_1.websocket_connect(f"/ws/ingest/{meeting_id}?token={token}") as ws1:
             ws1.send_text(json.dumps({"type": "control", "action": "meeting_start"}))
+            ws1.receive_text()
             ws1.send_text(json.dumps({"type": "control", "action": "consent_confirmed"}))
+            ws1.receive_text()
             ws1.send_bytes(b"worker_1_audio_chunk_1")
             ack1 = json.loads(ws1.receive_text())
             assert ack1["seq"] == 1
@@ -343,47 +346,59 @@ class TestSimultaneousListeners:
 # ── 5. Expired/invalid Clerk JWT rejected before any frame processed ─────────
 class TestAuthRejectionBeforeProcessing:
     def test_expired_jwt_rejected_immediately(self, fake_redis):
-        """Expired JWT must be rejected with WebSocketDisconnect code 1008."""
+        """Expired JWT must be rejected with WSCloseCode.UNAUTHORIZED (4401)."""
         app = _build_test_app(fake_redis)
         client = TestClient(app)
         expired_token = _make_token(exp_offset=-100)
 
         with (
+            client.websocket_connect(f"/ws/ingest/mtg_auth_test?token={expired_token}") as ws,
             pytest.raises(WebSocketDisconnect) as exc_info,
-            client.websocket_connect(f"/ws/ingest/mtg_auth_test?token={expired_token}"),
         ):
-            pass
+            ws.receive_text()
 
-        assert exc_info.value.code == 1008
+        assert exc_info.value.code == WSCloseCode.UNAUTHORIZED
         # Ensure session was never created in Redis
         assert "session:mtg_auth_test" not in fake_redis._data
 
     def test_invalid_signature_jwt_rejected_immediately(self, fake_redis):
-        """JWT with wrong secret must be rejected immediately."""
+        """JWT with invalid signature must be rejected immediately with 4401."""
         app = _build_test_app(fake_redis)
         client = TestClient(app)
-        bad_token = _make_token(secret="wrong_secret_32_characters_long!")
+        other_key = rsa.generate_private_key(public_exponent=65537, key_size=2048)
+        payload = {
+            "sub": "user_test",
+            "org_id": "test_tenant",
+            "exp": int(time.time()) + 3600,
+            "iat": int(time.time()),
+        }
+        bad_token = pyjwt.encode(
+            payload,
+            other_key,
+            algorithm="RS256",
+            headers={"kid": "unknown-key"},
+        )
 
         with (
+            client.websocket_connect(f"/ws/ingest/mtg_auth_test?token={bad_token}") as ws,
             pytest.raises(WebSocketDisconnect) as exc_info,
-            client.websocket_connect(f"/ws/ingest/mtg_auth_test?token={bad_token}"),
         ):
-            pass
+            ws.receive_text()
 
-        assert exc_info.value.code == 1008
+        assert exc_info.value.code == WSCloseCode.UNAUTHORIZED
 
     def test_missing_token_rejected_immediately(self, fake_redis):
-        """Connection without token must be rejected immediately."""
+        """Connection without token must be rejected immediately with 4401."""
         app = _build_test_app(fake_redis)
         client = TestClient(app)
 
         with (
+            client.websocket_connect("/ws/ingest/mtg_auth_test") as ws,
             pytest.raises(WebSocketDisconnect) as exc_info,
-            client.websocket_connect("/ws/ingest/mtg_auth_test"),
         ):
-            pass
+            ws.receive_text()
 
-        assert exc_info.value.code == 1008
+        assert exc_info.value.code == WSCloseCode.UNAUTHORIZED
 
 
 # ── 6. Sign-off: Zero domain-specific words in service ────────────────────────

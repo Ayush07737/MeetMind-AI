@@ -1,85 +1,72 @@
-"""MeetMind AI — Consent Record Service.
+"""MeetMind AI - Append-Only Consent Record Service.
 
 Hard invariant: NO audio frame may be processed without a prior logged
-`consent_confirmed` event. This module enforces that invariant by providing:
+`consent_confirmed` event. This module enforces that invariant via an
+APPEND-ONLY `consent_events` table:
 
-1. `record_consent` — grants consent and writes an audit event
-2. `check_consent`  — returns whether active (un-revoked) consent exists
-3. `revoke_consent` — revokes consent and writes an audit event
+1. `record_consent` - grants consent by inserting an event with action='granted'
+2. `check_consent`  - checks if the latest event for (user, meeting, type) is 'granted'
+3. `revoke_consent` - revokes consent by inserting an event with action='revoked'
 
 Every consent state change produces an audit trail via the audit_log module.
-
-Table schema::
-
-    CREATE TABLE IF NOT EXISTS consent_records (
-        id            UUID PRIMARY KEY DEFAULT gen_random_uuid(),
-        tenant_id     TEXT NOT NULL,
-        user_id       TEXT NOT NULL,
-        meeting_id    TEXT NOT NULL,
-        consent_type  TEXT NOT NULL,
-        granted_at    TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-        revoked_at    TIMESTAMPTZ
-    );
+In-database triggers forbid UPDATE and DELETE operations.
 """
 
 from __future__ import annotations
 
 import uuid
 from datetime import UTC, datetime
+from typing import Literal
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, computed_field
 
 from . import db
 from .audit_log import write_audit_event
+from .migrations import apply_migrations
+from .tenant import TenantRouter
 
-# ── Pydantic model ──────────────────────────────────────────────────────────
+_router = TenantRouter()
+
+ConsentAction = Literal["granted", "revoked"]
 
 
-class ConsentRecord(BaseModel):
-    """A consent grant/revocation record."""
+class ConsentEvent(BaseModel):
+    """An immutable consent event record (granted or revoked)."""
 
     id: uuid.UUID = Field(default_factory=uuid.uuid4)
     tenant_id: str
     user_id: str
     meeting_id: str
-    consent_type: str  # e.g. "audio_capture", "transcript_storage", "ai_analysis"
-    granted_at: datetime = Field(default_factory=lambda: datetime.now(UTC))
-    revoked_at: datetime | None = None
+    consent_type: str = "audio_capture"
+    action: ConsentAction = "granted"
+    created_at: datetime = Field(default_factory=lambda: datetime.now(UTC))
+
+    @computed_field
+    @property
+    def granted_at(self) -> datetime:
+        return self.created_at
+
+    @computed_field
+    @property
+    def revoked_at(self) -> datetime | None:
+        return self.created_at if self.action == "revoked" else None
 
 
-# ── Table initialization ───────────────────────────────────────────────────
-
-_CREATE_TABLE_SQL = """
-CREATE TABLE IF NOT EXISTS consent_records (
-    id            UUID PRIMARY KEY DEFAULT gen_random_uuid(),
-    tenant_id     TEXT NOT NULL,
-    user_id       TEXT NOT NULL,
-    meeting_id    TEXT NOT NULL,
-    consent_type  TEXT NOT NULL,
-    granted_at    TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-    revoked_at    TIMESTAMPTZ
-);
-
-CREATE INDEX IF NOT EXISTS idx_consent_records_lookup
-    ON consent_records (tenant_id, user_id, meeting_id, consent_type)
-    WHERE revoked_at IS NULL;
-"""
+# Backward-compatible alias
+ConsentRecord = ConsentEvent
 
 
 async def init_consent_table(tenant_id: str = "default") -> None:
-    """Create the consent_records table if it does not exist.
+    """Ensure consent tables are initialized via the migration runner."""
+    schema = _router.pg_schema(tenant_id)
+    pool = await db.get_pool()
+    await apply_migrations(pool, schema)
 
-    Called once during service startup — idempotent.
-    """
-    await db.execute_raw(_CREATE_TABLE_SQL, tenant_id=tenant_id)
-
-
-# ── Grant consent ──────────────────────────────────────────────────────────
 
 _INSERT_SQL = """
-INSERT INTO consent_records (id, tenant_id, user_id, meeting_id, consent_type, granted_at)
-VALUES ($1, $2, $3, $4, $5, $6)
-RETURNING id, granted_at;
+INSERT INTO consent_events (id, tenant_id, user_id, meeting_id, consent_type, action, created_at)
+VALUES ($1, $2, $3, $4, $5, $6, $7)
+RETURNING id, created_at;
 """
 
 
@@ -89,33 +76,35 @@ async def record_consent(
     user_id: str,
     meeting_id: str,
     consent_type: str = "audio_capture",
-) -> ConsentRecord:
-    """Grant consent and log an audit event.
+) -> ConsentEvent:
+    """Grant consent by appending a new 'granted' event and writing an audit trail.
 
     Returns:
-        The created ConsentRecord.
+        The created ConsentEvent.
     """
-    record = ConsentRecord(
+    event = ConsentEvent(
         tenant_id=tenant_id,
         user_id=user_id,
         meeting_id=meeting_id,
         consent_type=consent_type,
+        action="granted",
     )
 
     row = await db.fetch_one(
         _INSERT_SQL,
-        record.id,
-        record.tenant_id,
-        record.user_id,
-        record.meeting_id,
-        record.consent_type,
-        record.granted_at,
+        event.id,
+        event.tenant_id,
+        event.user_id,
+        event.meeting_id,
+        event.consent_type,
+        event.action,
+        event.created_at,
         tenant_id=tenant_id,
     )
 
     if row:
-        record.id = row["id"]
-        record.granted_at = row["granted_at"]
+        event.id = row["id"]
+        event.created_at = row["created_at"]
 
     # Audit trail
     await write_audit_event(
@@ -125,24 +114,22 @@ async def record_consent(
         payload={
             "meeting_id": meeting_id,
             "consent_type": consent_type,
-            "consent_record_id": str(record.id),
+            "consent_event_id": str(event.id),
         },
     )
 
-    return record
+    return event
 
 
-# ── Check consent ──────────────────────────────────────────────────────────
-
-_CHECK_SQL = """
-SELECT EXISTS (
-    SELECT 1 FROM consent_records
-    WHERE tenant_id = $1
-      AND user_id = $2
-      AND meeting_id = $3
-      AND consent_type = $4
-      AND revoked_at IS NULL
-) AS has_consent;
+_CHECK_LATEST_SQL = """
+SELECT action
+FROM consent_events
+WHERE tenant_id = $1
+  AND user_id = $2
+  AND meeting_id = $3
+  AND consent_type = $4
+ORDER BY created_at DESC, id DESC
+LIMIT 1;
 """
 
 
@@ -153,33 +140,19 @@ async def check_consent(
     meeting_id: str,
     consent_type: str = "audio_capture",
 ) -> bool:
-    """Check whether active (un-revoked) consent exists.
+    """Check whether active consent exists based on the latest event.
 
-    This is the gate that §1's gateway checks before processing any audio frame.
+    Returns True only if the latest event has action='granted'.
     """
     row = await db.fetch_one(
-        _CHECK_SQL,
+        _CHECK_LATEST_SQL,
         tenant_id,
         user_id,
         meeting_id,
         consent_type,
         tenant_id=tenant_id,
     )
-    return bool(row and row["has_consent"])
-
-
-# ── Revoke consent ─────────────────────────────────────────────────────────
-
-_REVOKE_SQL = """
-UPDATE consent_records
-SET revoked_at = NOW()
-WHERE tenant_id = $1
-  AND user_id = $2
-  AND meeting_id = $3
-  AND consent_type = $4
-  AND revoked_at IS NULL
-RETURNING id;
-"""
+    return bool(row and row["action"] == "granted")
 
 
 async def revoke_consent(
@@ -189,21 +162,32 @@ async def revoke_consent(
     meeting_id: str,
     consent_type: str = "audio_capture",
 ) -> list[uuid.UUID]:
-    """Revoke all active consent records matching the criteria.
+    """Revoke consent by appending a new 'revoked' event and writing an audit trail.
 
     Returns:
-        List of revoked consent record IDs.
+        List containing the ID of the newly created revocation event.
     """
-    rows = await db.fetch_all(
-        _REVOKE_SQL,
-        tenant_id,
-        user_id,
-        meeting_id,
-        consent_type,
+    event = ConsentEvent(
+        tenant_id=tenant_id,
+        user_id=user_id,
+        meeting_id=meeting_id,
+        consent_type=consent_type,
+        action="revoked",
+    )
+
+    row = await db.fetch_one(
+        _INSERT_SQL,
+        event.id,
+        event.tenant_id,
+        event.user_id,
+        event.meeting_id,
+        event.consent_type,
+        event.action,
+        event.created_at,
         tenant_id=tenant_id,
     )
 
-    revoked_ids = [row["id"] for row in rows]
+    revoked_id = row["id"] if row else event.id
 
     # Audit trail
     await write_audit_event(
@@ -213,8 +197,8 @@ async def revoke_consent(
         payload={
             "meeting_id": meeting_id,
             "consent_type": consent_type,
-            "revoked_record_ids": [str(rid) for rid in revoked_ids],
+            "consent_event_id": str(revoked_id),
         },
     )
 
-    return revoked_ids
+    return [revoked_id]

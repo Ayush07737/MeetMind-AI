@@ -2,7 +2,7 @@
 
 Tracks active meetings, connected listeners, and meeting state in Redis.
 Supports multiple simultaneous listeners per meeting without duplicating
-upstream processing.
+upstream processing, and enforces single-writer exclusivity.
 """
 
 from __future__ import annotations
@@ -16,11 +16,6 @@ import redis.asyncio as redis
 from .frames import MeetingStatus
 
 logger = logging.getLogger(__name__)
-
-
-@staticmethod
-def _generate_connection_id() -> str:
-    return uuid.uuid4().hex[:12]
 
 
 class MeetingSession:
@@ -48,6 +43,7 @@ class SessionManager:
     Keys used in Redis:
         - ``session:{meeting_id}`` -- hash with meeting metadata + status
         - ``listeners:{meeting_id}`` -- set of connection IDs
+        - ``writer:{meeting_id}`` -- connection ID of current active audio producer
     """
 
     def __init__(self, redis_client: redis.Redis) -> None:
@@ -68,7 +64,6 @@ class SessionManager:
             adapter_type=adapter_type,
         )
 
-        # Store session metadata (HSETNX = don't overwrite if exists)
         session_key = f"session:{meeting_id}"
         existing = await self._redis.exists(session_key)
 
@@ -85,7 +80,6 @@ class SessionManager:
                 },
             )
         else:
-            # Load existing session state
             data = await self._redis.hgetall(session_key)
             if data:
                 session.status = MeetingStatus(
@@ -97,6 +91,26 @@ class SessionManager:
         await self._redis.sadd(f"listeners:{meeting_id}", session.connection_id)
 
         return session
+
+    async def acquire_writer_lock(self, meeting_id: str, connection_id: str) -> bool:
+        """Acquire exclusive writer lock for audio ingestion.
+
+        Returns:
+            True if acquired or already held by connection_id; False if conflict.
+        """
+        key = f"writer:{meeting_id}"
+        current = await self._redis.get(key)
+        if current is None:
+            acquired = await self._redis.set(key, connection_id, nx=True)
+            return bool(acquired)
+        return current == connection_id
+
+    async def release_writer_lock(self, meeting_id: str, connection_id: str) -> None:
+        """Release writer lock if held by this connection."""
+        key = f"writer:{meeting_id}"
+        current = await self._redis.get(key)
+        if current == connection_id:
+            await self._redis.delete(key)
 
     async def update_status(self, meeting_id: str, status: MeetingStatus) -> None:
         """Update the meeting status in Redis."""
@@ -115,7 +129,8 @@ class SessionManager:
         return data if data else None
 
     async def remove_listener(self, meeting_id: str, connection_id: str) -> int:
-        """Remove a listener and return remaining listener count."""
+        """Remove a listener and release writer lock."""
+        await self.release_writer_lock(meeting_id, connection_id)
         await self._redis.srem(f"listeners:{meeting_id}", connection_id)
         return await self._redis.scard(f"listeners:{meeting_id}")
 
@@ -128,5 +143,6 @@ class SessionManager:
         await self._redis.delete(
             f"session:{meeting_id}",
             f"listeners:{meeting_id}",
+            f"writer:{meeting_id}",
             f"seq:{meeting_id}",
         )

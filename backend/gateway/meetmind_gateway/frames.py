@@ -21,7 +21,7 @@ from datetime import UTC, datetime
 from enum import StrEnum
 from typing import Annotated, Any, Literal
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, ConfigDict, Field
 
 # ── Enums ────────────────────────────────────────────────────────────────────
 
@@ -56,6 +56,7 @@ class ErrorCode(StrEnum):
     CONSENT_REQUIRED = "CONSENT_REQUIRED"
     AUTH_FAILED = "AUTH_FAILED"
     INVALID_FRAME = "INVALID_FRAME"
+    UNKNOWN_FRAME_TYPE = "UNKNOWN_FRAME_TYPE"
     MEETING_ENDED = "MEETING_ENDED"
     INTERNAL_ERROR = "INTERNAL_ERROR"
 
@@ -66,11 +67,12 @@ class ErrorCode(StrEnum):
 class ControlFrame(BaseModel):
     """Control frame for meeting lifecycle events."""
 
+    model_config = ConfigDict(extra="forbid")
+
     type: Literal["control"] = "control"
     action: ControlAction
     adapter_type: AdapterType | None = None
     consent_type: str | None = None  # e.g. "audio_capture"
-    metadata: dict[str, Any] = Field(default_factory=dict)
 
 
 class TranscriptChunkFrame(BaseModel):
@@ -107,6 +109,9 @@ class AckFrame(BaseModel):
 
     type: Literal["ack"] = "ack"
     seq: int
+    frame_type: str | None = None
+    status: str = "acked"
+    timestamp: datetime = Field(default_factory=lambda: datetime.now(UTC))
 
 
 class ErrorFrame(BaseModel):

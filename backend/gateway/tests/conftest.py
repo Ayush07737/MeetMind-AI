@@ -3,27 +3,75 @@
 from __future__ import annotations
 
 import asyncio
+import http.server
+import json
+import threading
+import time
 from typing import Any
 
+import jwt as pyjwt
 import pytest
+from cryptography.hazmat.primitives.asymmetric import rsa
+from jwt.algorithms import RSAAlgorithm
 from meetmind_gateway.auth import AuthenticatedUser, ClerkAuthenticator
 from meetmind_gateway.config import GatewaySettings
 from meetmind_gateway.redis_streams import StreamProducer
 from meetmind_gateway.sequence import SequenceCounter
 from meetmind_gateway.session_manager import SessionManager
 
-# ── Fake Redis ───────────────────────────────────────────────────────────────
+# ── Global Test RSA Keys & JWKS Server ────────────────────────────────────────
+
+TEST_RSA_PRIV_KEY = rsa.generate_private_key(public_exponent=65537, key_size=2048)
+_raw_jwk = RSAAlgorithm.to_jwk(TEST_RSA_PRIV_KEY.public_key(), as_dict=True)
+_raw_jwk.update({"kid": "test-key-1", "use": "sig", "alg": "RS256"})
+TEST_RSA_JWK = _raw_jwk
+
+
+class _JWKSHandler(http.server.BaseHTTPRequestHandler):
+    def do_GET(self):
+        self.send_response(200)
+        self.send_header("Content-Type", "application/json")
+        self.end_headers()
+        self.wfile.write(json.dumps({"keys": [TEST_RSA_JWK]}).encode("utf-8"))
+
+    def log_message(self, format, *args):
+        pass
+
+
+_jwks_httpd = http.server.HTTPServer(("127.0.0.1", 0), _JWKSHandler)
+_jwks_port = _jwks_httpd.server_address[1]
+_jwks_thread = threading.Thread(target=_jwks_httpd.serve_forever, daemon=True)
+_jwks_thread.start()
+TEST_JWKS_URL = f"http://127.0.0.1:{_jwks_port}/.well-known/jwks.json"
+
+
+def make_test_jwt(
+    sub: str = "user_test",
+    org_id: str = "test_tenant",
+    exp_offset: int = 3600,
+    **extra_claims: Any,
+) -> str:
+    """Create a valid RS256 JWT signed with the test private key."""
+    payload = {
+        "sub": sub,
+        "org_id": org_id,
+        "exp": int(time.time()) + exp_offset,
+        "iat": int(time.time()),
+        **extra_claims,
+    }
+    return pyjwt.encode(
+        payload,
+        TEST_RSA_PRIV_KEY,
+        algorithm="RS256",
+        headers={"kid": "test-key-1"},
+    )
+
+
+# ── Fake Redis ────────────────────────────────────────────────────────────────
 
 
 class FakeRedis:
-    """Minimal in-memory Redis mock for unit tests.
-
-    Supports: GET, SET, INCR, DELETE, EXISTS,
-              HSET, HGET, HGETALL, HSETNX,
-              SADD, SREM, SCARD,
-              XADD, XGROUP_CREATE,
-              PUBSUB (subscribe/publish)
-    """
+    """Minimal in-memory Redis mock for unit tests."""
 
     def __init__(self) -> None:
         self._data: dict[str, Any] = {}
@@ -34,8 +82,28 @@ class FakeRedis:
     async def get(self, key: str) -> str | None:
         return self._data.get(key)
 
-    async def set(self, key: str, value: Any) -> None:
+    async def getdel(self, key: str) -> str | None:
+        val = self._data.get(key)
+        if key in self._data:
+            del self._data[key]
+        return val
+
+    async def set(
+        self,
+        key: str,
+        value: Any,
+        ex: int | None = None,
+        nx: bool = False,
+    ) -> bool:
+        if nx and key in self._data:
+            return False
         self._data[key] = str(value)
+        return True
+
+    async def execute_command(self, cmd: str, *args: Any) -> Any:
+        if cmd.upper() == "GETDEL":
+            return await self.getdel(args[0])
+        raise NotImplementedError(f"FakeRedis doesn't support command {cmd}")
 
     async def incr(self, key: str) -> int:
         val = int(self._data.get(key, 0)) + 1
@@ -57,7 +125,11 @@ class FakeRedis:
         return 1 if key in self._data else 0
 
     async def hset(
-        self, key: str, field: str | None = None, value: Any = None, mapping: dict | None = None
+        self,
+        key: str,
+        field: str | None = None,
+        value: Any = None,
+        mapping: dict | None = None,
     ) -> int:
         if key not in self._data:
             self._data[key] = {}
@@ -168,22 +240,25 @@ def fake_redis() -> FakeRedis:
 
 @pytest.fixture
 def settings() -> GatewaySettings:
-    """Return test settings (no real env vars needed)."""
+    """Return test settings configured with local test JWKS."""
     return GatewaySettings(
         neon_database_url="postgresql://test:test@localhost/test",
         redis_url="redis://localhost:6379/0",
+        clerk_jwks_url=TEST_JWKS_URL,
         clerk_secret_key="sk_test_fake_key_for_testing",
         clerk_publishable_key="pk_test_fake_key_for_testing",
         default_tenant_id="test_tenant",
+        app_env="development",
     )
 
 
 @pytest.fixture
 def authenticator(settings: GatewaySettings) -> ClerkAuthenticator:
-    """Return a ClerkAuthenticator with test settings."""
+    """Return a ClerkAuthenticator pointing to the local test JWKS server."""
     return ClerkAuthenticator(
-        clerk_secret_key=settings.clerk_secret_key,
+        jwks_url=settings.clerk_jwks_url,
         default_tenant_id=settings.default_tenant_id,
+        app_env="development",
     )
 
 

@@ -29,8 +29,9 @@ class SequenceCounter:
         return f"{self.KEY_PREFIX}:{meeting_id}"
 
     async def next(self, meeting_id: str) -> int:
-        """Return the next sequence number for the given meeting."""
         return await self._redis.incr(self._key(meeting_id))
+
+    next_seq = next
 
     async def current(self, meeting_id: str) -> int:
         """Return the current sequence number (0 if no frames yet)."""

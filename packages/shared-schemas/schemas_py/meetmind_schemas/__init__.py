@@ -4,11 +4,12 @@ Pydantic models that mirror the Zod schemas in src/index.ts.
 These are the canonical Python-side contracts shared across backend services.
 """
 
-from .events import AuditEventSchema, ConsentRecordSchema, ConsentType, TenantId
+from .events import AuditEventSchema, ConsentRecordSchema, ConsentType, TenantId, WSCloseCode
 
 __all__ = [
     "AuditEventSchema",
     "ConsentRecordSchema",
     "ConsentType",
     "TenantId",
+    "WSCloseCode",
 ]

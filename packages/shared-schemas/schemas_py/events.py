@@ -3,6 +3,7 @@ from meetmind_schemas.events import (
     ConsentRecordSchema,
     ConsentType,
     TenantId,
+    WSCloseCode,
 )
 
 __all__ = [
@@ -10,4 +11,5 @@ __all__ = [
     "ConsentRecordSchema",
     "ConsentType",
     "TenantId",
+    "WSCloseCode",
 ]

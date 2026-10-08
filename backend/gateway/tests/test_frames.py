@@ -52,6 +52,65 @@ class TestControlFrame:
         with pytest.raises(ValidationError):
             ControlFrame(action="invalid_action")
 
+    def test_malformed_shape_with_payload_rejected_by_extra_forbid(self):
+        """CO-3: Legacy or fallback payload dict must be rejected with ValidationError."""
+        with pytest.raises(ValidationError) as exc:
+            ControlFrame.model_validate(
+                {
+                    "type": "control",
+                    "action": "consent_confirmed",
+                    "payload": {"consent_type": "audio_capture"},
+                }
+            )
+        assert "Extra inputs are not permitted" in str(exc.value)
+
+    def test_malformed_shape_with_metadata_rejected_by_extra_forbid(self):
+        """CO-3: Metadata dict on ControlFrame must be rejected."""
+        with pytest.raises(ValidationError) as exc:
+            ControlFrame.model_validate(
+                {
+                    "type": "control",
+                    "action": "consent_confirmed",
+                    "metadata": {"consent_type": "audio_capture"},
+                }
+            )
+        assert "Extra inputs are not permitted" in str(exc.value)
+
+    def test_malformed_shape_with_extra_field_rejected(self):
+        """CO-3: Arbitrary extra keys must be rejected."""
+        with pytest.raises(ValidationError) as exc:
+            ControlFrame.model_validate(
+                {
+                    "type": "control",
+                    "action": "consent_confirmed",
+                    "unknown_field": "disallowed",
+                }
+            )
+        assert "Extra inputs are not permitted" in str(exc.value)
+
+    def test_malformed_shape_missing_action_rejected(self):
+        """CO-3: Control frame without action field must be rejected."""
+        with pytest.raises(ValidationError) as exc:
+            ControlFrame.model_validate(
+                {
+                    "type": "control",
+                    "consent_type": "audio_capture",
+                }
+            )
+        assert "Field required" in str(exc.value)
+
+    def test_canonical_consent_confirmed_accepted(self):
+        """CO-3: Canonical shape with action and optional consent_type is accepted."""
+        frame = ControlFrame.model_validate(
+            {
+                "type": "control",
+                "action": "consent_confirmed",
+                "consent_type": "audio_capture",
+            }
+        )
+        assert frame.action == ControlAction.CONSENT_CONFIRMED
+        assert frame.consent_type == "audio_capture"
+
 
 class TestTranscriptChunkFrame:
     def test_create_transcript(self):

@@ -62,15 +62,23 @@ class ConsentGate:
 
     async def check_existing_consent(self, consent_type: str = "audio_capture") -> bool:
         """Check if consent was already granted (e.g. on reconnect)."""
-        has_consent = await check_consent(
-            tenant_id=self.tenant_id,
-            user_id=self.user_id,
-            meeting_id=self.meeting_id,
-            consent_type=consent_type,
-        )
-        if has_consent:
-            self._consented = True
-        return has_consent
+        try:
+            has_consent = await check_consent(
+                tenant_id=self.tenant_id,
+                user_id=self.user_id,
+                meeting_id=self.meeting_id,
+                consent_type=consent_type,
+            )
+            if has_consent:
+                self._consented = True
+            return has_consent
+        except Exception as exc:
+            logger.warning(
+                "Failed to check existing consent from DB: %s",
+                exc,
+                extra={"meeting_id": self.meeting_id},
+            )
+            return False
 
     async def reject_frame(self, frame_type: str) -> None:
         """Log a rejected frame due to missing consent."""
