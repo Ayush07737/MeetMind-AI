@@ -1,0 +1,9 @@
+{
+  "tenantId": "tenant_123",
+  "userId": "user_456",
+  "eventType": "meeting_start",
+  "payload": {
+    "meetingId": "mtg_789"
+  },
+  "createdAt": "2026-10-07T12:00:00Z"
+}

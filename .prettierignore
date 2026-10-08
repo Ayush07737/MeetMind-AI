@@ -1,0 +1,12 @@
+node_modules
+dist
+build
+.venv
+.pytest_cache
+.ruff_cache
+pnpm-lock.yaml
+uv.lock
+*.py
+*.pyc
+.git
+.github

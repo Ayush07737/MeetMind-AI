@@ -1,24 +1,13 @@
-"""MeetMind AI — Append-Only Audit Log.
+"""MeetMind AI - Append-Only Audit Log.
 
 The audit_events table is APPEND-ONLY by design:
-- Only INSERT is exposed via `write_audit_event`.
+- Only INSERT is exposed via ``write_audit_event``.
 - No UPDATE or DELETE function exists in this module.
-- The table is created with no foreign keys to avoid coupling.
+- In-database triggers prevent modification or deletion even for privileged roles.
+- Schema creation is managed exclusively by the migrations runner.
 
 This is a hard security invariant: every state-changing operation in MeetMind AI
-must produce an audit event, and no audit event can ever be modified or deleted
-through the application layer.
-
-Table schema::
-
-    CREATE TABLE IF NOT EXISTS audit_events (
-        id            UUID PRIMARY KEY DEFAULT gen_random_uuid(),
-        tenant_id     TEXT NOT NULL,
-        user_id       TEXT NOT NULL,
-        event_type    TEXT NOT NULL,
-        payload       JSONB NOT NULL DEFAULT '{}',
-        created_at    TIMESTAMPTZ NOT NULL DEFAULT NOW()
-    );
+must produce an audit event, and no audit event can ever be modified or deleted.
 """
 
 from __future__ import annotations
@@ -31,8 +20,10 @@ from typing import Any
 from pydantic import BaseModel, Field
 
 from . import db
+from .migrations import apply_migrations
+from .tenant import TenantRouter
 
-# ── Pydantic model ──────────────────────────────────────────────────────────
+_router = TenantRouter()
 
 
 class AuditEvent(BaseModel):
@@ -46,38 +37,15 @@ class AuditEvent(BaseModel):
     created_at: datetime = Field(default_factory=lambda: datetime.now(UTC))
 
 
-# ── Table initialization ───────────────────────────────────────────────────
-
-_CREATE_TABLE_SQL = """
-CREATE TABLE IF NOT EXISTS audit_events (
-    id            UUID PRIMARY KEY DEFAULT gen_random_uuid(),
-    tenant_id     TEXT NOT NULL,
-    user_id       TEXT NOT NULL,
-    event_type    TEXT NOT NULL,
-    payload       JSONB NOT NULL DEFAULT '{}',
-    created_at    TIMESTAMPTZ NOT NULL DEFAULT NOW()
-);
-
-CREATE INDEX IF NOT EXISTS idx_audit_events_tenant
-    ON audit_events (tenant_id, created_at DESC);
-
-CREATE INDEX IF NOT EXISTS idx_audit_events_user
-    ON audit_events (tenant_id, user_id, created_at DESC);
-
-CREATE INDEX IF NOT EXISTS idx_audit_events_type
-    ON audit_events (event_type, created_at DESC);
-"""
-
-
 async def init_audit_table(tenant_id: str = "default") -> None:
-    """Create the audit_events table if it does not exist.
+    """Ensure audit tables are initialized via the migration runner.
 
-    Called once during service startup — idempotent.
+    Applies pending schema migrations for the tenant if needed.
     """
-    await db.execute_raw(_CREATE_TABLE_SQL, tenant_id=tenant_id)
+    schema = _router.pg_schema(tenant_id)
+    pool = await db.get_pool()
+    await apply_migrations(pool, schema)
 
-
-# ── Write (INSERT only — no UPDATE, no DELETE) ─────────────────────────────
 
 _INSERT_SQL = """
 INSERT INTO audit_events (id, tenant_id, user_id, event_type, payload, created_at)
@@ -123,8 +91,6 @@ async def write_audit_event(
     return event
 
 
-# ── Read (for verification / compliance queries) ───────────────────────────
-
 _QUERY_BY_TYPE_SQL = """
 SELECT id, tenant_id, user_id, event_type, payload, created_at
 FROM audit_events
@@ -139,7 +105,7 @@ async def query_events_by_type(
     event_type: str,
     limit: int = 100,
 ) -> list[AuditEvent]:
-    """Query audit events by type (for compliance dashboards)."""
+    """Query audit events by type (for compliance verification)."""
     rows = await db.fetch_all(
         _QUERY_BY_TYPE_SQL,
         tenant_id,
@@ -154,9 +120,7 @@ async def query_events_by_type(
             user_id=row["user_id"],
             event_type=row["event_type"],
             payload=(
-                row["payload"]
-                if isinstance(row["payload"], dict)
-                else json.loads(row["payload"])
+                row["payload"] if isinstance(row["payload"], dict) else json.loads(row["payload"])
             ),
             created_at=row["created_at"],
         )
