@@ -188,7 +188,7 @@ class TestRoutingByFrameShape:
 
     def test_ast_check_no_adapter_type_branching_in_ws_endpoint(self):
         """Static analysis: AST check verifying no conditional branch on adapter_type."""
-        endpoint_path = Path(r"E:\MeetMind AI\backend\gateway\meetmind_gateway\ws_endpoint.py")
+        endpoint_path = Path(__file__).resolve().parents[1] / "meetmind_gateway" / "ws_endpoint.py"
         tree = ast.parse(endpoint_path.read_text(encoding="utf-8"))
 
         class AdapterBranchVisitor(ast.NodeVisitor):
@@ -438,7 +438,7 @@ class TestDomainAgnosticSignOff:
             "clinical_trial",
         ]
 
-        src_dir = Path(r"E:\MeetMind AI\backend\gateway\meetmind_gateway")
+        src_dir = Path(__file__).resolve().parents[1] / "meetmind_gateway"
         matched = []
 
         for py_file in src_dir.glob("*.py"):

@@ -35,6 +35,10 @@ dev-dependencies = [
 [tool.pytest.ini_options]
 asyncio_mode = "auto"
 timeout = 30
+pythonpath = [
+    ".",
+    "backend/gateway/tests",
+]
 markers = [
     "integration: marks tests as integration tests requiring live services",
 ]
