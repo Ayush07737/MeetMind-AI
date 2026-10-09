@@ -1,0 +1,85 @@
+{
+  "valid_control": [
+    {
+      "type": "control",
+      "action": "meeting_start",
+      "adapter_type": "chrome_extension"
+    },
+    {
+      "type": "control",
+      "action": "meeting_end"
+    },
+    {
+      "type": "control",
+      "action": "consent_confirmed",
+      "consent_type": "audio_capture",
+      "external_participants": true,
+      "jurisdiction_hint": "US-CA",
+      "consent_text_version": "v1.0",
+      "client_version": "1.2.3"
+    }
+  ],
+  "invalid_control": [
+    {
+      "description": "Missing external_participants in consent_confirmed",
+      "frame": {
+        "type": "control",
+        "action": "consent_confirmed",
+        "consent_text_version": "v1.0",
+        "client_version": "1.2.3"
+      }
+    },
+    {
+      "description": "Consent fields present in meeting_start",
+      "frame": {
+        "type": "control",
+        "action": "meeting_start",
+        "external_participants": true,
+        "consent_text_version": "v1.0",
+        "client_version": "1.0.0"
+      }
+    },
+    {
+      "description": "Extra unexpected field in meeting_end",
+      "frame": {
+        "type": "control",
+        "action": "meeting_end",
+        "extra_bad_field": 123
+      }
+    }
+  ],
+  "valid_transcript": [
+    {
+      "type": "transcript_chunk",
+      "text": "Hello world transcription test",
+      "client_seq": 10,
+      "timestamp_ms": 1728470000000
+    }
+  ],
+  "valid_ack": [
+    {
+      "type": "ack",
+      "seq": 10,
+      "frame_type": "transcript_chunk",
+      "status": "acked"
+    }
+  ],
+  "valid_error": [
+    {
+      "type": "error",
+      "code": "CONSENT_REQUIRED",
+      "message": "Consent has not been confirmed"
+    }
+  ],
+  "valid_intelligence": [
+    {
+      "type": "intelligence_event",
+      "event_type": "action_item",
+      "payload": {
+        "assignee": "Ayush",
+        "task": "Ship Session C1"
+      },
+      "meeting_id": "meet_123"
+    }
+  ]
+}

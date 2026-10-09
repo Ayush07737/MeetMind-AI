@@ -25,7 +25,10 @@ async def test_real_uvicorn_ws_handshake_succeeds_then_receives_4401():
     settings = GatewaySettings(
         neon_database_url="postgresql://localhost/test",
         redis_url="redis://localhost:6379/0",
-        app_env="production",
+        app_env="test",
+        clerk_jwks_url="https://clerk.meetmind.ai/.well-known/jwks.json",
+        clerk_issuer="https://clerk.meetmind.ai",
+        allowed_origins=["https://app.meetmind.ai"],
         allow_token_in_dev=False,
     )
     app = create_app(settings)
@@ -36,10 +39,11 @@ async def test_real_uvicorn_ws_handshake_succeeds_then_receives_4401():
     thread.start()
 
     # Wait for uvicorn server to start
-    for _ in range(50):
+    for _ in range(120):
         if server.started:
             break
         await asyncio.sleep(0.05)
+    assert server.started, "Uvicorn server failed to start within timeout"
 
     try:
         uri = f"ws://127.0.0.1:{port}/ws/ingest/real_uvicorn_test"

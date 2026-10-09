@@ -3,69 +3,17 @@
 from __future__ import annotations
 
 import asyncio
-import http.server
-import json
-import threading
-import time
 from typing import Any
 
-import jwt as pyjwt
 import pytest
-from cryptography.hazmat.primitives.asymmetric import rsa
-from jwt.algorithms import RSAAlgorithm
 from meetmind_gateway.auth import AuthenticatedUser, ClerkAuthenticator
 from meetmind_gateway.config import GatewaySettings
 from meetmind_gateway.redis_streams import StreamProducer
 from meetmind_gateway.sequence import SequenceCounter
 from meetmind_gateway.session_manager import SessionManager
-
-# ── Global Test RSA Keys & JWKS Server ────────────────────────────────────────
-
-TEST_RSA_PRIV_KEY = rsa.generate_private_key(public_exponent=65537, key_size=2048)
-_raw_jwk = RSAAlgorithm.to_jwk(TEST_RSA_PRIV_KEY.public_key(), as_dict=True)
-_raw_jwk.update({"kid": "test-key-1", "use": "sig", "alg": "RS256"})
-TEST_RSA_JWK = _raw_jwk
-
-
-class _JWKSHandler(http.server.BaseHTTPRequestHandler):
-    def do_GET(self):
-        self.send_response(200)
-        self.send_header("Content-Type", "application/json")
-        self.end_headers()
-        self.wfile.write(json.dumps({"keys": [TEST_RSA_JWK]}).encode("utf-8"))
-
-    def log_message(self, format, *args):
-        pass
-
-
-_jwks_httpd = http.server.HTTPServer(("127.0.0.1", 0), _JWKSHandler)
-_jwks_port = _jwks_httpd.server_address[1]
-_jwks_thread = threading.Thread(target=_jwks_httpd.serve_forever, daemon=True)
-_jwks_thread.start()
-TEST_JWKS_URL = f"http://127.0.0.1:{_jwks_port}/.well-known/jwks.json"
-
-
-def make_test_jwt(
-    sub: str = "user_test",
-    org_id: str = "test_tenant",
-    exp_offset: int = 3600,
-    **extra_claims: Any,
-) -> str:
-    """Create a valid RS256 JWT signed with the test private key."""
-    payload = {
-        "sub": sub,
-        "org_id": org_id,
-        "exp": int(time.time()) + exp_offset,
-        "iat": int(time.time()),
-        **extra_claims,
-    }
-    return pyjwt.encode(
-        payload,
-        TEST_RSA_PRIV_KEY,
-        algorithm="RS256",
-        headers={"kid": "test-key-1"},
-    )
-
+from tests.jwt_test_utils import (
+    TEST_JWKS_URL,
+)
 
 # ── Fake Redis ────────────────────────────────────────────────────────────────
 
@@ -77,6 +25,7 @@ class FakeRedis:
         self._data: dict[str, Any] = {}
         self._streams: dict[str, list[tuple[str, dict]]] = {}
         self._stream_counter: dict[str, int] = {}
+        self._dollar_cursors: dict[str, str] = {}
         self._pubsub_channels: dict[str, list] = {}
 
     async def get(self, key: str) -> str | None:
@@ -93,12 +42,19 @@ class FakeRedis:
         key: str,
         value: Any,
         ex: int | None = None,
+        px: int | None = None,
         nx: bool = False,
     ) -> bool:
         if nx and key in self._data:
             return False
         self._data[key] = str(value)
         return True
+
+    async def expire(self, key: str, time: int) -> bool:
+        return key in self._data
+
+    async def pexpire(self, key: str, time: int) -> bool:
+        return key in self._data
 
     async def execute_command(self, cmd: str, *args: Any) -> Any:
         if cmd.upper() == "GETDEL":
@@ -178,11 +134,50 @@ class FakeRedis:
             self._streams[stream] = self._streams[stream][-maxlen:]
         return entry_id
 
+    async def xrevrange(
+        self, stream: str, max: str = "+", min: str = "-", count: int | None = None
+    ) -> list[tuple[str, dict]]:
+        entries = self._streams.get(stream, [])
+        rev = list(reversed(entries))
+        if count:
+            rev = rev[:count]
+        return rev
+
     async def xgroup_create(
         self, stream: str, group: str, id: str = "0", mkstream: bool = False
     ) -> None:
         if stream not in self._streams and mkstream:
             self._streams[stream] = []
+
+    async def xread(
+        self,
+        streams: dict[str, str],
+        count: int | None = None,
+        block: int | None = None,
+    ) -> list[tuple[str, list[tuple[str, dict]]]]:
+        results = []
+        for stream, last_id in streams.items():
+            entries = self._streams.get(stream, [])
+            if last_id == "$":
+                if stream not in self._dollar_cursors:
+                    self._dollar_cursors[stream] = entries[-1][0] if entries else "0-0"
+                    selected = []
+                else:
+                    base_id = self._dollar_cursors[stream]
+                    selected = [e for e in entries if e[0] > base_id]
+                    if selected:
+                        self._dollar_cursors[stream] = selected[-1][0]
+            elif last_id in ("0", "0-0"):
+                selected = entries
+            else:
+                selected = [e for e in entries if e[0] > last_id]
+            if count and len(selected) > count:
+                selected = selected[:count]
+            if selected:
+                results.append((stream, selected))
+        if not results and block:
+            await asyncio.sleep(min(block / 1000.0, 0.05))
+        return results
 
     def pubsub(self) -> FakePubSub:
         return FakePubSub(self)

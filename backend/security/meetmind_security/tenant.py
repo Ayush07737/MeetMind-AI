@@ -96,8 +96,13 @@ class TenantRouter:
         redis_pfx  = config.redis_prefix      # "default"
     """
 
-    def __init__(self, configs: dict[str, TenantConfig] | None = None) -> None:
+    def __init__(
+        self,
+        configs: dict[str, TenantConfig] | None = None,
+        allow_dynamic: bool | None = None,
+    ) -> None:
         self._configs = dict(configs) if configs is not None else dict(TENANT_CONFIGS)
+        self._allow_dynamic = allow_dynamic if allow_dynamic is not None else (configs is None)
 
     def resolve(self, tenant_id: str) -> TenantConfig:
         """Return the TenantConfig for the given tenant_id.
@@ -113,6 +118,16 @@ class TenantRouter:
 
         config = self._configs.get(tenant_id)
         if config is None:
+            if self._allow_dynamic:
+                schema = f"tenant_{tenant_id.lower()}"[:48]
+                if SCHEMA_NAME_REGEX.match(schema):
+                    return TenantConfig(
+                        tenant_id=tenant_id,
+                        pg_schema=schema,
+                        neo4j_namespace=tenant_id,
+                        qdrant_prefix=tenant_id,
+                        redis_prefix=tenant_id,
+                    )
             raise TenantNotFoundError(tenant_id)
         return config
 

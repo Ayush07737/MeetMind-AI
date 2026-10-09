@@ -31,6 +31,10 @@ class TestConsentGate:
             user_id="user_123",
             meeting_id="mtg_001",
             consent_type="audio_capture",
+            external_participants=False,
+            jurisdiction_hint=None,
+            consent_text_version="v1.0",
+            client_version="1.0.0",
         )
 
     @patch("meetmind_gateway.consent_gate.check_consent", new_callable=AsyncMock)

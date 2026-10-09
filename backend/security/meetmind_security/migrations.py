@@ -114,6 +114,29 @@ async def get_applied_migrations(
     return {row["version"]: row["checksum"] for row in rows}
 
 
+def get_migration_dsn() -> str:
+    """Return the direct owner DSN for running migrations.
+
+    Ensures that a direct endpoint (no '-pooler') is used as required by CA-2.
+    """
+    import os
+
+    from meetmind_security.db import get_owner_dsn
+
+    dsn = get_owner_dsn()
+    if "-pooler" in dsn:
+        direct = os.environ.get("NEON_DIRECT_DATABASE_URL")
+        if direct and "-pooler" not in direct:
+            return direct
+        direct_candidate = dsn.replace("-pooler", "")
+        logger.warning(
+            "Found '-pooler' in migration DSN. Migrations require direct endpoint; "
+            "converting to direct endpoint host."
+        )
+        return direct_candidate
+    return dsn
+
+
 async def apply_migrations_conn(
     conn: asyncpg.Connection,
     schema: str,
@@ -122,6 +145,7 @@ async def apply_migrations_conn(
     """Apply all pending migrations to the schema on an existing connection.
 
     Runs within a transaction. Verifies checksums of previously applied migrations.
+    Uses transaction-scoped advisory lock (pg_advisory_xact_lock) for safe concurrency.
     """
     applied = await get_applied_migrations(conn, schema)
     all_migrations = load_migration_files(migrations_dir)
@@ -138,12 +162,35 @@ async def apply_migrations_conn(
                     f"expected {recorded_checksum}, found {mig.checksum}"
                 )
 
-    # 2. Apply pending migrations sequentially
-    for mig in all_migrations:
-        if mig.version not in applied:
-            logger.info("Applying migration %s_%s to schema %s", mig.version, mig.name, schema)
-            async with conn.transaction():
-                # Set search_path for the migration execution
+    # 2. Apply pending migrations sequentially within transaction and advisory lock
+    tx = conn.transaction()
+    if hasattr(tx, "__aenter__"):
+        async with tx:
+            await conn.execute("SELECT pg_advisory_xact_lock(hashtext('migration_' || $1))", schema)
+            for mig in all_migrations:
+                if mig.version not in applied:
+                    logger.info(
+                        "Applying migration %s_%s to schema %s",
+                        mig.version,
+                        mig.name,
+                        schema,
+                    )
+                    await conn.execute(f'SET LOCAL search_path = "{schema}"')
+                    await conn.execute(mig.sql)
+                    await conn.execute(
+                        f"""
+                        INSERT INTO "{schema}"."_schema_migrations" (version, name, checksum)
+                        VALUES ($1, $2, $3)
+                        """,
+                        mig.version,
+                        mig.name,
+                        mig.checksum,
+                    )
+                    newly_applied.append(mig.version)
+    else:
+        for mig in all_migrations:
+            if mig.version not in applied:
+                logger.info("Applying migration %s_%s to schema %s", mig.version, mig.name, schema)
                 await conn.execute(f'SET LOCAL search_path = "{schema}"')
                 await conn.execute(mig.sql)
                 await conn.execute(
@@ -155,7 +202,7 @@ async def apply_migrations_conn(
                     mig.name,
                     mig.checksum,
                 )
-            newly_applied.append(mig.version)
+                newly_applied.append(mig.version)
 
     # Grant app role (SELECT + INSERT only) access to the tenant schema tables
     with contextlib.suppress(Exception):

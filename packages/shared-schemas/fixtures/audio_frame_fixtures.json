@@ -1,0 +1,38 @@
+{
+  "valid": [
+    {
+      "description": "Standard audio frame",
+      "hex": "0100000000000000002a0000019270d72180524946465f46414b455f415544494f5f53414d504c455f3132333435363738",
+      "header": {
+        "version": 1,
+        "flags": 0,
+        "client_seq": 42,
+        "capture_ts_ms": 1728470000000
+      },
+      "payload_hex": "524946465f46414b455f415544494f5f53414d504c455f3132333435363738"
+    },
+    {
+      "description": "Audio frame with flags and high client_seq",
+      "hex": "010300000000000003e90000019270d73733000102030405",
+      "header": {
+        "version": 1,
+        "flags": 3,
+        "client_seq": 1001,
+        "capture_ts_ms": 1728470005555
+      },
+      "payload_hex": "000102030405"
+    }
+  ],
+  "invalid": [
+    {
+      "description": "Too short (<18 bytes)",
+      "hex": "0100000000000000002a",
+      "error": "too short"
+    },
+    {
+      "description": "Unsupported version (version=2)",
+      "hex": "0200000000000000000100000000000003e8aabbcc",
+      "error": "version"
+    }
+  ]
+}

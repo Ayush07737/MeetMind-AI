@@ -295,3 +295,195 @@ class TestClerkAuthenticatorRS256:
         user = AuthenticatedUser(user_id="u", tenant_id="t", session_id="s", claims={})
         with pytest.raises(AttributeError):
             user.user_id = "tampered"  # type: ignore[misc]
+
+
+class TestClerkConfigFailFast:
+    """CA-3: Startup refusal tests for invalid or insecure Clerk configurations."""
+
+    def test_missing_clerk_jwks_url_fails_in_prod(self):
+        from meetmind_gateway.config import GatewaySettings
+
+        with pytest.raises(ValueError, match="CLERK_JWKS_URL is required"):
+            GatewaySettings(
+                neon_database_url="postgresql://localhost/test",
+                app_env="production",
+                clerk_jwks_url="",
+                clerk_issuer="https://clerk.meetmind.ai",
+                allowed_origins=["https://app.meetmind.ai"],
+            )
+
+    def test_missing_clerk_issuer_fails_in_prod(self):
+        from meetmind_gateway.config import GatewaySettings
+
+        with pytest.raises(ValueError, match="CLERK_ISSUER is required"):
+            GatewaySettings(
+                neon_database_url="postgresql://localhost/test",
+                app_env="production",
+                clerk_jwks_url="https://clerk.meetmind.ai/.well-known/jwks.json",
+                clerk_issuer="",
+                allowed_origins=["https://app.meetmind.ai"],
+            )
+
+    def test_missing_allowed_origins_fails_in_prod(self):
+        from meetmind_gateway.config import GatewaySettings
+
+        with pytest.raises(ValueError, match="ALLOWED_ORIGINS is required"):
+            GatewaySettings(
+                neon_database_url="postgresql://localhost/test",
+                app_env="production",
+                clerk_jwks_url="https://clerk.meetmind.ai/.well-known/jwks.json",
+                clerk_issuer="https://clerk.meetmind.ai",
+                allowed_origins=[],
+            )
+
+    def test_wildcard_origin_rejected_in_prod(self):
+        from meetmind_gateway.config import GatewaySettings
+
+        with pytest.raises(ValueError, match=r"Wildcard origin '\*' is forbidden"):
+            GatewaySettings(
+                neon_database_url="postgresql://localhost/test",
+                app_env="production",
+                clerk_jwks_url="https://clerk.meetmind.ai/.well-known/jwks.json",
+                clerk_issuer="https://clerk.meetmind.ai",
+                allowed_origins=["*"],
+            )
+
+    def test_invalid_jwks_url_structure_fails_in_prod(self):
+        from meetmind_gateway.config import GatewaySettings
+
+        with pytest.raises(ValueError, match="must match https://<host>/.well-known/jwks.json"):
+            GatewaySettings(
+                neon_database_url="postgresql://localhost/test",
+                app_env="production",
+                clerk_jwks_url="https://api.clerk.com/v1/jwks",  # Backend API url, not .well-known
+                clerk_issuer="https://clerk.meetmind.ai",
+                allowed_origins=["https://app.meetmind.ai"],
+            )
+
+    def test_valid_prod_config_succeeds(self):
+        from meetmind_gateway.config import GatewaySettings
+
+        s = GatewaySettings(
+            neon_database_url="postgresql://localhost/test",
+            app_env="production",
+            clerk_jwks_url="https://clerk.meetmind.ai/.well-known/jwks.json",
+            clerk_issuer="https://clerk.meetmind.ai",
+            allowed_origins=["https://app.meetmind.ai"],
+        )
+        assert s.clerk_issuer == "https://clerk.meetmind.ai"
+
+    def test_dev_environment_permits_empty_clerk_defaults(self):
+        from meetmind_gateway.config import GatewaySettings
+
+        s = GatewaySettings(
+            neon_database_url="postgresql://localhost/test",
+            app_env="development",
+        )
+        assert s.app_env == "development"
+
+
+class TestClerkRealTokenClaimsShape:
+    """Unit tests for real Clerk session token compact 'o' claim extraction."""
+
+    def test_compact_o_object_extracts_id_and_role(self):
+        auth = ClerkAuthenticator(
+            jwks_url="https://clerk.meetmind.ai/.well-known/jwks.json",
+            allowed_origins=["https://app.meetmind.ai"],
+            expected_issuer="https://clerk.meetmind.ai",
+            tenant_org_map={"org_2testorg456": "tenant_prod_1"},
+            app_env="production",
+        )
+        claims = {
+            "sub": "user_2test123",
+            "o": {
+                "id": "org_2testorg456",
+                "rol": "admin",
+                "slg": "meetmind-dev",
+            },
+            "sid": "sess_abc123",
+            "azp": "https://app.meetmind.ai",
+            "iss": "https://clerk.meetmind.ai",
+        }
+
+        user = auth.extract_user_from_claims(claims)
+
+        assert user.user_id == "user_2test123"
+        assert user.tenant_id == "tenant_prod_1"
+        assert user.role == "admin"
+        assert user.session_id == "sess_abc123"
+
+    def test_compact_o_object_unmapped_in_dev_falls_back_to_org_id(self):
+        auth = ClerkAuthenticator(
+            jwks_url="https://clerk.meetmind.ai/.well-known/jwks.json",
+            allowed_origins=["*"],
+            tenant_org_map={},
+            app_env="development",
+        )
+        claims = {
+            "sub": "user_dev1",
+            "o": {"id": "org_unmapped_dev", "rol": "member"},
+        }
+        user = auth.extract_user_from_claims(claims)
+
+        assert user.tenant_id == "org_unmapped_dev"
+        assert user.role == "member"
+
+    def test_compact_o_object_unmapped_in_prod_raises_clean_auth_forbidden(self):
+        auth = ClerkAuthenticator(
+            jwks_url="https://clerk.meetmind.ai/.well-known/jwks.json",
+            allowed_origins=["https://app.meetmind.ai"],
+            tenant_org_map={},
+            app_env="production",
+        )
+        claims = {
+            "sub": "user_prod1",
+            "o": {"id": "org_unknown_prod", "rol": "member"},
+            "azp": "https://app.meetmind.ai",
+            "iss": "https://clerk.meetmind.ai",
+        }
+        with pytest.raises(AuthForbiddenError, match="not mapped to an authorized tenant"):
+            auth.extract_user_from_claims(claims)
+
+    def test_malformed_o_claim_raises_clean_auth_error(self):
+        auth = ClerkAuthenticator(
+            jwks_url="https://clerk.meetmind.ai/.well-known/jwks.json",
+            allowed_origins=["https://app.meetmind.ai"],
+            app_env="production",
+        )
+        # 1. 'o' is dict without 'id'
+        claims_missing_id = {
+            "sub": "user_bad1",
+            "o": {"rol": "admin"},
+            "azp": "https://app.meetmind.ai",
+            "iss": "https://clerk.meetmind.ai",
+        }
+        with pytest.raises(AuthForbiddenError, match="missing string 'id'"):
+            auth.extract_user_from_claims(claims_missing_id)
+
+        # 2. 'o' is an invalid type (e.g. list)
+        claims_bad_type = {
+            "sub": "user_bad2",
+            "o": ["not", "a", "dict"],
+            "azp": "https://app.meetmind.ai",
+            "iss": "https://clerk.meetmind.ai",
+        }
+        with pytest.raises(AuthForbiddenError, match="Invalid organization claim format in 'o'"):
+            auth.extract_user_from_claims(claims_bad_type)
+
+
+class TestAllowedOriginsEnvParsing:
+    """Tests parsing of ALLOWED_ORIGINS JSON list format from environment variables."""
+
+    def test_parses_json_list_from_env(self):
+        from unittest.mock import patch
+
+        from meetmind_gateway.config import GatewaySettings
+
+        env_vars = {
+            "NEON_DATABASE_URL": "postgresql://localhost/test",
+            "APP_ENV": "development",
+            "ALLOWED_ORIGINS": '["https://app.meetmind.ai", "https://ext.meetmind.ai"]',
+        }
+        with patch.dict("os.environ", env_vars, clear=False):
+            s = GatewaySettings()
+            assert s.allowed_origins == ["https://app.meetmind.ai", "https://ext.meetmind.ai"]

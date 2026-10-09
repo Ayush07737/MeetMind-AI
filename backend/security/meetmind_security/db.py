@@ -35,16 +35,41 @@ _UNSET_SENTINEL = object()
 NEON_DATABASE_URL: Any = _UNSET_SENTINEL
 
 
-def get_neon_database_url() -> str:
-    """Return the runtime PostgreSQL/Neon connection URL.
+def get_owner_dsn() -> str:
+    """Return the owner DSN for migrations and DDL operations.
 
-    Runtime defaults to the app role DSN (NEON_APP_DATABASE_URL, SELECT+INSERT only),
-    falling back to NEON_DATABASE_URL if not configured.
+    Checks NEON_TEST_DATABASE_URL (for test runs), NEON_DIRECT_DATABASE_URL,
+    and NEON_DATABASE_URL.
     """
-    if NEON_DATABASE_URL is not _UNSET_SENTINEL:
-        url = NEON_DATABASE_URL
-    else:
-        url = os.environ.get("NEON_APP_DATABASE_URL") or os.environ.get("NEON_DATABASE_URL")
+    if NEON_DATABASE_URL is not _UNSET_SENTINEL and NEON_DATABASE_URL:
+        return NEON_DATABASE_URL
+    url = (
+        os.environ.get("NEON_TEST_DATABASE_URL")
+        or os.environ.get("NEON_DIRECT_DATABASE_URL")
+        or os.environ.get("NEON_DATABASE_URL")
+    )
+    if not url:
+        raise RuntimeError(
+            "Owner database DSN is not set. "
+            "Set NEON_DATABASE_URL, NEON_DIRECT_DATABASE_URL, or NEON_TEST_DATABASE_URL in .env"
+        )
+    return url
+
+
+def get_app_dsn() -> str:
+    """Return the runtime PostgreSQL connection URL for application services.
+
+    Defaults to the restricted app role DSN (SELECT + INSERT only).
+    Checks NEON_TEST_APP_DATABASE_URL (for test runs), NEON_APP_DATABASE_URL,
+    falling back to NEON_DATABASE_URL.
+    """
+    if NEON_DATABASE_URL is not _UNSET_SENTINEL and NEON_DATABASE_URL:
+        return NEON_DATABASE_URL
+    url = (
+        os.environ.get("NEON_TEST_APP_DATABASE_URL")
+        or os.environ.get("NEON_APP_DATABASE_URL")
+        or os.environ.get("NEON_DATABASE_URL")
+    )
     if not url:
         raise RuntimeError(
             "NEON_DATABASE_URL is not set. "
@@ -54,15 +79,10 @@ def get_neon_database_url() -> str:
     return url
 
 
-def get_neon_owner_database_url() -> str:
-    """Return the owner DSN for migrations and DDL operations."""
-    url = os.environ.get("NEON_DATABASE_URL")
-    if not url:
-        raise RuntimeError("NEON_DATABASE_URL owner DSN is not set.")
-    return url
-
-
-_require_neon_url = get_neon_database_url
+# Backward-compatible aliases
+get_neon_database_url = get_app_dsn
+get_neon_owner_database_url = get_owner_dsn
+_require_neon_url = get_app_dsn
 
 
 def _create_ssl_context(
@@ -78,6 +98,48 @@ def _create_ssl_context(
     ctx.check_hostname = True
     ctx.verify_mode = ssl.CERT_REQUIRED
     return ctx
+
+
+async def verify_runtime_role_privileges(
+    conn: asyncpg.Connection,
+    schema: str = "tenant_default",
+) -> str:
+    """Verify that runtime role holds least-privilege (SELECT/INSERT only).
+
+    Refuses startup if the runtime role holds UPDATE, DELETE, or TRUNCATE
+    on append-only audit_events or consent_events tables.
+    Returns the current user string.
+    """
+    current_user: str = await conn.fetchval("SELECT current_user")
+    logger.info("Database runtime connected as user: %s", current_user)
+
+    for table in ["audit_events", "consent_events"]:
+        exists = await conn.fetchval(
+            """
+            SELECT EXISTS (
+                SELECT 1 FROM information_schema.tables
+                WHERE table_schema = $1 AND table_name = $2
+            )
+            """,
+            schema,
+            table,
+        )
+        if not exists:
+            continue
+
+        for priv in ["UPDATE", "DELETE", "TRUNCATE"]:
+            target_table = f'"{schema}"."{table}"'
+            query = f"SELECT has_table_privilege(current_user, '{target_table}', '{priv}')"
+            has_priv = await conn.fetchval(query)
+            if has_priv:
+                msg = (
+                    f"Security violation: role '{current_user}' holds illegal privilege "
+                    f"'{priv}' on table '{schema}.{table}'."
+                )
+                logger.critical(msg)
+                raise RuntimeError(msg)
+
+    return current_user
 
 
 async def _create_pool_with_retry(dsn: str, max_retries: int = 3) -> asyncpg.Pool:
@@ -121,15 +183,29 @@ async def _create_pool_with_retry(dsn: str, max_retries: int = 3) -> asyncpg.Poo
             backoff *= 2.0
 
 
-async def init_db(dsn: str | None = None) -> asyncpg.Pool:
-    """Initialize the global shared connection pool."""
+async def init_db(
+    dsn: str | None = None,
+    verify_privileges: bool = True,
+    schema: str = "tenant_default",
+) -> asyncpg.Pool:
+    """Initialize the global shared connection pool using the app role DSN."""
     global _shared_pool
     async with _pool_lock:
         if _shared_pool is not None and not _shared_pool._closed:
             return _shared_pool
 
-        connection_url = dsn or get_neon_database_url()
+        connection_url = dsn or get_app_dsn()
         _shared_pool = await _create_pool_with_retry(connection_url)
+
+        if verify_privileges:
+            try:
+                async with _shared_pool.acquire() as conn:
+                    await verify_runtime_role_privileges(conn, schema=schema)
+            except Exception:
+                await _shared_pool.close()
+                _shared_pool = None
+                raise
+
         return _shared_pool
 
 

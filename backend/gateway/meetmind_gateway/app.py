@@ -7,6 +7,7 @@ and the one-time WebSocket ticket issuer.
 
 from __future__ import annotations
 
+import contextlib
 import json
 import logging
 import secrets
@@ -18,12 +19,18 @@ from typing import Any
 import redis.asyncio as aioredis
 from fastapi import FastAPI, HTTPException, Request, WebSocket, status
 
-from .auth import AuthForbiddenError, AuthUnauthorizedError, ClerkAuthenticator
+from .auth import (
+    AuthForbiddenError,
+    AuthUnauthorizedError,
+    ClerkAuthenticator,
+    can_listen,
+)
 from .config import GatewaySettings, get_settings
+from .keys import ws_ticket_key
 from .redis_streams import StreamProducer
 from .sequence import SequenceCounter
 from .session_manager import SessionManager
-from .ws_endpoint import websocket_ingest
+from .ws_endpoint import websocket_ingest, websocket_listen
 
 logger = logging.getLogger(__name__)
 
@@ -63,11 +70,11 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
         redis_binary_client, maxlen=settings.redis_stream_maxlen
     )
 
-    # -- Warm DB connection pool (CO-8) ----------------------------------------
+    # -- Warm DB connection pool via app role (CA-1) ---------------------------
     try:
-        from meetmind_security.db import get_neon_database_url, init_db
+        from meetmind_security.db import get_app_dsn, init_db
 
-        pool = await init_db(get_neon_database_url())
+        pool = await init_db(get_app_dsn())
         warmed = [await pool.acquire() for _ in range(pool.get_min_size())]
         for conn in warmed:
             await pool.release(conn)
@@ -109,10 +116,10 @@ def create_app(settings: GatewaySettings | None = None) -> FastAPI:
     async def health_check() -> dict[str, str]:
         return {"status": "ok", "service": "gateway"}
 
-    # ── One-Time WebSocket Ticket Exchange ───────────────────────────────
+    # ── One-Time WebSocket Ticket Exchange (WP4) ─────────────────────────
     @app.post("/v1/ws-ticket")
     async def create_ws_ticket(request: Request) -> dict[str, Any]:
-        """Issue a single-use 128-bit ticket for WebSocket connection."""
+        """Issue a single-use 128-bit ticket bound to meeting_id and role (ingest|listen)."""
         auth_header = request.headers.get("Authorization", "")
         if not auth_header.startswith("Bearer "):
             raise HTTPException(
@@ -133,6 +140,63 @@ def create_app(settings: GatewaySettings | None = None) -> FastAPI:
                 detail=str(exc.message),
             ) from exc
 
+        # Parse request body or query params for meeting_id and role
+        body: dict[str, Any] = {}
+        with contextlib.suppress(Exception):
+            body = await request.json()
+
+        meeting_id = str(body.get("meeting_id") or request.query_params.get("meeting_id") or "")
+        role = str(body.get("role") or request.query_params.get("role") or "ingest").lower()
+
+        if role not in ("ingest", "listen"):
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail="Role must be 'ingest' or 'listen'",
+            )
+
+        if meeting_id:
+            # Enforce cross-tenant isolation at ticket issue time
+            bound_tenant = await app.state.session_manager.get_meeting_tenant(meeting_id)
+            if bound_tenant and bound_tenant != user.tenant_id:
+                try:
+                    from meetmind_security.audit_log import write_audit_event
+
+                    await write_audit_event(
+                        tenant_id=user.tenant_id,
+                        user_id=user.user_id,
+                        event_type="cross_tenant_access_denied",
+                        payload={
+                            "meeting_id": meeting_id,
+                            "target_tenant": bound_tenant,
+                            "attempted_tenant": user.tenant_id,
+                            "source": "ticket_exchange",
+                        },
+                    )
+                except Exception:
+                    pass
+                raise HTTPException(
+                    status_code=status.HTTP_403_FORBIDDEN,
+                    detail="cross-tenant access denied",
+                )
+
+            # Enforce can_listen role permissions if role is listen
+            if role == "listen":
+                session_data = await app.state.session_manager.get_session_data(
+                    meeting_id, user.tenant_id
+                )
+                if session_data:
+                    owner_id = session_data.get("user_id", "")
+                    if not can_listen(
+                        user,
+                        user.tenant_id,
+                        owner_id,
+                        settings.elevated_listen_roles,
+                    ):
+                        raise HTTPException(
+                            status_code=status.HTTP_403_FORBIDDEN,
+                            detail="forbidden: cannot listen to meeting",
+                        )
+
         # 128-bit cryptographically secure ticket
         ticket = secrets.token_urlsafe(16)
         ticket_payload = json.dumps(
@@ -140,11 +204,15 @@ def create_app(settings: GatewaySettings | None = None) -> FastAPI:
                 "user_id": user.user_id,
                 "tenant_id": user.tenant_id,
                 "session_id": user.session_id,
+                "role": role,
+                "meeting_id": meeting_id,
                 "claims": user.claims,
+                "role_claim": user.role,
                 "created_at": time.time(),
             }
         )
-        stored = await app.state.redis.set(f"ws_ticket:{ticket}", ticket_payload, ex=30, nx=True)
+        ticket_key = ws_ticket_key(ticket)
+        stored = await app.state.redis.set(ticket_key, ticket_payload, ex=30, nx=True)
         if not stored:
             raise HTTPException(
                 status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
@@ -153,8 +221,10 @@ def create_app(settings: GatewaySettings | None = None) -> FastAPI:
 
         return {"ticket": ticket, "expires_in": 30}
 
-    # ── WebSocket routes ──────────────────────────────────────────────────
-    async def _handle_ws(websocket: WebSocket, meeting_id: str) -> None:
+    # ── WebSocket routes (WP4) ───────────────────────────────────────────
+    @app.websocket("/v1/meetings/{meeting_id}/stream")
+    async def ws_meetings_stream(websocket: WebSocket, meeting_id: str) -> None:
+        """Primary ingest/write WebSocket endpoint."""
         await websocket_ingest(
             ws=websocket,
             meeting_id=meeting_id,
@@ -165,16 +235,40 @@ def create_app(settings: GatewaySettings | None = None) -> FastAPI:
             redis_client=app.state.redis,
         )
 
-    @app.websocket("/v1/meetings/{meeting_id}/stream")
-    async def ws_meetings_stream(websocket: WebSocket, meeting_id: str) -> None:
-        await _handle_ws(websocket, meeting_id)
+    @app.websocket("/v1/meetings/{meeting_id}/listen")
+    async def ws_meetings_listen(websocket: WebSocket, meeting_id: str) -> None:
+        """Read-only listener WebSocket endpoint."""
+        await websocket_listen(
+            ws=websocket,
+            meeting_id=meeting_id,
+            authenticator=app.state.authenticator,
+            session_manager=app.state.session_manager,
+            redis_client=app.state.redis,
+        )
 
+    # Legacy & alias routes for backward compatibility
     @app.websocket("/v1/ws/ingest/{meeting_id}")
     async def ws_v1_ingest(websocket: WebSocket, meeting_id: str) -> None:
-        await _handle_ws(websocket, meeting_id)
+        await websocket_ingest(
+            ws=websocket,
+            meeting_id=meeting_id,
+            authenticator=app.state.authenticator,
+            session_manager=app.state.session_manager,
+            seq_counter=app.state.seq_counter,
+            stream_producer=app.state.stream_producer,
+            redis_client=app.state.redis,
+        )
 
     @app.websocket("/ws/ingest/{meeting_id}")
     async def ws_legacy_ingest(websocket: WebSocket, meeting_id: str) -> None:
-        await _handle_ws(websocket, meeting_id)
+        await websocket_ingest(
+            ws=websocket,
+            meeting_id=meeting_id,
+            authenticator=app.state.authenticator,
+            session_manager=app.state.session_manager,
+            seq_counter=app.state.seq_counter,
+            stream_producer=app.state.stream_producer,
+            redis_client=app.state.redis,
+        )
 
     return app

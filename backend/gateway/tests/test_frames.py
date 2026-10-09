@@ -30,9 +30,15 @@ class TestControlFrame:
         frame = ControlFrame(
             action=ControlAction.CONSENT_CONFIRMED,
             consent_type="audio_capture",
+            external_participants=False,
+            consent_text_version="v1.0",
+            client_version="1.0.0",
         )
         assert frame.action == ControlAction.CONSENT_CONFIRMED
         assert frame.consent_type == "audio_capture"
+        assert frame.external_participants is False
+        assert frame.consent_text_version == "v1.0"
+        assert frame.client_version == "1.0.0"
 
     def test_create_meeting_end(self):
         frame = ControlFrame(action=ControlAction.MEETING_END)
@@ -100,16 +106,22 @@ class TestControlFrame:
         assert "Field required" in str(exc.value)
 
     def test_canonical_consent_confirmed_accepted(self):
-        """CO-3: Canonical shape with action and optional consent_type is accepted."""
+        """WP5: Canonical shape with extended required fields is accepted."""
         frame = ControlFrame.model_validate(
             {
                 "type": "control",
                 "action": "consent_confirmed",
                 "consent_type": "audio_capture",
+                "external_participants": True,
+                "jurisdiction_hint": "US-CA",
+                "consent_text_version": "v1.0",
+                "client_version": "1.0.0",
             }
         )
         assert frame.action == ControlAction.CONSENT_CONFIRMED
         assert frame.consent_type == "audio_capture"
+        assert frame.external_participants is True
+        assert frame.jurisdiction_hint == "US-CA"
 
 
 class TestTranscriptChunkFrame:
