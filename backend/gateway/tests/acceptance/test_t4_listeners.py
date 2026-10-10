@@ -13,12 +13,13 @@ from __future__ import annotations
 import asyncio
 import json
 import uuid
+from datetime import UTC, datetime
 
 import pytest
 import websockets
 from conftest import ServerHarness, exchange_ws_ticket
-from meetmind_gateway.keys import out_stream_key
-from meetmind_schemas.events import WSCloseCode
+from meetmind_gateway.keys import audio_stream_key, events_stream_key, out_stream_key
+from meetmind_schemas.events import WSCloseCode, encode_audio_frame
 
 pytestmark = [pytest.mark.integration]
 
@@ -71,6 +72,23 @@ async def test_t4_multiple_listeners_and_single_writer(
         ack_consent = json.loads(await writer_ws.recv())
         assert ack_consent["status"] == "accepted"
 
+        # Assert audio stream entry count == frames sent
+        audio_key = audio_stream_key(tenant_id, meeting_id)
+        for seq in (1, 2):
+            ts = int(datetime.now(UTC).timestamp() * 1000)
+            framed = encode_audio_frame(
+                client_seq=seq,
+                capture_ts_ms=ts,
+                payload=b"audio_pcm_frame",
+            )
+            await writer_ws.send(framed)
+            ack_audio = json.loads(await writer_ws.recv())
+            assert ack_audio["type"] == "ack"
+            assert ack_audio["seq"] == seq
+
+        stream_count = await real_redis.xlen(audio_key)
+        assert stream_count == 2, f"Expected 2 audio frames, found {stream_count}"
+
         # 2. Connect 2 Listeners via /v1/meetings/{meeting_id}/listen
         token_l1 = h.jwks.mint_token(sub="user_listener_1", org_id=h.org_a, org_role="org:admin")
         status_l1, ticket_l1_resp = await exchange_ws_ticket(
@@ -90,14 +108,26 @@ async def test_t4_multiple_listeners_and_single_writer(
         l2_uri = f"{h.ws_url}/v1/meetings/{meeting_id}/listen?ticket={ticket_l2}&last_event_id=0-0"
 
         async with websockets.connect(l1_uri) as l1_ws, websockets.connect(l2_uri) as l2_ws:
-            # 3. Publish outbound event and verify fan-out to both listeners
+            # 3. Assert an internal-bus event reaches NEITHER listener
+            internal_key = events_stream_key(tenant_id, meeting_id)
+            await real_redis.xadd(
+                internal_key,
+                {"payload": json.dumps({"internal_secret": "internal_bus_only"})},
+            )
+
+            # Neither listener should receive the internal bus event
+            for l_ws in (l1_ws, l2_ws):
+                with pytest.raises(TimeoutError):
+                    await asyncio.wait_for(l_ws.recv(), timeout=0.4)
+
+            # 4. Outbound event fanning out exactly once to both listeners
             out_key = out_stream_key(tenant_id, meeting_id)
             event_payload = {
                 "type": "intelligence_event",
                 "event_type": "intelligence_event",
                 "insight": "Crucial product roadmap decision",
             }
-            await real_redis.xadd(
+            entry_id_1 = await real_redis.xadd(
                 out_key,
                 {
                     "event_type": "intelligence_event",
@@ -105,8 +135,11 @@ async def test_t4_multiple_listeners_and_single_writer(
                     "meeting_id": meeting_id,
                 },
             )
+            entry_id_1_str = (
+                entry_id_1.decode("utf-8") if isinstance(entry_id_1, bytes) else str(entry_id_1)
+            )
 
-            # Both listeners should receive the fanned out event
+            # Both listeners should receive the fanned out event exactly once
             msg_l1_raw = await asyncio.wait_for(l1_ws.recv(), timeout=5.0)
             msg_l2_raw = await asyncio.wait_for(l2_ws.recv(), timeout=5.0)
 
@@ -118,16 +151,53 @@ async def test_t4_multiple_listeners_and_single_writer(
             assert msg_l2["event_type"] == "intelligence_event"
             assert msg_l2["payload"]["insight"] == "Crucial product roadmap decision"
 
-            # 4. Listener 1 attempts to write -> rejected with 4400 (PROTOCOL_VIOLATION)
+            # Verify exactly once: no duplicate delivery
+            for l_ws in (l1_ws, l2_ws):
+                with pytest.raises(TimeoutError):
+                    await asyncio.wait_for(l_ws.recv(), timeout=0.3)
+
+            # 5. Listener 1 attempts to write -> rejected with 4400 (PROTOCOL_VIOLATION)
             await l1_ws.send(b"\x00\x01\x02\x03\x04")
             with pytest.raises(websockets.exceptions.ConnectionClosed) as exc_info:
-                # Discard any buffered frames until connection closed
                 while True:
                     await l1_ws.recv()
             assert exc_info.value.rcvd is not None
             assert exc_info.value.rcvd.code == WSCloseCode.PROTOCOL_VIOLATION
 
-        # 5. Second ingest writer attempts to connect -> rejected with 4409 (WRITER_CONFLICT)
+        # 6. Verify last_event_id resume works for reconnecting listeners
+        # Publish event 2 while listener 2 is disconnected
+        event_payload_2 = {
+            "type": "intelligence_event",
+            "event_type": "intelligence_event",
+            "insight": "Follow-up action item from resumed session",
+        }
+        await real_redis.xadd(
+            out_key,
+            {
+                "event_type": "intelligence_event",
+                "payload": json.dumps(event_payload_2),
+                "meeting_id": meeting_id,
+            },
+        )
+
+        # Exchange new ticket for listener 2 and reconnect with last_event_id=entry_id_1_str
+        status_l2_resume, ticket_l2_resume_resp = await exchange_ws_ticket(
+            h.http_url, token_l2, meeting_id, role="listen"
+        )
+        assert status_l2_resume == 200
+        ticket_l2_resume = ticket_l2_resume_resp["ticket"]
+        l2_resume_uri = (
+            f"{h.ws_url}/v1/meetings/{meeting_id}/listen?"
+            f"ticket={ticket_l2_resume}&last_event_id={entry_id_1_str}"
+        )
+
+        async with websockets.connect(l2_resume_uri) as l2_resume_ws:
+            msg_resumed_raw = await asyncio.wait_for(l2_resume_ws.recv(), timeout=5.0)
+            msg_resumed = json.loads(msg_resumed_raw)
+            assert msg_resumed["event_type"] == "intelligence_event"
+            assert msg_resumed["payload"]["insight"] == "Follow-up action item from resumed session"
+
+        # 7. Second ingest writer attempts to connect -> rejected with 4409 (WRITER_CONFLICT)
         token_writer2 = h.jwks.mint_token(sub="user_writer_2", org_id=h.org_a, org_role="org:admin")
         status_w2, ticket_w2_resp = await exchange_ws_ticket(
             h.http_url, token_writer2, meeting_id, role="ingest"

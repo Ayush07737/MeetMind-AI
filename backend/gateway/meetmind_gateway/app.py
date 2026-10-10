@@ -74,11 +74,16 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
     try:
         from meetmind_security.db import get_app_dsn, init_db
 
-        pool = await init_db(get_app_dsn())
+        pool = await init_db(get_app_dsn(), verify_privileges=True)
         warmed = [await pool.acquire() for _ in range(pool.get_min_size())]
         for conn in warmed:
             await pool.release(conn)
         logger.info("Database pool warmed (%d connections)", pool.get_min_size())
+    except RuntimeError as exc:
+        if "Security violation" in str(exc) or "holds illegal privilege" in str(exc):
+            logger.critical("Startup refused due to database privilege violation: %s", exc)
+            raise
+        logger.warning("Database pool initialization skipped: %s", exc)
     except Exception as exc:
         logger.warning("Database pool warming skipped or failed: %s", exc)
 
@@ -110,6 +115,19 @@ def create_app(settings: GatewaySettings | None = None) -> FastAPI:
         lifespan=lifespan,
     )
     app.state.settings = settings
+
+    # ── CORS Middleware (CA-3 & Security Hardening) ──────────────────────
+    from fastapi.middleware.cors import CORSMiddleware
+
+    origins = settings.allowed_origins if settings.allowed_origins else ["https://app.meetmind.ai"]
+    has_wildcard = "*" in origins
+    app.add_middleware(
+        CORSMiddleware,
+        allow_origins=origins,
+        allow_credentials=not has_wildcard,  # Must NOT be '*' with credentials
+        allow_methods=["GET", "POST", "OPTIONS"],
+        allow_headers=["*"],
+    )
 
     # ── Health check ─────────────────────────────────────────────────────
     @app.get("/health")

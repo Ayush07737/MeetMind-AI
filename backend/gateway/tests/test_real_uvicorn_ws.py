@@ -9,6 +9,8 @@ from meetmind_gateway.app import create_app
 from meetmind_gateway.config import GatewaySettings
 from meetmind_schemas.events import WSCloseCode
 
+pytestmark = [pytest.mark.integration]
+
 
 def get_free_port() -> int:
     with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:

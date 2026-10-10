@@ -71,6 +71,7 @@ async def test_t1_consent_gate_enforcement(
             payload = json.loads(audit_row["payload"])
             assert payload["meeting_id"] == meeting_id
             assert payload["frame_type"] == "audio_chunk"
+            assert payload["reason"] == "consent_not_confirmed"
 
         # Step 2: Send meeting_start control frame
         await ws.send(
@@ -123,8 +124,9 @@ async def test_t1_consent_gate_enforcement(
             assert consent_row["consent_text_version"] == "v2.0"
             assert consent_row["client_version"] == "2.1.0"
 
-        # Step 4: Send audio chunk with 18-byte big-endian header
-        pcm_payload = b"VALID_PCM_AUDIO_DATA_FOR_TEST_1"
+        # Step 4: Send audio chunk with 18-byte big-endian header and 3,200 bytes REAL PCM payload
+        pcm_payload = b"\x00\x01" * 1600  # Exactly 3,200 bytes of PCM audio
+        assert len(pcm_payload) == 3200
         ts_ms = int(datetime.now(UTC).timestamp() * 1000)
         framed_audio = encode_audio_frame(
             client_seq=1,
@@ -146,3 +148,5 @@ async def test_t1_consent_gate_enforcement(
         fields = entries[0][1]
         assert fields[b"client_seq"] == b"1" or fields.get("client_seq") == "1"
         assert fields[b"audio_data"] == pcm_payload or fields.get("audio_data") == pcm_payload
+        stored_bytes = fields.get(b"audio_data") or fields.get("audio_data")
+        assert len(stored_bytes) == 3200

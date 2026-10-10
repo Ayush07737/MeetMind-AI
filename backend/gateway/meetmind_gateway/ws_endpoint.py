@@ -297,9 +297,6 @@ async def _handle_control_frame(
             timestamp=datetime.now(UTC),
         )
         await ctx.ws.send_text(ack.model_dump_json())
-        # Clean close with code 1000
-        await ctx.ws.close(code=WSCloseCode.NORMAL_CLOSURE, reason="Meeting ended")
-        ctx.mark_closed()
 
 
 async def _handle_audio_chunk(
@@ -311,6 +308,8 @@ async def _handle_audio_chunk(
     if ctx.state == ProtocolState.ENDED:
         err = ErrorFrame(code=ErrorCode.MEETING_ENDED, message="Meeting has already ended")
         await ctx.ws.send_text(err.model_dump_json())
+        await ctx.ws.close(code=WSCloseCode.NORMAL_CLOSURE, reason="Meeting ended")
+        ctx.mark_closed()
         return
 
     if ctx.state != ProtocolState.ACTIVE or not ctx.consent_gate.is_open:
@@ -530,6 +529,7 @@ async def _run_lease_heartbeat(
                     connection_id,
                 )
                 break
+            await session_manager.refresh_activity(meeting_id, tenant_id)
         except asyncio.CancelledError:
             break
         except Exception as exc:
@@ -766,7 +766,9 @@ async def websocket_ingest(
         settings=settings,
         redis_client=redis_client,
     )
-    if consent_gate.is_open:
+    if session.status == MeetingStatus.ENDED:
+        ctx.state = ProtocolState.ENDED
+    elif consent_gate.is_open:
         ctx.state = ProtocolState.ACTIVE
 
     # Lease refresh loop

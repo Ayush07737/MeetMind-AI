@@ -101,8 +101,41 @@ class TenantRouter:
         configs: dict[str, TenantConfig] | None = None,
         allow_dynamic: bool | None = None,
     ) -> None:
-        self._configs = dict(configs) if configs is not None else dict(TENANT_CONFIGS)
-        self._allow_dynamic = allow_dynamic if allow_dynamic is not None else (configs is None)
+        if configs is not None:
+            self._configs = dict(configs)
+        else:
+            self._configs = dict(TENANT_CONFIGS)
+            # Register mapped tenants from environment if present
+            org_map_str = os.getenv("TENANT_ORG_MAP", "")
+            if org_map_str.strip():
+                try:
+                    import json
+
+                    org_map = json.loads(org_map_str)
+                    if isinstance(org_map, dict):
+                        for _org_id, tid in org_map.items():
+                            if (
+                                isinstance(tid, str)
+                                and tid not in self._configs
+                                and TENANT_ID_REGEX.match(tid)
+                            ):
+                                schema = f"tenant_{tid.lower()}"[:48]
+                                if SCHEMA_NAME_REGEX.match(schema):
+                                    self._configs[tid] = TenantConfig(
+                                        tenant_id=tid,
+                                        pg_schema=schema,
+                                        neo4j_namespace=tid,
+                                        qdrant_prefix=tid,
+                                        redis_prefix=tid,
+                                    )
+                except Exception:
+                    pass
+
+        app_env = os.getenv("APP_ENV", "production").lower()
+        is_dev = app_env in ("development", "dev")
+        self._allow_dynamic = (
+            allow_dynamic if allow_dynamic is not None else (is_dev and configs is None)
+        )
 
     def resolve(self, tenant_id: str) -> TenantConfig:
         """Return the TenantConfig for the given tenant_id.

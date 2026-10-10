@@ -142,6 +142,7 @@ class LocalJWKSServer:
         sign_key: Any = None,
         alg: str = "RS256",
         headers: dict[str, Any] | None = None,
+        include_org: bool = True,
     ) -> str:
         """Mint a signed JWT."""
         now = int(datetime.now(UTC).timestamp())
@@ -152,12 +153,13 @@ class LocalJWKSServer:
             "exp": now + exp_offset,
             "nbf": now + nbf_offset,
             "iat": now,
-            "o": {
+        }
+        if include_org:
+            payload["o"] = {
                 "id": org_id,
                 "rol": org_role,
                 "slg": "acceptance-slug",
-            },
-        }
+            }
         if extra_claims:
             payload.update(extra_claims)
 

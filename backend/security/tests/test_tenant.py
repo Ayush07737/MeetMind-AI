@@ -109,3 +109,33 @@ class TestTenantRouter:
 
         with pytest.raises(ValueError, match="Invalid tenant identifier"):
             self.router.resolve("bad' OR '1'='1")
+
+    def test_dev_mode_permits_dynamic_tenant_fallback(self):
+        from unittest.mock import patch
+
+        with patch.dict("os.environ", {"APP_ENV": "development"}, clear=False):
+            router = TenantRouter()
+            resolved = router.resolve("dynamic_dev_tenant")
+            assert resolved.tenant_id == "dynamic_dev_tenant"
+            assert resolved.pg_schema == "tenant_dynamic_dev_tenant"
+
+    def test_prod_mode_rejects_unknown_tenant(self):
+        from unittest.mock import patch
+
+        with patch.dict("os.environ", {"APP_ENV": "production"}, clear=False):
+            router = TenantRouter()
+            with pytest.raises(TenantNotFoundError):
+                router.resolve("unregistered_prod_tenant")
+
+    def test_tenant_org_map_env_registers_tenants(self):
+        import json
+        from unittest.mock import patch
+
+        mapping = {"org_enterprise_1": "tenant_ent_1", "org_enterprise_2": "tenant_ent_2"}
+        with patch.dict("os.environ", {"TENANT_ORG_MAP": json.dumps(mapping)}, clear=False):
+            router = TenantRouter()
+            t1 = router.resolve("tenant_ent_1")
+            assert t1.tenant_id == "tenant_ent_1"
+            assert t1.pg_schema == "tenant_tenant_ent_1"
+            t2 = router.resolve("tenant_ent_2")
+            assert t2.tenant_id == "tenant_ent_2"

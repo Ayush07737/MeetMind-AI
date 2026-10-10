@@ -118,7 +118,7 @@ async def test_t8_pre_consent_flood_audit_rate_limiting(
             assert err_data["type"] == "error"
             assert err_data["code"] == "CONSENT_REQUIRED"
 
-    # Verify Neon audit log: only first 5 rejections recorded in DB
+    # Verify Neon audit log: only first 5 rejections recorded individually in DB
     async with h.tenant_conn(tenant_id) as conn:
         count = await conn.fetchval(
             """
@@ -132,3 +132,82 @@ async def test_t8_pre_consent_flood_audit_rate_limiting(
             meeting_id,
         )
         assert count == 5, f"Expected exactly 5 rate-limited audit rows, got {count}"
+
+        # Verify disconnect summary audit for suppressed rejected-frame audits is written
+        summary_row = await conn.fetchrow(
+            """
+            SELECT payload
+            FROM audit_events
+            WHERE tenant_id = $1
+              AND event_type = 'rejected_frames_summary'
+              AND (payload->>'meeting_id') = $2
+            ORDER BY created_at DESC LIMIT 1
+            """,
+            tenant_id,
+            meeting_id,
+        )
+        assert summary_row is not None
+        summary_payload = json.loads(summary_row["payload"])
+        assert summary_payload["total_rejected"] == 25
+
+
+@pytest.mark.asyncio
+async def test_t8_per_connection_rate_limit(
+    gateway_harness: ServerHarness,
+) -> None:
+    """Verify rate limit violations close the WebSocket with 4429 (RATE_LIMITED)."""
+    h = gateway_harness
+    meeting_id = f"mtg_t8_rate_{uuid.uuid4().hex[:6]}"
+
+    token = h.jwks.mint_token(sub="user_ratelimit", org_id=h.org_a, org_role="org:admin")
+    status, resp = await exchange_ws_ticket(h.http_url, token, meeting_id, role="ingest")
+    assert status == 200
+    ticket = resp["ticket"]
+
+    uri = f"{h.ws_url}/v1/meetings/{meeting_id}/stream?ticket={ticket}"
+
+    async with websockets.connect(uri) as ws:
+        # Rapid flood of 150 frames (> 120 frame/sec limit)
+        with pytest.raises(ConnectionClosed) as exc:
+            for _ in range(150):
+                await ws.send(b"\x00\x01\x02\x03\x04\x05")
+
+            # Consume error frame and close frame
+            while True:
+                await ws.recv()
+
+        assert exc.value.rcvd is not None
+        assert exc.value.rcvd.code == WSCloseCode.RATE_LIMITED
+
+
+@pytest.mark.asyncio
+async def test_t8_per_user_connection_cap(
+    gateway_harness: ServerHarness,
+    real_redis,
+) -> None:
+    """Verify per-user connection cap closes with 4429 (RATE_LIMITED)."""
+    from meetmind_gateway.keys import user_connections_key
+
+    h = gateway_harness
+    meeting_id = f"mtg_t8_usercap_{uuid.uuid4().hex[:6]}"
+    tenant_id = h.tenant_a
+    user_id = "user_capped_123"
+
+    # Pre-seed Redis connection counter to 10 (the default per-user cap)
+    uconn_key = user_connections_key(tenant_id, user_id)
+    await real_redis.set(uconn_key, 10)
+
+    token = h.jwks.mint_token(sub=user_id, org_id=h.org_a, org_role="org:admin")
+    status, resp = await exchange_ws_ticket(h.http_url, token, meeting_id, role="ingest")
+    assert status == 200
+    ticket = resp["ticket"]
+
+    uri = f"{h.ws_url}/v1/meetings/{meeting_id}/stream?ticket={ticket}"
+
+    # Incoming connection increments to 11 (> 10) and is closed with 4429
+    with pytest.raises(ConnectionClosed) as exc:
+        async with websockets.connect(uri) as ws:
+            await ws.recv()
+
+    assert exc.value.rcvd is not None
+    assert exc.value.rcvd.code == WSCloseCode.RATE_LIMITED

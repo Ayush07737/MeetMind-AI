@@ -90,20 +90,30 @@ async def test_t7_deduplication_gap_tracking_and_meeting_end(
         assert ack_start["status"] == "accepted"
 
         # 2. consent_confirmed
-        await ws.send(
-            json.dumps(
-                {
-                    "type": "control",
-                    "action": "consent_confirmed",
-                    "consent_type": "audio_capture",
-                    "external_participants": False,
-                    "consent_text_version": "v1.0",
-                    "client_version": "1.0.0",
-                }
-            )
-        )
+        consent_frame_data = {
+            "type": "control",
+            "action": "consent_confirmed",
+            "consent_type": "audio_capture",
+            "external_participants": False,
+            "consent_text_version": "v1.0",
+            "client_version": "1.0.0",
+        }
+        await ws.send(json.dumps(consent_frame_data))
         ack_consent = json.loads(await ws.recv())
         assert ack_consent["status"] == "accepted"
+
+        # Duplicate consent_confirmed -> idempotent, acked without re-insertion
+        await ws.send(json.dumps(consent_frame_data))
+        ack_dup_consent = json.loads(await ws.recv())
+        assert ack_dup_consent["status"] == "accepted"
+
+        async with h.tenant_conn(tenant_id) as conn:
+            consent_count = await conn.fetchval(
+                "SELECT COUNT(*) FROM consent_events WHERE tenant_id = $1 AND meeting_id = $2",
+                tenant_id,
+                meeting_id,
+            )
+            assert consent_count == 1
 
         # 3. Send Frame client_seq=1
         ts1 = int(datetime.now(UTC).timestamp() * 1000)
@@ -157,7 +167,20 @@ async def test_t7_deduplication_gap_tracking_and_meeting_end(
         assert ack_end["type"] == "ack"
         assert ack_end["status"] == "accepted"
 
-        # 7. Connection gracefully closed with 1000 (NORMAL_CLOSURE)
+        # 7. Audio after meeting_end rejected with ErrorFrame(MEETING_ENDED)
+        ts_post = int(datetime.now(UTC).timestamp() * 1000)
+        post_end_frame = encode_audio_frame(
+            client_seq=99,
+            capture_ts_ms=ts_post,
+            payload=b"POST_END_PCM",
+        )
+        await ws.send(post_end_frame)
+
+        resp_post = json.loads(await ws.recv())
+        assert resp_post["type"] == "error"
+        assert resp_post["code"] == "MEETING_ENDED"
+
+        # 8. Connection gracefully closed with 1000 (NORMAL_CLOSURE)
         with pytest.raises(ConnectionClosed) as exc_closed:
             await ws.recv()
         assert exc_closed.value.rcvd is not None

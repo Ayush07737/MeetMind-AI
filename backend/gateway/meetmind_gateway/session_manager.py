@@ -267,6 +267,21 @@ class SessionManager:
         lkey = listeners_key(t, meeting_id)
         return await self._redis.scard(lkey)
 
+    async def refresh_activity(
+        self,
+        meeting_id: str,
+        tenant_id: str = "default",
+        ttl: int = 86400,
+    ) -> None:
+        """Refresh TTLs on meeting session and listener keys on activity."""
+        t = await self._resolve_tenant(meeting_id, tenant_id)
+        skey = meeting_session_key(t, meeting_id)
+        lkey = listeners_key(t, meeting_id)
+        bkey = meeting_tenant_binding_key(meeting_id)
+        await self._redis.expire(skey, ttl)
+        await self._redis.expire(lkey, ttl)
+        await self._redis.expire(bkey, ttl)
+
     async def cleanup_session(
         self,
         meeting_id: str,

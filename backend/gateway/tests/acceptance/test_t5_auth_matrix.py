@@ -105,6 +105,23 @@ async def test_t5_auth_token_failures_matrix(
     status, resp = await exchange_ws_ticket(h.http_url, hs256_token, meeting_id)
     assert status == 401
 
+    # 8. Missing organization claim outside dev -> 403 Forbidden
+    no_org_token = h.jwks.mint_token(
+        sub="user_no_org",
+        include_org=False,
+    )
+    status, resp = await exchange_ws_ticket(h.http_url, no_org_token, meeting_id)
+    assert status == 403
+
+    # 9. Unknown / unmapped tenant outside dev -> 403 Forbidden
+    unmapped_token = h.jwks.mint_token(
+        sub="user_unmapped",
+        org_id="org_unmapped_random_12345",
+        org_role="org:admin",
+    )
+    status, resp = await exchange_ws_ticket(h.http_url, unmapped_token, meeting_id)
+    assert status == 403
+
 
 @pytest.mark.asyncio
 async def test_t5_key_rotation_dynamic_success(
@@ -133,7 +150,10 @@ async def test_t5_key_rotation_dynamic_success(
 @pytest.mark.asyncio
 async def test_t5_ws_ticket_security_invariants(
     gateway_harness: ServerHarness,
+    real_redis,
 ) -> None:
+    from meetmind_gateway.keys import ws_ticket_key
+
     h = gateway_harness
     meeting_a = f"mtg_t5_a_{uuid.uuid4().hex[:6]}"
     meeting_b = f"mtg_t5_b_{uuid.uuid4().hex[:6]}"
@@ -148,6 +168,10 @@ async def test_t5_ws_ticket_security_invariants(
     assert exc_fake.value.rcvd is not None
     assert exc_fake.value.rcvd.code == WSCloseCode.UNAUTHORIZED
 
+    # Assert no session or stream keys created for nonexistent ticket
+    keys = await real_redis.keys(f"mm:*:{meeting_a}")
+    assert len(keys) == 0
+
     # 2. Ticket issued for meeting A used on meeting B -> 4403 (FORBIDDEN)
     status, resp_a = await exchange_ws_ticket(h.http_url, token, meeting_a, role="ingest")
     assert status == 200
@@ -160,7 +184,25 @@ async def test_t5_ws_ticket_security_invariants(
     assert exc_wrong_mtg.value.rcvd is not None
     assert exc_wrong_mtg.value.rcvd.code == WSCloseCode.FORBIDDEN
 
-    # 3. Ticket replay -> second connection gets 4401 (UNAUTHORIZED)
+    # Assert no session or stream keys created on meeting B
+    keys_b = await real_redis.keys(f"mm:*:{meeting_b}")
+    assert len(keys_b) == 0
+
+    # 3. Expired ticket -> 4401 (UNAUTHORIZED)
+    status_exp, resp_exp = await exchange_ws_ticket(h.http_url, token, meeting_a, role="ingest")
+    assert status_exp == 200
+    ticket_expired = resp_exp["ticket"]
+    # Simulate TTL expiration by deleting ticket from Redis
+    await real_redis.delete(ws_ticket_key(ticket_expired))
+
+    expired_uri = f"{h.ws_url}/v1/meetings/{meeting_a}/stream?ticket={ticket_expired}"
+    with pytest.raises(ConnectionClosed) as exc_expired:
+        async with websockets.connect(expired_uri) as ws_exp:
+            await ws_exp.recv()
+    assert exc_expired.value.rcvd is not None
+    assert exc_expired.value.rcvd.code == WSCloseCode.UNAUTHORIZED
+
+    # 4. Ticket replay -> second connection gets 4401 (UNAUTHORIZED)
     status2, resp2 = await exchange_ws_ticket(h.http_url, token, meeting_a, role="ingest")
     assert status2 == 200
     ticket_valid = resp2["ticket"]
