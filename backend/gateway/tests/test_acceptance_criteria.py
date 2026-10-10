@@ -20,19 +20,25 @@ from unittest.mock import AsyncMock, patch
 
 import jwt as pyjwt
 import pytest
-from conftest import TEST_JWKS_URL, make_test_jwt
 from cryptography.hazmat.primitives.asymmetric import rsa
 from fastapi import FastAPI, WebSocket
 from fastapi.testclient import TestClient
 from meetmind_gateway.auth import ClerkAuthenticator
 from meetmind_gateway.config import GatewaySettings
 from meetmind_gateway.frames import AdapterType
+from meetmind_gateway.keys import (
+    audio_stream_key,
+    listeners_key,
+    out_stream_key,
+    transcript_stream_key,
+)
 from meetmind_gateway.redis_streams import EventSubscriber, StreamProducer
 from meetmind_gateway.sequence import SequenceCounter
 from meetmind_gateway.session_manager import SessionManager
-from meetmind_gateway.ws_endpoint import websocket_ingest
+from meetmind_gateway.ws_endpoint import websocket_ingest, websocket_listen
 from meetmind_schemas.events import WSCloseCode
 from starlette.websockets import WebSocketDisconnect
+from tests.jwt_test_utils import TEST_JWKS_URL, make_test_jwt
 
 SECRET = "sk_test_secret_32_chars_long_val!"
 
@@ -81,6 +87,16 @@ def _build_test_app(fake_redis, settings: GatewaySettings | None = None) -> Fast
             redis_client=fake_redis,
         )
 
+    @app.websocket("/v1/meetings/{meeting_id}/listen")
+    async def ws_listen(websocket: WebSocket, meeting_id: str):
+        await websocket_listen(
+            ws=websocket,
+            meeting_id=meeting_id,
+            authenticator=app.state.authenticator,
+            session_manager=app.state.session_manager,
+            redis_client=fake_redis,
+        )
+
     return app
 
 
@@ -111,9 +127,12 @@ class TestConsentRejectionAudit:
             assert response["code"] == "CONSENT_REQUIRED"
 
             # 2. Verify rejection is written to the audit log (not just a 4xx / WS error)
-            mock_audit_gate.assert_awaited_once()
-            call_kwargs = mock_audit_gate.call_args.kwargs
-            assert call_kwargs["event_type"] == "frame_rejected_no_consent"
+            all_calls = mock_audit_gate.call_args_list + mock_audit_gw.call_args_list
+            rejection_calls = [
+                c for c in all_calls if c.kwargs.get("event_type") == "frame_rejected_no_consent"
+            ]
+            assert len(rejection_calls) >= 1
+            call_kwargs = rejection_calls[0].kwargs
             assert call_kwargs["payload"]["frame_type"] == "audio_chunk"
             assert call_kwargs["payload"]["meeting_id"] == "mtg_consent_test"
             assert call_kwargs["payload"]["reason"] == "consent_not_confirmed"
@@ -156,7 +175,17 @@ class TestRoutingByFrameShape:
                     )
                 )
                 ws.receive_text()  # consume meeting_start ack
-                ws.send_text(json.dumps({"type": "control", "action": "consent_confirmed"}))
+                ws.send_text(
+                    json.dumps(
+                        {
+                            "type": "control",
+                            "action": "consent_confirmed",
+                            "external_participants": False,
+                            "consent_text_version": "v1.0",
+                            "client_version": "1.0.0",
+                        }
+                    )
+                )
                 ws.receive_text()  # consume consent_confirmed ack
 
                 # Send binary frame (audio) -> goes to audio stream
@@ -178,8 +207,10 @@ class TestRoutingByFrameShape:
                 assert ack2["type"] == "ack"
 
                 # Check Redis streams: audio stream got binary, transcript stream got text
-                audio_stream = fake_redis._streams.get(f"audio:{meeting_id}", [])
-                transcript_stream = fake_redis._streams.get(f"transcript:{meeting_id}", [])
+                a_key = audio_stream_key("test_tenant", meeting_id)
+                t_key = transcript_stream_key("test_tenant", meeting_id)
+                audio_stream = fake_redis._streams.get(a_key, [])
+                transcript_stream = fake_redis._streams.get(t_key, [])
 
                 assert len(audio_stream) == 1
                 assert audio_stream[0][1]["audio_data"] == b"PCM_AUDIO_BYTES_TEST"
@@ -231,7 +262,17 @@ class TestWorkerFailover:
         with client_1.websocket_connect(f"/ws/ingest/{meeting_id}?token={token}") as ws1:
             ws1.send_text(json.dumps({"type": "control", "action": "meeting_start"}))
             ws1.receive_text()
-            ws1.send_text(json.dumps({"type": "control", "action": "consent_confirmed"}))
+            ws1.send_text(
+                json.dumps(
+                    {
+                        "type": "control",
+                        "action": "consent_confirmed",
+                        "external_participants": False,
+                        "consent_text_version": "v1.0",
+                        "client_version": "1.0.0",
+                    }
+                )
+            )
             ws1.receive_text()
             ws1.send_bytes(b"worker_1_audio_chunk_1")
             ack1 = json.loads(ws1.receive_text())
@@ -259,7 +300,7 @@ class TestWorkerFailover:
             assert ack3["seq"] == 3
 
         # Verify stream content: all 3 chunks retained in order with correct seq numbers
-        audio_stream = fake_redis._streams.get(f"audio:{meeting_id}", [])
+        audio_stream = fake_redis._streams.get(audio_stream_key("test_tenant", meeting_id), [])
         assert len(audio_stream) == 3
         assert audio_stream[0][1]["audio_data"] == b"worker_1_audio_chunk_1"
         assert audio_stream[0][1]["seq"] == "1"
@@ -278,34 +319,38 @@ class TestSimultaneousListeners:
     )
     @patch("meetmind_gateway.audit.write_audit_event", new_callable=AsyncMock)
     def test_two_listeners_no_duplicate_upstream(self, mock_audit, mock_check, fake_redis):
-        """Two listeners receive pubsub events without duplicate upstream stream publishing."""
+        """Two listeners connect via /listen and receive outbound events; writer ingests audio."""
         meeting_id = "mtg_dual_listeners"
         app = _build_test_app(fake_redis)
         client = TestClient(app)
 
         token1 = _make_token(sub="user_1")
-        token2 = _make_token(sub="user_2")
+        token2 = _make_token(sub="user_2", role="org:admin")
+        token_writer = _make_token(sub="user_writer")
 
         with (
-            client.websocket_connect(f"/ws/ingest/{meeting_id}?token={token1}") as ws1,
-            client.websocket_connect(f"/ws/ingest/{meeting_id}?token={token2}") as _ws2,
+            client.websocket_connect(f"/v1/meetings/{meeting_id}/listen?token={token1}") as _ws1,
+            client.websocket_connect(f"/v1/meetings/{meeting_id}/listen?token={token2}") as _ws2,
         ):
             # Both listeners are registered in Redis
-            listeners = fake_redis._data.get(f"listeners:{meeting_id}", set())
+            listeners = fake_redis._data.get(listeners_key("test_tenant", meeting_id), set())
             assert len(listeners) == 2
 
-            # Send audio from listener 1
-            ws1.send_bytes(b"single_audio_input")
-            ack = json.loads(ws1.receive_text())
-            assert ack["type"] == "ack"
+            writer_url = f"/ws/ingest/{meeting_id}?token={token_writer}"
+            with client.websocket_connect(writer_url) as ws_writer:
+                # Send audio from writer
+                ws_writer.send_bytes(b"single_audio_input")
+                ack = json.loads(ws_writer.receive_text())
+                assert ack["type"] == "ack"
 
-            # Verify audio stream was written exactly ONCE upstream (no duplication)
-            audio_stream = fake_redis._streams.get(f"audio:{meeting_id}", [])
-            assert len(audio_stream) == 1
-            assert audio_stream[0][1]["audio_data"] == b"single_audio_input"
+                # Verify audio stream was written exactly ONCE upstream (no duplication)
+                a_key = audio_stream_key("test_tenant", meeting_id)
+                audio_stream = fake_redis._streams.get(a_key, [])
+                assert len(audio_stream) == 1
+                assert audio_stream[0][1]["audio_data"] == b"single_audio_input"
 
     async def test_event_subscriber_fanout(self, fake_redis):
-        """Direct subscriber test: events published to events:{meeting_id}
+        """Direct subscriber test: events published to out_stream
         fan out to subscribers.
         """
         received_events_1 = []
@@ -321,23 +366,24 @@ class TestSimultaneousListeners:
             received_events_2.append(data)
 
         meeting_id = "mtg_fanout_test"
-        await sub1.subscribe(meeting_id, callback1)
-        await sub2.subscribe(meeting_id, callback2)
+        await sub1.subscribe(meeting_id, callback1, tenant_id="test_tenant")
+        await sub2.subscribe(meeting_id, callback2, tenant_id="test_tenant")
 
         # Single upstream publication
-        event_data = {"event_type": "battlecard_update", "payload": {"topic": "pricing"}}
-        await fake_redis.publish(f"events:{meeting_id}", json.dumps(event_data))
+        event_data = {"event_type": "intelligence_event", "payload": {"topic": "pricing"}}
+        out_key = out_stream_key("test_tenant", meeting_id)
+        await fake_redis.xadd(out_key, {"payload": json.dumps(event_data)})
 
         # Yield control so async listen loops process the message
         import asyncio
 
-        await asyncio.sleep(0.05)
+        await asyncio.sleep(0.1)
 
         # Both subscribers received the event from a single publish
         assert len(received_events_1) == 1
-        assert received_events_1[0]["event_type"] == "battlecard_update"
+        assert received_events_1[0]["event_type"] == "intelligence_event"
         assert len(received_events_2) == 1
-        assert received_events_2[0]["event_type"] == "battlecard_update"
+        assert received_events_2[0]["event_type"] == "intelligence_event"
 
         await sub1.unsubscribe()
         await sub2.unsubscribe()

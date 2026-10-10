@@ -38,19 +38,24 @@ class ConsentGate:
         """Return True if consent has been confirmed for this meeting."""
         return self._consented
 
-    async def confirm_consent(self, consent_type: str = "audio_capture") -> None:
-        """Record consent via the §15 consent service.
-
-        This writes both a consent record and an audit event.
-
-        Raises:
-            Exception: If the consent service fails.
-        """
+    async def confirm_consent(
+        self,
+        consent_type: str = "audio_capture",
+        external_participants: bool = False,
+        jurisdiction_hint: str | None = None,
+        consent_text_version: str = "v1.0",
+        client_version: str = "1.0.0",
+    ) -> None:
+        """Record consent via the §15 consent service with WP5 extended fields."""
         await record_consent(
             tenant_id=self.tenant_id,
             user_id=self.user_id,
             meeting_id=self.meeting_id,
             consent_type=consent_type,
+            external_participants=external_participants,
+            jurisdiction_hint=jurisdiction_hint,
+            consent_text_version=consent_text_version,
+            client_version=client_version,
         )
         self._consented = True
         logger.info(

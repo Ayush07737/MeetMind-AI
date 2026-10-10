@@ -4,7 +4,7 @@
   "version": "0.1.0",
   "description": "MeetMind AI \u2014 AI-powered meeting intelligence platform",
   "scripts": {
-    "test": "pnpm -r run test",
+    "test": "pnpm -r --workspace-concurrency=1 run test",
     "lint": "eslint .",
     "format": "prettier --write .",
     "format:check": "prettier --check ."

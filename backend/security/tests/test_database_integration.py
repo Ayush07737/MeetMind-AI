@@ -8,7 +8,7 @@ Tests run against a live PostgreSQL / Neon instance and verify:
 """
 
 import asyncio
-import os
+import json
 import uuid
 from pathlib import Path
 
@@ -28,21 +28,24 @@ pytestmark = [pytest.mark.integration, pytest.mark.timeout(120)]
 
 @pytest.fixture
 async def shared_db_pool():
-    dsn = os.getenv("NEON_DATABASE_URL")
-    if not dsn:
-        pytest.skip("NEON_DATABASE_URL is not set")
-    pool = await db.init_db(dsn)
+    try:
+        dsn = db.get_owner_dsn()
+    except RuntimeError:
+        pytest.skip("Owner DSN is not set")
+    pool = await db.init_db(dsn, verify_privileges=False)
     yield pool
     await db.close_db()
 
 
 @pytest.fixture
 async def app_db_pool():
-    dsn = os.getenv("NEON_APP_DATABASE_URL")
-    if not dsn:
-        pytest.skip("NEON_APP_DATABASE_URL is not set")
+    try:
+        dsn = db.get_app_dsn()
+    except RuntimeError:
+        pytest.skip("App DSN is not set")
     pool = await db._create_pool_with_retry(dsn)
     yield pool
+    await pool.close()
     await pool.close()
 
 
@@ -75,11 +78,82 @@ async def isolated_tenant(shared_db_pool):
 
 class TestDatabaseLayerIntegration:
     @pytest.mark.asyncio
+    async def test_ca2_pooled_dsn_200_interleaved_operations_no_schema_leak(self, shared_db_pool):
+        """CA-2: 200 interleaved operations across two tenants through the pooled DSN
+
+        Proves that SET LOCAL search_path inside transactions never leaks across
+        connections in the connection pool.
+        """
+        id_a = f"ca2_a_{uuid.uuid4().hex[:6]}"
+        id_b = f"ca2_b_{uuid.uuid4().hex[:6]}"
+        cfg_a = TenantConfig(
+            tenant_id=id_a,
+            pg_schema=f"tenant_{id_a}",
+            neo4j_namespace=id_a,
+            qdrant_prefix=id_a,
+            redis_prefix=id_a,
+        )
+        cfg_b = TenantConfig(
+            tenant_id=id_b,
+            pg_schema=f"tenant_{id_b}",
+            neo4j_namespace=id_b,
+            qdrant_prefix=id_b,
+            redis_prefix=id_b,
+        )
+        db._router.register(cfg_a)
+        db._router.register(cfg_b)
+
+        await apply_migrations(shared_db_pool, cfg_a.pg_schema)
+        await apply_migrations(shared_db_pool, cfg_b.pg_schema)
+
+        try:
+            sem = asyncio.Semaphore(10)
+
+            async def execute_tenant_op(tenant_cfg: TenantConfig, op_num: int):
+                async with sem, db.tenant_conn(tenant_cfg.tenant_id) as conn:
+                    current_schema = await conn.fetchval("SELECT current_schema()")
+                    assert current_schema == tenant_cfg.pg_schema, (
+                        f"Schema leak! Expected {tenant_cfg.pg_schema}, got {current_schema}"
+                    )
+                    await conn.execute(
+                        """
+                        INSERT INTO audit_events (tenant_id, user_id, event_type, payload)
+                        VALUES ($1, $2, $3, $4::jsonb)
+                        """,
+                        tenant_cfg.tenant_id,
+                        f"user_{op_num}",
+                        "ca2_concurrency_op",
+                        json.dumps({"op": op_num}),
+                    )
+
+            # 200 interleaved operations: 100 for A, 100 for B
+            tasks = []
+            for i in range(200):
+                cfg = cfg_a if (i % 2 == 0) else cfg_b
+                tasks.append(execute_tenant_op(cfg, i))
+
+            await asyncio.gather(*tasks)
+
+            # Assert each schema received exactly 100 events
+            async with db.tenant_conn(cfg_a.tenant_id) as conn:
+                count_a = await conn.fetchval("SELECT COUNT(*) FROM audit_events")
+                assert count_a == 100
+
+            async with db.tenant_conn(cfg_b.tenant_id) as conn:
+                count_b = await conn.fetchval("SELECT COUNT(*) FROM audit_events")
+                assert count_b == 100
+
+        finally:
+            async with shared_db_pool.acquire() as conn:
+                await conn.execute(f'DROP SCHEMA IF EXISTS "{cfg_a.pg_schema}" CASCADE')
+                await conn.execute(f'DROP SCHEMA IF EXISTS "{cfg_b.pg_schema}" CASCADE')
+
+    @pytest.mark.asyncio
     async def test_migration_runner_is_idempotent(self, shared_db_pool, isolated_tenant):
         schema = isolated_tenant.pg_schema
         # Verify schema is at version 1
         async with shared_db_pool.acquire() as conn:
-            is_valid = await verify_schema_version(conn, schema, expected_version=1)
+            is_valid = await verify_schema_version(conn, schema, expected_version=2)
             assert is_valid is True
 
         # Re-running migrations should apply nothing

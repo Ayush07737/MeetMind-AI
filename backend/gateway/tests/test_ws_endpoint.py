@@ -13,12 +13,12 @@ import json
 from unittest.mock import AsyncMock, patch
 
 import pytest
-from conftest import TEST_JWKS_URL, make_test_jwt
 from fastapi.testclient import TestClient
 from meetmind_gateway.app import create_app
 from meetmind_gateway.config import GatewaySettings
 from meetmind_schemas.events import WSCloseCode
 from starlette.websockets import WebSocketDisconnect
+from tests.jwt_test_utils import TEST_JWKS_URL, make_test_jwt
 
 
 @pytest.fixture
@@ -171,10 +171,6 @@ class TestConsentEnforcement:
                     {
                         "type": "transcript_chunk",
                         "text": "Hello world",
-                        "speaker": "speaker_0",
-                        "is_final": True,
-                        "start_ms": 0,
-                        "end_ms": 1000,
                     }
                 )
             )
@@ -193,12 +189,19 @@ class TestConsentEnforcement:
         token = make_test_jwt()
         client = TestClient(app_with_mocks)
         with client.websocket_connect(f"/ws/ingest/mtg_001?token={token}") as ws:
+            ws.send_text(json.dumps({"type": "control", "action": "meeting_start"}))
+            ack_start = json.loads(ws.receive_text())
+            assert ack_start["status"] == "accepted"
+
             ws.send_text(
                 json.dumps(
                     {
                         "type": "control",
                         "action": "consent_confirmed",
                         "consent_type": "audio_capture",
+                        "external_participants": False,
+                        "consent_text_version": "v1.0",
+                        "client_version": "1.0.0",
                     }
                 )
             )
@@ -220,11 +223,17 @@ class TestFrameProcessing:
         token = make_test_jwt()
         client = TestClient(app_with_mocks)
         with client.websocket_connect(f"/ws/ingest/mtg_001?token={token}") as ws:
+            ws.send_text(json.dumps({"type": "control", "action": "meeting_start"}))
+            ws.receive_text()
+
             ws.send_text(
                 json.dumps(
                     {
                         "type": "control",
                         "action": "consent_confirmed",
+                        "external_participants": False,
+                        "consent_text_version": "v1.0",
+                        "client_version": "1.0.0",
                     }
                 )
             )
@@ -235,10 +244,6 @@ class TestFrameProcessing:
                     {
                         "type": "transcript_chunk",
                         "text": "Meeting opened.",
-                        "speaker": "chair",
-                        "is_final": True,
-                        "start_ms": 0,
-                        "end_ms": 2000,
                     }
                 )
             )
@@ -255,11 +260,17 @@ class TestFrameProcessing:
         token = make_test_jwt()
         client = TestClient(app_with_mocks)
         with client.websocket_connect(f"/ws/ingest/mtg_001?token={token}") as ws:
+            ws.send_text(json.dumps({"type": "control", "action": "meeting_start"}))
+            ws.receive_text()
+
             ws.send_text(
                 json.dumps(
                     {
                         "type": "control",
                         "action": "consent_confirmed",
+                        "external_participants": False,
+                        "consent_text_version": "v1.0",
+                        "client_version": "1.0.0",
                     }
                 )
             )
@@ -307,14 +318,22 @@ class TestFrameProcessing:
     def test_audio_published_to_redis_stream(
         self, mock_audit, mock_record, mock_check, app_with_mocks, fake_redis
     ):
+        from meetmind_gateway.keys import audio_stream_key
+
         token = make_test_jwt()
         client = TestClient(app_with_mocks)
         with client.websocket_connect(f"/ws/ingest/mtg_001?token={token}") as ws:
+            ws.send_text(json.dumps({"type": "control", "action": "meeting_start"}))
+            ws.receive_text()
+
             ws.send_text(
                 json.dumps(
                     {
                         "type": "control",
                         "action": "consent_confirmed",
+                        "external_participants": False,
+                        "consent_text_version": "v1.0",
+                        "client_version": "1.0.0",
                     }
                 )
             )
@@ -322,7 +341,7 @@ class TestFrameProcessing:
             ws.send_bytes(b"mock_audio_data")
             ws.receive_text()  # consume ack
 
-        entries = fake_redis._streams.get("audio:mtg_001", [])
+        entries = fake_redis._streams.get(audio_stream_key("test_tenant", "mtg_001"), [])
         assert len(entries) == 1
 
 
@@ -342,18 +361,13 @@ class TestWriterConflict:
         client = TestClient(app_with_mocks)
 
         with client.websocket_connect(f"/ws/ingest/mtg_conflict?token={token1}") as ws1:
-            ws1.send_text(json.dumps({"type": "control", "action": "consent_confirmed"}))
+            ws1.send_text(json.dumps({"type": "control", "action": "meeting_start"}))
             ws1.receive_text()
-            ws1.send_bytes(b"audio_from_writer_1")
-            ws1.receive_text()  # writer lock acquired by ws1
 
             with (
-                pytest.raises(WebSocketDisconnect) as exc_info,
                 client.websocket_connect(f"/ws/ingest/mtg_conflict?token={token2}") as ws2,
+                pytest.raises(WebSocketDisconnect) as exc_info,
             ):
-                ws2.send_text(json.dumps({"type": "control", "action": "consent_confirmed"}))
-                ws2.receive_text()
-                ws2.send_bytes(b"audio_from_writer_2")  # conflict!
                 ws2.receive_text()
 
             assert exc_info.value.code == WSCloseCode.WRITER_CONFLICT

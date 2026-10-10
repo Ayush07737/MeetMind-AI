@@ -96,8 +96,46 @@ class TenantRouter:
         redis_pfx  = config.redis_prefix      # "default"
     """
 
-    def __init__(self, configs: dict[str, TenantConfig] | None = None) -> None:
-        self._configs = dict(configs) if configs is not None else dict(TENANT_CONFIGS)
+    def __init__(
+        self,
+        configs: dict[str, TenantConfig] | None = None,
+        allow_dynamic: bool | None = None,
+    ) -> None:
+        if configs is not None:
+            self._configs = dict(configs)
+        else:
+            self._configs = dict(TENANT_CONFIGS)
+            # Register mapped tenants from environment if present
+            org_map_str = os.getenv("TENANT_ORG_MAP", "")
+            if org_map_str.strip():
+                try:
+                    import json
+
+                    org_map = json.loads(org_map_str)
+                    if isinstance(org_map, dict):
+                        for _org_id, tid in org_map.items():
+                            if (
+                                isinstance(tid, str)
+                                and tid not in self._configs
+                                and TENANT_ID_REGEX.match(tid)
+                            ):
+                                schema = f"tenant_{tid.lower()}"[:48]
+                                if SCHEMA_NAME_REGEX.match(schema):
+                                    self._configs[tid] = TenantConfig(
+                                        tenant_id=tid,
+                                        pg_schema=schema,
+                                        neo4j_namespace=tid,
+                                        qdrant_prefix=tid,
+                                        redis_prefix=tid,
+                                    )
+                except Exception:
+                    pass
+
+        app_env = os.getenv("APP_ENV", "production").lower()
+        is_dev = app_env in ("development", "dev")
+        self._allow_dynamic = (
+            allow_dynamic if allow_dynamic is not None else (is_dev and configs is None)
+        )
 
     def resolve(self, tenant_id: str) -> TenantConfig:
         """Return the TenantConfig for the given tenant_id.
@@ -113,6 +151,16 @@ class TenantRouter:
 
         config = self._configs.get(tenant_id)
         if config is None:
+            if self._allow_dynamic:
+                schema = f"tenant_{tenant_id.lower()}"[:48]
+                if SCHEMA_NAME_REGEX.match(schema):
+                    return TenantConfig(
+                        tenant_id=tenant_id,
+                        pg_schema=schema,
+                        neo4j_namespace=tenant_id,
+                        qdrant_prefix=tenant_id,
+                        redis_prefix=tenant_id,
+                    )
             raise TenantNotFoundError(tenant_id)
         return config
 
