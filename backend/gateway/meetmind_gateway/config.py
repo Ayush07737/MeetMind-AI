@@ -29,7 +29,7 @@ class GatewaySettings(BaseSettings):
     }
 
     # -- Neon (Postgres) -------------------------------------------------------
-    neon_database_url: str
+    neon_database_url: str = ""
 
     # -- Redis -----------------------------------------------------------------
     redis_url: str = "redis://localhost:6379/0"

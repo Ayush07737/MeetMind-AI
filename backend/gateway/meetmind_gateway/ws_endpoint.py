@@ -652,7 +652,7 @@ async def websocket_ingest(
     redis_client: Any,
 ) -> None:
     """Main WebSocket handler for meeting stream ingestion (Write endpoint)."""
-    settings = get_settings()
+    settings = getattr(ws.app.state, "settings", None) or get_settings()
 
     # 1. Authenticate
     user = await _authenticate_ws(
@@ -893,7 +893,7 @@ async def websocket_listen(
     redis_client: Any,
 ) -> None:
     """Read-only listener endpoint for meeting events (/v1/meetings/{meeting_id}/listen)."""
-    settings = get_settings()
+    settings = getattr(ws.app.state, "settings", None) or get_settings()
 
     # 1. Authenticate (must have role="listen" or valid dev token)
     user = await _authenticate_ws(
