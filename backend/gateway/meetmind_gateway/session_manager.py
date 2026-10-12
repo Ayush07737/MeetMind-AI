@@ -2,7 +2,7 @@
 
 Tracks active meetings, connected listeners, and meeting state in Redis.
 Supports multiple simultaneous listeners per meeting without duplicating
-upstream processing, and enforces single-writer exclusivity.
+upstream processing, and enforces single-writer exclusivity with K7 lease takeover.
 
 All Redis keys are strictly formatted via meetmind_gateway.keys.
 """
@@ -12,6 +12,7 @@ from __future__ import annotations
 import logging
 import uuid
 from datetime import UTC, datetime
+from typing import Any
 
 import redis.asyncio as redis
 
@@ -20,11 +21,29 @@ from .keys import (
     last_seq_key,
     listeners_key,
     meeting_session_key,
-    meeting_tenant_binding_key,
     writer_lease_key,
 )
 
 logger = logging.getLogger(__name__)
+
+# K7: Atomic compare-and-set Lua script for writer lease acquisition and takeover
+LEASE_TAKEOVER_LUA = """
+local cur = redis.call('GET', KEYS[1])
+if not cur or cur == ARGV[1] then
+    redis.call('SET', KEYS[1], ARGV[1], 'PX', ARGV[2])
+    return 1
+else
+    return 0
+end
+"""
+
+LEASE_RELEASE_LUA = """
+if redis.call('GET', KEYS[1]) == ARGV[1] then
+    return redis.call('DEL', KEYS[1])
+else
+    return 0
+end
+"""
 
 
 class MeetingSession:
@@ -51,27 +70,70 @@ class CrossTenantAccessError(Exception):
 
 
 class SessionManager:
-    """Manages meeting sessions and listener tracking in Redis."""
+    """Manages meeting sessions, server-issued meetings, and leases in Redis."""
 
     def __init__(self, redis_client: redis.Redis) -> None:
         self._redis = redis_client
 
-    async def get_meeting_tenant(self, meeting_id: str) -> str | None:
-        """Lookup which tenant owns a meeting from the global binding key."""
-        bkey = meeting_tenant_binding_key(meeting_id)
-        val = await self._redis.get(bkey)
-        if val is None:
-            return None
-        return val.decode("utf-8") if isinstance(val, bytes) else str(val)
+    async def create_meeting(
+        self,
+        tenant_id: str,
+        owner_id: str,
+        meeting_id: str | None = None,
+    ) -> dict[str, Any]:
+        """Create a server-issued meeting bound to tenant and owner (K6)."""
+        mid = meeting_id or uuid.uuid4().hex
+        skey = meeting_session_key(tenant_id, mid)
+        now_iso = datetime.now(UTC).isoformat()
+        await self._redis.hset(
+            skey,
+            mapping={
+                "meeting_id": mid,
+                "tenant_id": tenant_id,
+                "owner_id": owner_id,
+                "user_id": owner_id,
+                "status": MeetingStatus.PENDING_CONSENT.value,
+                "created_at": now_iso,
+            },
+        )
+        await self._redis.expire(skey, 86400)
+        return {
+            "meeting_id": mid,
+            "tenant_id": tenant_id,
+            "owner_id": owner_id,
+            "status": MeetingStatus.PENDING_CONSENT.value,
+            "created_at": now_iso,
+        }
 
-    async def _resolve_tenant(self, meeting_id: str, tenant_id: str | None = None) -> str:
-        """Resolve effective tenant for a meeting."""
-        if tenant_id and tenant_id != "default":
-            return tenant_id
-        bound = await self.get_meeting_tenant(meeting_id)
-        if bound:
-            return bound
-        return tenant_id or "default"
+    async def get_meeting(self, tenant_id: str, meeting_id: str) -> dict[str, str] | None:
+        """Lookup an existing meeting within tenant scope (K6)."""
+        skey = meeting_session_key(tenant_id, meeting_id)
+        data = await self._redis.hgetall(skey)
+        if not data:
+            return None
+        return {
+            (k.decode("utf-8") if isinstance(k, bytes) else str(k)): (
+                v.decode("utf-8") if isinstance(v, bytes) else str(v)
+            )
+            for k, v in data.items()
+        }
+
+    async def find_meeting_tenant(self, meeting_id: str) -> str | None:
+        """Probe for which tenant holds this meeting (for audit logging only)."""
+        try:
+            keys = await self._redis.keys(f"mm:*:meeting:{meeting_id}")
+            if keys:
+                k_str = keys[0].decode("utf-8") if isinstance(keys[0], bytes) else str(keys[0])
+                parts = k_str.split(":")
+                if len(parts) >= 2:
+                    return parts[1]
+        except Exception as exc:
+            logger.warning("Error finding meeting tenant for %s: %s", meeting_id, exc)
+        return None
+
+    async def get_meeting_tenant(self, meeting_id: str) -> str | None:
+        """Backward-compatible helper: probe which tenant holds this meeting."""
+        return await self.find_meeting_tenant(meeting_id)
 
     async def create_session(
         self,
@@ -81,23 +143,6 @@ class SessionManager:
         adapter_type: str,
     ) -> MeetingSession:
         """Create or join a meeting session under tenant isolation."""
-        # 1. Enforce single-tenant binding per meeting
-        bkey = meeting_tenant_binding_key(meeting_id)
-        existing_tenant = await self._redis.get(bkey)
-        if existing_tenant is not None:
-            existing_tenant_str = (
-                existing_tenant.decode("utf-8")
-                if isinstance(existing_tenant, bytes)
-                else str(existing_tenant)
-            )
-            if existing_tenant_str != tenant_id:
-                raise CrossTenantAccessError(
-                    f"Meeting {meeting_id} belongs to tenant '{existing_tenant_str}', "
-                    f"access denied for tenant '{tenant_id}'"
-                )
-        else:
-            await self._redis.set(bkey, tenant_id, ex=86400, nx=True)
-
         session = MeetingSession(
             meeting_id=meeting_id,
             tenant_id=tenant_id,
@@ -115,6 +160,7 @@ class SessionManager:
                     "meeting_id": meeting_id,
                     "tenant_id": tenant_id,
                     "user_id": user_id,
+                    "owner_id": user_id,
                     "adapter_type": adapter_type,
                     "status": MeetingStatus.PENDING_CONSENT.value,
                     "started_at": session.started_at.isoformat(),
@@ -124,10 +170,9 @@ class SessionManager:
         else:
             data = await self._redis.hgetall(session_key)
             if data:
-                # Handle bytes vs str from redis
                 clean_data = {
-                    (k.decode("utf-8") if isinstance(k, bytes) else k): (
-                        v.decode("utf-8") if isinstance(v, bytes) else v
+                    (k.decode("utf-8") if isinstance(k, bytes) else str(k)): (
+                        v.decode("utf-8") if isinstance(v, bytes) else str(v)
                     )
                     for k, v in data.items()
                 }
@@ -143,6 +188,79 @@ class SessionManager:
 
         return session
 
+    async def acquire_or_takeover_writer_lease(
+        self,
+        meeting_id: str,
+        tenant_id: str,
+        user_id: str,
+        client_instance_id: str,
+        ttl_ms: int = 15000,
+    ) -> bool:
+        """Acquire or take over writer lease using atomic compare-and-set Lua script (K7).
+
+        Lease value is 'user_id:client_instance_id'.
+        Same owner and instance takes over immediately.
+        Different owner or instance is rejected.
+        """
+        lease_val = f"{user_id}:{client_instance_id}"
+        key = writer_lease_key(tenant_id, meeting_id)
+        try:
+            res = await self._redis.eval(LEASE_TAKEOVER_LUA, 1, key, lease_val, str(ttl_ms))
+            return bool(res == 1 or res == b"1")
+        except Exception:
+            # Fallback if eval unsupported (e.g. basic mock)
+            current = await self._redis.get(key)
+            if current is None:
+                return bool(await self._redis.set(key, lease_val, px=ttl_ms, nx=True))
+            curr_str = current.decode("utf-8") if isinstance(current, bytes) else str(current)
+            if curr_str == lease_val:
+                await self._redis.pexpire(key, ttl_ms)
+                return True
+            return False
+
+    async def refresh_writer_lease(
+        self,
+        meeting_id: str,
+        tenant_id: str,
+        user_id: str,
+        client_instance_id: str,
+        ttl_ms: int = 15000,
+    ) -> bool:
+        """Refresh writer lease if held by this user and client instance (K7)."""
+        lease_val = f"{user_id}:{client_instance_id}"
+        key = writer_lease_key(tenant_id, meeting_id)
+        try:
+            res = await self._redis.eval(LEASE_TAKEOVER_LUA, 1, key, lease_val, str(ttl_ms))
+            return bool(res == 1 or res == b"1")
+        except Exception:
+            current = await self._redis.get(key)
+            if current is not None:
+                curr_str = current.decode("utf-8") if isinstance(current, bytes) else str(current)
+                if curr_str == lease_val:
+                    await self._redis.pexpire(key, ttl_ms)
+                    return True
+            return False
+
+    async def release_writer_lease(
+        self,
+        meeting_id: str,
+        tenant_id: str,
+        user_id: str,
+        client_instance_id: str,
+    ) -> None:
+        """Release writer lease if held by this user and instance (K7)."""
+        lease_val = f"{user_id}:{client_instance_id}"
+        key = writer_lease_key(tenant_id, meeting_id)
+        try:
+            await self._redis.eval(LEASE_RELEASE_LUA, 1, key, lease_val)
+        except Exception:
+            current = await self._redis.get(key)
+            if current is not None:
+                curr_str = current.decode("utf-8") if isinstance(current, bytes) else str(current)
+                if curr_str == lease_val:
+                    await self._redis.delete(key)
+
+    # ── Backward-compatible lease helpers ─────────────────────────────────
     async def acquire_writer_lock(
         self,
         meeting_id: str,
@@ -150,17 +268,16 @@ class SessionManager:
         tenant_id: str = "default",
         ttl_ms: int = 15000,
     ) -> bool:
-        """Acquire single-writer lease for audio ingestion.
-
-        Returns:
-            True if acquired or already held by connection_id; False if conflict.
-        """
-        t = await self._resolve_tenant(meeting_id, tenant_id)
-        key = writer_lease_key(t, meeting_id)
+        """Backward-compatible lease acquisition."""
+        parts = connection_id.split(":", 1)
+        if len(parts) == 2:
+            return await self.acquire_or_takeover_writer_lease(
+                meeting_id, tenant_id, parts[0], parts[1], ttl_ms=ttl_ms
+            )
+        key = writer_lease_key(tenant_id, meeting_id)
         current = await self._redis.get(key)
         if current is None:
-            acquired = await self._redis.set(key, connection_id, nx=True, px=ttl_ms)
-            return bool(acquired)
+            return bool(await self._redis.set(key, connection_id, nx=True, px=ttl_ms))
         curr_str = current.decode("utf-8") if isinstance(current, bytes) else str(current)
         if curr_str == connection_id:
             await self._redis.pexpire(key, ttl_ms)
@@ -174,9 +291,13 @@ class SessionManager:
         tenant_id: str = "default",
         ttl_ms: int = 15000,
     ) -> bool:
-        """Refresh single-writer lease if held by this connection."""
-        t = await self._resolve_tenant(meeting_id, tenant_id)
-        key = writer_lease_key(t, meeting_id)
+        """Backward-compatible lease refresh."""
+        parts = connection_id.split(":", 1)
+        if len(parts) == 2:
+            return await self.refresh_writer_lease(
+                meeting_id, tenant_id, parts[0], parts[1], ttl_ms=ttl_ms
+            )
+        key = writer_lease_key(tenant_id, meeting_id)
         current = await self._redis.get(key)
         if current is not None:
             curr_str = current.decode("utf-8") if isinstance(current, bytes) else str(current)
@@ -191,14 +312,23 @@ class SessionManager:
         connection_id: str,
         tenant_id: str = "default",
     ) -> None:
-        """Release writer lease if held by this connection."""
-        t = await self._resolve_tenant(meeting_id, tenant_id)
-        key = writer_lease_key(t, meeting_id)
+        """Backward-compatible lease release."""
+        parts = connection_id.split(":", 1)
+        if len(parts) == 2:
+            await self.release_writer_lease(meeting_id, tenant_id, parts[0], parts[1])
+            return
+        key = writer_lease_key(tenant_id, meeting_id)
         current = await self._redis.get(key)
         if current is not None:
             curr_str = current.decode("utf-8") if isinstance(current, bytes) else str(current)
             if curr_str == connection_id:
                 await self._redis.delete(key)
+
+    async def _resolve_tenant(self, meeting_id: str, tenant_id: str = "default") -> str:
+        if tenant_id and tenant_id != "default":
+            return tenant_id
+        found = await self.find_meeting_tenant(meeting_id)
+        return found or tenant_id
 
     async def update_status(
         self,
@@ -206,11 +336,10 @@ class SessionManager:
         status: MeetingStatus,
         tenant_id: str = "default",
     ) -> None:
-        """Update the meeting status in Redis."""
+        """Update meeting status."""
         t = await self._resolve_tenant(meeting_id, tenant_id)
-        skey = meeting_session_key(t, meeting_id)
-        await self._redis.hset(skey, "status", status.value)
-        await self._redis.expire(skey, 86400)
+        key = meeting_session_key(t, meeting_id)
+        await self._redis.hset(key, "status", status.value)
 
     async def get_status(
         self,
@@ -218,28 +347,28 @@ class SessionManager:
         tenant_id: str = "default",
     ) -> MeetingStatus | None:
         """Get the current meeting status."""
-        t = await self._resolve_tenant(meeting_id, tenant_id)
-        skey = meeting_session_key(t, meeting_id)
-        status_val = await self._redis.hget(skey, "status")
-        if status_val is None:
+        data = await self.get_session_data(meeting_id, tenant_id)
+        if not data:
             return None
-        val_str = status_val.decode("utf-8") if isinstance(status_val, bytes) else str(status_val)
+        val_str = data.get("status")
+        if not val_str:
+            return None
         return MeetingStatus(val_str)
 
     async def get_session_data(
         self,
         meeting_id: str,
         tenant_id: str = "default",
-    ) -> dict[str, str] | None:
-        """Get all session metadata."""
+    ) -> dict[str, str]:
+        """Fetch all metadata fields for a meeting session."""
         t = await self._resolve_tenant(meeting_id, tenant_id)
-        skey = meeting_session_key(t, meeting_id)
-        data = await self._redis.hgetall(skey)
+        key = meeting_session_key(t, meeting_id)
+        data = await self._redis.hgetall(key)
         if not data:
-            return None
+            return {}
         return {
-            (k.decode("utf-8") if isinstance(k, bytes) else k): (
-                v.decode("utf-8") if isinstance(v, bytes) else v
+            (k.decode("utf-8") if isinstance(k, bytes) else str(k)): (
+                v.decode("utf-8") if isinstance(v, bytes) else str(v)
             )
             for k, v in data.items()
         }
@@ -273,14 +402,20 @@ class SessionManager:
         tenant_id: str = "default",
         ttl: int = 86400,
     ) -> None:
-        """Refresh TTLs on meeting session and listener keys on activity."""
+        """Refresh TTLs on meeting session and listener keys on activity (K4)."""
         t = await self._resolve_tenant(meeting_id, tenant_id)
         skey = meeting_session_key(t, meeting_id)
         lkey = listeners_key(t, meeting_id)
-        bkey = meeting_tenant_binding_key(meeting_id)
-        await self._redis.expire(skey, ttl)
-        await self._redis.expire(lkey, ttl)
-        await self._redis.expire(bkey, ttl)
+        try:
+            await self._redis.expire(skey, ttl)
+            await self._redis.expire(lkey, ttl)
+        except Exception as exc:
+            logger.warning(
+                "Failed to refresh activity TTL for meeting %s (tenant %s): %s",
+                meeting_id,
+                t,
+                exc,
+            )
 
     async def cleanup_session(
         self,
@@ -294,5 +429,4 @@ class SessionManager:
             listeners_key(t, meeting_id),
             writer_lease_key(t, meeting_id),
             last_seq_key(t, meeting_id),
-            meeting_tenant_binding_key(meeting_id),
         )

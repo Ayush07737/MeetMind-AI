@@ -7,11 +7,14 @@ and the one-time WebSocket ticket issuer.
 
 from __future__ import annotations
 
+import asyncio
 import contextlib
 import json
 import logging
 import secrets
+import sys
 import time
+import uuid
 from collections.abc import AsyncGenerator
 from contextlib import asynccontextmanager
 from typing import Any
@@ -46,12 +49,18 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
         decode_responses=True,
         max_connections=50,
     )
-    # Separate client for binary data (audio chunks have bytes)
+    # Separate client for binary data (audio chunks have bytes) — WP6: audio_redis_url
+    audio_redis_url = settings.audio_redis_url or settings.redis_url
     redis_binary_client = aioredis.from_url(
-        settings.redis_url,
+        audio_redis_url,
         decode_responses=False,
         max_connections=50,
     )
+
+    # WP6: Startup non-persistence check
+    from .persistence_check import assert_audio_redis_not_persistent
+
+    await assert_audio_redis_not_persistent(redis_binary_client, settings)
 
     app.state.redis = redis_client
     app.state.redis_binary = redis_binary_client
@@ -67,8 +76,13 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
     app.state.session_manager = SessionManager(redis_client)
     app.state.seq_counter = SequenceCounter(redis_client)
     app.state.stream_producer = StreamProducer(
-        redis_binary_client, maxlen=settings.redis_stream_maxlen
+        redis_binary_client, maxlen=settings.audio_stream_maxlen
     )
+
+    # WP6: Background Janitor task
+    from .janitor import run_janitor_loop
+
+    janitor_task = asyncio.create_task(run_janitor_loop(redis_client, app.state.session_manager))
 
     # -- Warm DB connection pool via app role (CA-1) ---------------------------
     try:
@@ -76,9 +90,20 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
 
         pool = await init_db(get_app_dsn(), verify_privileges=True)
         warmed = [await pool.acquire() for _ in range(pool.get_min_size())]
+        current_user = await warmed[0].fetchval("SELECT current_user")
         for conn in warmed:
             await pool.release(conn)
-        logger.info("Database pool warmed (%d connections)", pool.get_min_size())
+        msg = (
+            f"INFO: Database pool warmed ({pool.get_min_size()} connections, "
+            f"current_user={current_user})\n"
+        )
+        sys.stderr.write(msg)
+        sys.stderr.flush()
+        logger.info(
+            "Database pool warmed (%d connections, current_user=%s)",
+            pool.get_min_size(),
+            current_user,
+        )
     except RuntimeError as exc:
         if "Security violation" in str(exc) or "holds illegal privilege" in str(exc):
             logger.critical("Startup refused due to database privilege violation: %s", exc)
@@ -92,6 +117,9 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
     yield
 
     # -- Shutdown --------------------------------------------------------------
+    janitor_task.cancel()
+    with contextlib.suppress(asyncio.CancelledError):
+        await janitor_task
     await redis_client.aclose()
     await redis_binary_client.aclose()
     try:
@@ -116,6 +144,15 @@ def create_app(settings: GatewaySettings | None = None) -> FastAPI:
     )
     app.state.settings = settings
 
+    # ── Multi-Tenancy Router Injection (K2) ──────────────────────────────
+    from meetmind_security.tenant import configure_tenant_router
+
+    configure_tenant_router(
+        app_env=settings.app_env,
+        tenant_org_map=settings.tenant_org_map,
+        default_tenant_id=settings.default_tenant_id,
+    )
+
     # ── CORS Middleware (CA-3 & Security Hardening) ──────────────────────
     from fastapi.middleware.cors import CORSMiddleware
 
@@ -134,10 +171,10 @@ def create_app(settings: GatewaySettings | None = None) -> FastAPI:
     async def health_check() -> dict[str, str]:
         return {"status": "ok", "service": "gateway"}
 
-    # ── One-Time WebSocket Ticket Exchange (WP4) ─────────────────────────
-    @app.post("/v1/ws-ticket")
-    async def create_ws_ticket(request: Request) -> dict[str, Any]:
-        """Issue a single-use 128-bit ticket bound to meeting_id and role (ingest|listen)."""
+    # ── Server-Issued Meeting Lifecycle (K6) ─────────────────────────────
+    @app.post("/v1/meetings", status_code=status.HTTP_201_CREATED)
+    async def create_meeting(request: Request) -> dict[str, Any]:
+        """Issue a random unguessable meeting_id bound to tenant and owner (K6)."""
         auth_header = request.headers.get("Authorization", "")
         if not auth_header.startswith("Bearer "):
             raise HTTPException(
@@ -158,12 +195,50 @@ def create_app(settings: GatewaySettings | None = None) -> FastAPI:
                 detail=str(exc.message),
             ) from exc
 
-        # Parse request body or query params for meeting_id and role
         body: dict[str, Any] = {}
         with contextlib.suppress(Exception):
             body = await request.json()
 
-        meeting_id = str(body.get("meeting_id") or request.query_params.get("meeting_id") or "")
+        raw_mid = str(body.get("meeting_id") or "").strip()
+        meeting_id = raw_mid or uuid.uuid4().hex  # 32 characters (>= 22)
+        record = await app.state.session_manager.create_meeting(
+            tenant_id=user.tenant_id,
+            owner_id=user.user_id,
+            meeting_id=meeting_id,
+        )
+        return record
+
+    # ── One-Time WebSocket Ticket Exchange (WP4, K6, K7) ──────────────────
+    @app.post("/v1/ws-ticket")
+    async def create_ws_ticket(request: Request) -> dict[str, Any]:
+        """Issue a single-use 128-bit ticket bound to meeting_id, role, and client_instance_id."""
+        auth_header = request.headers.get("Authorization", "")
+        if not auth_header.startswith("Bearer "):
+            raise HTTPException(
+                status_code=status.HTTP_401_UNAUTHORIZED,
+                detail="Missing or invalid Authorization header",
+            )
+        token = auth_header[7:].strip()
+        try:
+            user = await app.state.authenticator.authenticate(token)
+        except AuthForbiddenError as exc:
+            raise HTTPException(
+                status_code=status.HTTP_403_FORBIDDEN,
+                detail=str(exc.message),
+            ) from exc
+        except AuthUnauthorizedError as exc:
+            raise HTTPException(
+                status_code=status.HTTP_401_UNAUTHORIZED,
+                detail=str(exc.message),
+            ) from exc
+
+        # Parse request body or query params for meeting_id, role, client_instance_id
+        body: dict[str, Any] = {}
+        with contextlib.suppress(Exception):
+            body = await request.json()
+
+        mid_source = body.get("meeting_id") or request.query_params.get("meeting_id") or ""
+        meeting_id = str(mid_source).strip()
         role = str(body.get("role") or request.query_params.get("role") or "ingest").lower()
 
         if role not in ("ingest", "listen"):
@@ -172,10 +247,19 @@ def create_app(settings: GatewaySettings | None = None) -> FastAPI:
                 detail="Role must be 'ingest' or 'listen'",
             )
 
-        if meeting_id:
-            # Enforce cross-tenant isolation at ticket issue time
-            bound_tenant = await app.state.session_manager.get_meeting_tenant(meeting_id)
-            if bound_tenant and bound_tenant != user.tenant_id:
+        if not meeting_id:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail="meeting_id is required",
+            )
+
+        # K6: Server-issued meeting ids. Verify meeting exists in tenant.
+        # "Not found" and "not yours" return the SAME 404 response externally
+        # (audit still distinguishes them).
+        existing_meeting = await app.state.session_manager.get_meeting(user.tenant_id, meeting_id)
+        if not existing_meeting:
+            other_tenant = await app.state.session_manager.find_meeting_tenant(meeting_id)
+            if other_tenant and other_tenant != user.tenant_id:
                 try:
                     from meetmind_security.audit_log import write_audit_event
 
@@ -185,35 +269,51 @@ def create_app(settings: GatewaySettings | None = None) -> FastAPI:
                         event_type="cross_tenant_access_denied",
                         payload={
                             "meeting_id": meeting_id,
-                            "target_tenant": bound_tenant,
+                            "target_tenant": other_tenant,
                             "attempted_tenant": user.tenant_id,
                             "source": "ticket_exchange",
                         },
                     )
                 except Exception:
                     pass
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND,
+                detail="meeting not found",
+            )
+
+        # Enforce can_listen role permissions if role is listen
+        if role == "listen":
+            owner_id = existing_meeting.get("owner_id") or existing_meeting.get("user_id", "")
+            if not can_listen(
+                user,
+                user.tenant_id,
+                owner_id,
+                settings.elevated_listen_roles,
+            ):
                 raise HTTPException(
                     status_code=status.HTTP_403_FORBIDDEN,
-                    detail="cross-tenant access denied",
+                    detail="forbidden: cannot listen to meeting",
                 )
 
-            # Enforce can_listen role permissions if role is listen
-            if role == "listen":
-                session_data = await app.state.session_manager.get_session_data(
-                    meeting_id, user.tenant_id
+        # K7: client_instance_id is required for capture session
+        client_instance_id = str(
+            body.get("client_instance_id") or request.query_params.get("client_instance_id") or ""
+        ).strip()
+        if not client_instance_id:
+            if role == "ingest":
+                raise HTTPException(
+                    status_code=status.HTTP_400_BAD_REQUEST,
+                    detail="client_instance_id is required for ingest role",
                 )
-                if session_data:
-                    owner_id = session_data.get("user_id", "")
-                    if not can_listen(
-                        user,
-                        user.tenant_id,
-                        owner_id,
-                        settings.elevated_listen_roles,
-                    ):
-                        raise HTTPException(
-                            status_code=status.HTTP_403_FORBIDDEN,
-                            detail="forbidden: cannot listen to meeting",
-                        )
+            client_instance_id = str(uuid.uuid4())
+        else:
+            try:
+                uuid.UUID(client_instance_id)
+            except Exception as exc:
+                raise HTTPException(
+                    status_code=status.HTTP_400_BAD_REQUEST,
+                    detail="client_instance_id must be a valid UUID",
+                ) from exc
 
         # 128-bit cryptographically secure ticket
         ticket = secrets.token_urlsafe(16)
@@ -224,20 +324,22 @@ def create_app(settings: GatewaySettings | None = None) -> FastAPI:
                 "session_id": user.session_id,
                 "role": role,
                 "meeting_id": meeting_id,
+                "client_instance_id": client_instance_id,
                 "claims": user.claims,
                 "role_claim": user.role,
                 "created_at": time.time(),
             }
         )
         ticket_key = ws_ticket_key(ticket)
-        stored = await app.state.redis.set(ticket_key, ticket_payload, ex=30, nx=True)
+        ticket_ttl = settings.ticket_ttl_seconds
+        stored = await app.state.redis.set(ticket_key, ticket_payload, ex=ticket_ttl, nx=True)
         if not stored:
             raise HTTPException(
                 status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
                 detail="Failed to store ticket",
             )
 
-        return {"ticket": ticket, "expires_in": 30}
+        return {"ticket": ticket, "expires_in": ticket_ttl}
 
     # ── WebSocket routes (WP4) ───────────────────────────────────────────
     @app.websocket("/v1/meetings/{meeting_id}/stream")

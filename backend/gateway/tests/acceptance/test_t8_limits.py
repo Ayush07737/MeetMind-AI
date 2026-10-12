@@ -18,7 +18,7 @@ from conftest import ServerHarness, exchange_ws_ticket
 from meetmind_schemas.events import WSCloseCode
 from websockets.exceptions import ConnectionClosed
 
-pytestmark = [pytest.mark.integration]
+pytestmark = [pytest.mark.integration, pytest.mark.timeout(120)]
 
 
 @pytest.mark.asyncio
@@ -167,9 +167,9 @@ async def test_t8_per_connection_rate_limit(
     uri = f"{h.ws_url}/v1/meetings/{meeting_id}/stream?ticket={ticket}"
 
     async with websockets.connect(uri) as ws:
-        # Rapid flood of 150 frames (> 120 frame/sec limit)
+        # Rapid flood of 200 frames (> 150 burst capacity)
         with pytest.raises(ConnectionClosed) as exc:
-            for _ in range(150):
+            for _ in range(200):
                 await ws.send(b"\x00\x01\x02\x03\x04\x05")
 
             # Consume error frame and close frame

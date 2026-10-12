@@ -92,7 +92,7 @@ class TestStreamProducer:
         entry_id = await producer.publish_outbound_event(
             "mtg_001",
             "acme",
-            {"event_type": "transcript_chunk", "text": "test", "seq": 1},
+            {"event_type": "transcript_interim", "text": "test", "seq": 1},
         )
         assert entry_id is not None
         skey = out_stream_key("acme", "mtg_001")

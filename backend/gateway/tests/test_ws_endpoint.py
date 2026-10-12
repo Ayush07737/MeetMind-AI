@@ -25,7 +25,7 @@ from tests.jwt_test_utils import TEST_JWKS_URL, make_test_jwt
 def test_settings() -> GatewaySettings:
     return GatewaySettings(
         neon_database_url="postgresql://test:test@localhost/test",
-        redis_url="redis://localhost:6379/0",
+        redis_url="redis://127.0.0.1:6379/0",
         clerk_jwks_url=TEST_JWKS_URL,
         clerk_secret_key="sk_test_secret_32_chars_long_val!",
         clerk_publishable_key="pk_test_key",
@@ -73,12 +73,24 @@ class TestWebSocketAuthAndTickets:
             assert exc_info.value.code == WSCloseCode.UNAUTHORIZED
 
     def test_ticket_exchange_and_connect(self, app_with_mocks):
-        """Full ticket flow: POST /v1/ws-ticket -> connect with ticket -> success."""
+        """Full ticket flow: POST /v1/ws-ticket -> connect with ticket -> success (K6/K7)."""
+        import uuid
+
         token = make_test_jwt()
         client = TestClient(app_with_mocks)
 
+        # 0. Create meeting
+        m_resp = client.post("/v1/meetings", headers={"Authorization": f"Bearer {token}"})
+        assert m_resp.status_code == 201
+        meeting_id = m_resp.json()["meeting_id"]
+
         # 1. Exchange JWT for ticket
-        resp = client.post("/v1/ws-ticket", headers={"Authorization": f"Bearer {token}"})
+        inst_id = str(uuid.uuid4())
+        resp = client.post(
+            "/v1/ws-ticket",
+            headers={"Authorization": f"Bearer {token}"},
+            json={"meeting_id": meeting_id, "role": "ingest", "client_instance_id": inst_id},
+        )
         assert resp.status_code == 200
         ticket_data = resp.json()
         assert "ticket" in ticket_data
@@ -87,7 +99,7 @@ class TestWebSocketAuthAndTickets:
         # 2. Connect with ticket
         with (
             patch("meetmind_gateway.audit.write_audit_event", new_callable=AsyncMock),
-            client.websocket_connect(f"/v1/meetings/mtg_001/stream?ticket={ticket}") as ws,
+            client.websocket_connect(f"/v1/meetings/{meeting_id}/stream?ticket={ticket}") as ws,
         ):
             ws.send_text(json.dumps({"type": "control", "action": "meeting_end"}))
             ack = json.loads(ws.receive_text())
@@ -95,21 +107,34 @@ class TestWebSocketAuthAndTickets:
 
     def test_replayed_ticket_rejected(self, app_with_mocks):
         """A ticket consumed once cannot be reused (atomic GETDEL)."""
+        import uuid
+
         token = make_test_jwt()
         client = TestClient(app_with_mocks)
 
-        resp = client.post("/v1/ws-ticket", headers={"Authorization": f"Bearer {token}"})
+        # 0. Create meeting
+        m_resp = client.post("/v1/meetings", headers={"Authorization": f"Bearer {token}"})
+        assert m_resp.status_code == 201
+        meeting_id = m_resp.json()["meeting_id"]
+
+        inst_id = str(uuid.uuid4())
+        resp = client.post(
+            "/v1/ws-ticket",
+            headers={"Authorization": f"Bearer {token}"},
+            json={"meeting_id": meeting_id, "role": "ingest", "client_instance_id": inst_id},
+        )
+        assert resp.status_code == 200
         ticket = resp.json()["ticket"]
 
         # First connection consumes ticket
         with (
             patch("meetmind_gateway.audit.write_audit_event", new_callable=AsyncMock),
-            client.websocket_connect(f"/v1/meetings/mtg_001/stream?ticket={ticket}") as ws,
+            client.websocket_connect(f"/v1/meetings/{meeting_id}/stream?ticket={ticket}") as ws,
         ):
             ws.send_text(json.dumps({"type": "control", "action": "meeting_end"}))
 
         # Replay ticket -> rejected with 4401
-        with client.websocket_connect(f"/v1/meetings/mtg_001/stream?ticket={ticket}") as ws:
+        with client.websocket_connect(f"/v1/meetings/{meeting_id}/stream?ticket={ticket}") as ws:
             with pytest.raises(WebSocketDisconnect) as exc_info:
                 ws.receive_text()
             assert exc_info.value.code == WSCloseCode.UNAUTHORIZED

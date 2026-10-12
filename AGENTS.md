@@ -78,6 +78,9 @@ Every service that will eventually need tenant isolation **must** route through 
 3. All consent state changes generate audit events.
 4. These primitives exist in `backend/security/` and must be operational before any
    other component's development begins.
+5. **Raw audio never persists to disk (WP6)** — ephemeral in-memory Redis Streams only, bounded
+   stream length, 15m active TTL, 5m post-meeting grace TTL. Gateway refuses to start if Redis
+   persistence is enabled.
 
 ## Code Style
 
@@ -101,6 +104,9 @@ Every service that will eventually need tenant isolation **must** route through 
 ## Environment
 
 - Local development: Docker Desktop with WSL2 backend on Windows.
-- `docker-compose.dev.yml` brings up Redis 7, Neo4j CE, and Qdrant.
+- `docker-compose.dev.yml` brings up Redis 7 (`redis:7-alpine`), Neo4j CE, and Qdrant.
+- Redis configuration: Acceptance tests and benchmarks connect via `ACCEPTANCE_REDIS_URL`
+  (defaults to `redis://127.0.0.1:6379/0`). During tests such as T10b, container lifecycle
+  is controlled via `docker stop meetmind-redis` and `docker start meetmind-redis`.
 - Neon handles all PostgreSQL needs (dev branch for local, prod branch for deploy).
 - All env vars documented in `.env.example`.

@@ -6,6 +6,7 @@ import asyncio
 from typing import Any
 
 import pytest
+from meetmind_gateway.app import create_app
 from meetmind_gateway.auth import AuthenticatedUser, ClerkAuthenticator
 from meetmind_gateway.config import GatewaySettings
 from meetmind_gateway.redis_streams import StreamProducer
@@ -23,18 +24,32 @@ class FakeRedis:
 
     def __init__(self) -> None:
         self._data: dict[str, Any] = {}
+        self._ttls: dict[str, int] = {}
+        self._expires_at: dict[str, float] = {}
         self._streams: dict[str, list[tuple[str, dict]]] = {}
         self._stream_counter: dict[str, int] = {}
         self._dollar_cursors: dict[str, str] = {}
         self._pubsub_channels: dict[str, list] = {}
 
+    def _check_expiry(self, key: str) -> None:
+        import time
+
+        if key in self._expires_at and time.time() >= self._expires_at[key]:
+            self._data.pop(key, None)
+            self._expires_at.pop(key, None)
+            self._ttls.pop(key, None)
+
     async def get(self, key: str) -> str | None:
+        self._check_expiry(key)
         return self._data.get(key)
 
     async def getdel(self, key: str) -> str | None:
+        self._check_expiry(key)
         val = self._data.get(key)
         if key in self._data:
             del self._data[key]
+            self._expires_at.pop(key, None)
+            self._ttls.pop(key, None)
         return val
 
     async def set(
@@ -45,13 +60,44 @@ class FakeRedis:
         px: int | None = None,
         nx: bool = False,
     ) -> bool:
+        self._check_expiry(key)
         if nx and key in self._data:
             return False
         self._data[key] = str(value)
+        import time
+
+        if ex:
+            self._ttls[key] = ex
+            self._expires_at[key] = time.time() + ex
+        elif px:
+            self._ttls[key] = max(1, px // 1000)
+            self._expires_at[key] = time.time() + (px / 1000.0)
+        else:
+            self._expires_at.pop(key, None)
+            self._ttls.pop(key, None)
         return True
 
-    async def expire(self, key: str, time: int) -> bool:
-        return key in self._data
+    async def expire(self, key: str, time_sec: int) -> bool:
+        self._check_expiry(key)
+        if key in self._data:
+            import time
+
+            self._ttls[key] = time_sec
+            self._expires_at[key] = time.time() + time_sec
+            return True
+        return False
+
+    async def ttl(self, key: str) -> int:
+        self._check_expiry(key)
+        if key not in self._data:
+            return -2
+        return self._ttls.get(key, -1)
+
+    async def keys(self, pattern: str = "*") -> list[bytes]:
+        import fnmatch
+
+        all_keys = set(self._data.keys()) | set(self._streams.keys())
+        return [k.encode("utf-8") for k in all_keys if fnmatch.fnmatch(k, pattern)]
 
     async def pexpire(self, key: str, time: int) -> bool:
         return key in self._data
@@ -123,7 +169,14 @@ class FakeRedis:
     async def scard(self, key: str) -> int:
         return len(self._data.get(key, set()))
 
-    async def xadd(self, stream: str, fields: dict, maxlen: int | None = None) -> str:
+    async def xadd(
+        self,
+        stream: str,
+        fields: dict,
+        maxlen: int | None = None,
+        approximate: bool = False,
+        **kwargs: Any,
+    ) -> str:
         if stream not in self._streams:
             self._streams[stream] = []
             self._stream_counter[stream] = 0
@@ -238,7 +291,7 @@ def settings() -> GatewaySettings:
     """Return test settings configured with local test JWKS."""
     return GatewaySettings(
         neon_database_url="postgresql://test:test@localhost/test",
-        redis_url="redis://localhost:6379/0",
+        redis_url="redis://127.0.0.1:6379/0",
         clerk_jwks_url=TEST_JWKS_URL,
         clerk_secret_key="sk_test_fake_key_for_testing",
         clerk_publishable_key="pk_test_fake_key_for_testing",
@@ -281,3 +334,23 @@ def authenticated_user() -> AuthenticatedUser:
         session_id="sess_test_456",
         claims={"sub": "user_test_123", "org_id": "test_tenant"},
     )
+
+
+@pytest.fixture
+def app_with_mocks(
+    settings: GatewaySettings,
+    fake_redis: FakeRedis,
+    authenticator: ClerkAuthenticator,
+    seq_counter: SequenceCounter,
+    stream_producer: StreamProducer,
+    session_manager: SessionManager,
+):
+    """Create gateway FastAPI app with FakeRedis and test authenticator."""
+    app = create_app(settings)
+    app.state.redis = fake_redis
+    app.state.redis_binary = fake_redis
+    app.state.authenticator = authenticator
+    app.state.seq_counter = seq_counter
+    app.state.stream_producer = stream_producer
+    app.state.session_manager = session_manager
+    return app

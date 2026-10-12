@@ -72,18 +72,21 @@ class TestSessionManager:
         assert s2.status == MeetingStatus.ACTIVE
 
     async def test_refresh_activity_updates_ttls(self, manager, fake_redis):
-        """Verify that refresh_activity refreshes TTLs on session and listener keys."""
+        """Verify that refresh_activity refreshes TTLs on session and listener keys (K4)."""
         await manager.create_session("mtg_001", "acme", "user_1", "chrome")
         # Call refresh_activity
         await manager.refresh_activity("mtg_001", "acme", ttl=3600)
 
-        # Keys exist and are tracked
+        # Keys exist and have positive TTL
         from meetmind_gateway.keys import (
             listeners_key,
             meeting_session_key,
-            meeting_tenant_binding_key,
         )
 
-        assert await fake_redis.exists(meeting_session_key("acme", "mtg_001")) == 1
-        assert await fake_redis.exists(listeners_key("acme", "mtg_001")) == 1
-        assert await fake_redis.exists(meeting_tenant_binding_key("mtg_001")) == 1
+        s_key = meeting_session_key("acme", "mtg_001")
+        l_key = listeners_key("acme", "mtg_001")
+
+        assert await fake_redis.exists(s_key) == 1
+        assert await fake_redis.exists(l_key) == 1
+        assert await fake_redis.ttl(s_key) == 3600
+        assert await fake_redis.ttl(l_key) == 3600

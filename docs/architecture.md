@@ -146,3 +146,4 @@ All services resolve connections through `TenantRouter` in `backend/security/mee
 1. **No audio without consent**: Gateway (§1) checks `consent_records` before processing any frame
 2. **Append-only audit log**: `audit_events` table — INSERT only, no UPDATE/DELETE
 3. **All consent changes audited**: Every `record_consent` / `revoke_consent` call writes to `audit_events`
+4. **Raw audio never persists to disk (WP6)**: Ephemeral Redis Streams only (`AUDIO_REDIS_URL`), bounded stream length (`AUDIO_STREAM_MAXLEN`), 15m write TTL, 5m post-meeting grace TTL. Gateway startup guard refuses to start if Redis persistence is enabled.

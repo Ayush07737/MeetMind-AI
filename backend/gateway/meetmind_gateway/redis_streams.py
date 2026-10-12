@@ -40,7 +40,7 @@ ErrorCallback = Callable[[ErrorFrame], Coroutine[Any, Any, None]]
 class StreamProducer:
     """Publishes audio/transcript chunks and events to Redis streams."""
 
-    def __init__(self, redis_client: redis.Redis, maxlen: int = 10_000) -> None:
+    def __init__(self, redis_client: redis.Redis, maxlen: int = 20_000) -> None:
         self._redis = redis_client
         self._maxlen = maxlen
 
@@ -64,7 +64,8 @@ class StreamProducer:
         Carries client_seq, capture_ts_ms, recv_ns, published_ns, and gap_size.
         """
         stream_key = audio_stream_key(tenant_id, meeting_id)
-        now_ns = time.time_ns()
+        recv_val = recv_ns if recv_ns is not None else time.perf_counter_ns()
+        published_val = time.perf_counter_ns()
 
         fields: dict[str, Any] = {
             "seq": str(seq),
@@ -75,8 +76,8 @@ class StreamProducer:
             "audio_data": audio_data,
             "timestamp_ms": str(timestamp_ms),
             "capture_ts_ms": str(capture_ts_ms if capture_ts_ms is not None else timestamp_ms),
-            "recv_ns": str(recv_ns if recv_ns is not None else now_ns),
-            "published_ns": str(now_ns),
+            "recv_ns": str(recv_val),
+            "published_ns": str(published_val),
         }
         if gap_size > 0:
             fields["gap_size"] = str(gap_size)
@@ -85,7 +86,10 @@ class StreamProducer:
             stream_key,
             fields,
             maxlen=self._maxlen,
+            approximate=True,
         )
+        with contextlib.suppress(Exception):
+            await self._redis.expire(stream_key, 900)  # 15 min TTL refreshed on each write
         return entry_id
 
     async def publish_transcript(

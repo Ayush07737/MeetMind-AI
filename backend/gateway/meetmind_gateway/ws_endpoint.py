@@ -28,6 +28,7 @@ import contextlib
 import json
 import logging
 import time
+import uuid
 from datetime import UTC, datetime
 from typing import Any
 
@@ -39,7 +40,6 @@ from meetmind_schemas.events import (
     ControlFrame,
     ErrorCode,
     ErrorFrame,
-    IntelligenceEventFrame,
     MeetingStatus,
     TranscriptChunkFrame,
     WSCloseCode,
@@ -75,6 +75,9 @@ from .session_manager import MeetingSession, SessionManager
 logger = logging.getLogger(__name__)
 
 router = APIRouter()
+
+# K7: Track active ingest WebSocket connections per (tenant_id, meeting_id) for immediate takeover
+_ACTIVE_INGEST_CONNECTIONS: dict[tuple[str, str], WebSocket] = {}
 
 
 class ProtocolState:
@@ -133,6 +136,9 @@ class ConnectionContext:
         self.rate_byte_count = 0
         self.rate_violations = 0
 
+        # Gateway added latency tracker (spans frame receipt to awaited XADD completion)
+        self.gateway_latencies_ms: list[float] = []
+
     def mark_closed(self) -> None:
         self.is_closed = True
         if self.idle_task and not self.idle_task.done():
@@ -165,24 +171,36 @@ async def _record_rejected_frame(ctx: ConnectionContext, frame_type: str, reason
 
 
 def _check_rate_limits(ctx: ConnectionContext, byte_length: int) -> bool:
-    """Check if connection exceeded frame or byte limits. Returns False if exceeded repeatedly."""
+    """Check if connection exceeded frame or byte limits (K8).
+
+    Accepts reconnect retransmit burst of 5s buffered frames (at least 100 frames at once)
+    while rejecting sustained floods.
+    """
     now = time.time()
     if now - ctx.rate_window_start >= 1.0:
         ctx.rate_window_start = now
+        # Check sustained rate limit in previous window
+        if (
+            ctx.rate_frame_count > ctx.settings.frame_rate_limit
+            or ctx.rate_byte_count > ctx.settings.byte_rate_limit
+        ):
+            ctx.rate_violations += 1
+            if ctx.rate_violations >= 2:
+                return False
+        else:
+            ctx.rate_violations = max(0, ctx.rate_violations - 1)
+
         ctx.rate_frame_count = 0
         ctx.rate_byte_count = 0
 
     ctx.rate_frame_count += 1
     ctx.rate_byte_count += byte_length
 
-    if (
-        ctx.rate_frame_count > ctx.settings.frame_rate_limit
-        or ctx.rate_byte_count > ctx.settings.byte_rate_limit
-    ):
-        ctx.rate_violations += 1
-        if ctx.rate_violations >= 3:
-            return False
-    return True
+    # Hard ceiling on instantaneous burst (140 frames, 1MB)
+    return not (
+        ctx.rate_frame_count > ctx.settings.burst_frame_limit
+        or ctx.rate_byte_count > ctx.settings.burst_byte_limit
+    )
 
 
 async def _handle_control_frame(
@@ -207,12 +225,19 @@ async def _handle_control_frame(
         await ctx.session_manager.update_status(
             ctx.meeting_id, MeetingStatus.PENDING_CONSENT, ctx.session.tenant_id
         )
-        await audit_meeting_start(
-            tenant_id=ctx.session.tenant_id,
-            user_id=ctx.session.user_id,
-            meeting_id=ctx.meeting_id,
-            adapter_type=ctx.session.adapter_type,
-        )
+        try:
+            await audit_meeting_start(
+                tenant_id=ctx.session.tenant_id,
+                user_id=ctx.session.user_id,
+                meeting_id=ctx.meeting_id,
+                adapter_type=ctx.session.adapter_type,
+            )
+        except Exception as exc:
+            logger.error("Audit write failed on meeting_start: %s", exc)
+            await ctx.ws.close(code=WSCloseCode.AUDIT_UNAVAILABLE, reason="AUDIT_UNAVAILABLE")
+            ctx.mark_closed()
+            return
+
         ack = AckFrame(
             seq=0,
             frame_type="control",
@@ -243,13 +268,19 @@ async def _handle_control_frame(
             return
 
         consent_type = frame.consent_type or "audio_capture"
-        await ctx.consent_gate.confirm_consent(
-            consent_type=consent_type,
-            external_participants=frame.external_participants,
-            jurisdiction_hint=frame.jurisdiction_hint,
-            consent_text_version=frame.consent_text_version,
-            client_version=frame.client_version,
-        )
+        try:
+            await ctx.consent_gate.confirm_consent(
+                consent_type=consent_type,
+                external_participants=frame.external_participants,
+                jurisdiction_hint=frame.jurisdiction_hint,
+                consent_text_version=frame.consent_text_version,
+                client_version=frame.client_version,
+            )
+        except Exception as exc:
+            logger.error("Audit write failed on consent_confirmed: %s", exc)
+            await ctx.ws.close(code=WSCloseCode.AUDIT_UNAVAILABLE, reason="AUDIT_UNAVAILABLE")
+            ctx.mark_closed()
+            return
 
         ctx.state = ProtocolState.ACTIVE
         ctx.session.status = MeetingStatus.ACTIVE
@@ -283,12 +314,22 @@ async def _handle_control_frame(
             ctx.meeting_id, MeetingStatus.ENDED, ctx.session.tenant_id
         )
 
-        await audit_meeting_end(
-            tenant_id=ctx.session.tenant_id,
-            user_id=ctx.session.user_id,
-            meeting_id=ctx.meeting_id,
-            total_chunks=ctx.frames_processed,
-        )
+        with contextlib.suppress(Exception):
+            await audit_meeting_end(
+                tenant_id=ctx.session.tenant_id,
+                user_id=ctx.session.user_id,
+                meeting_id=ctx.meeting_id,
+                total_chunks=ctx.frames_processed,
+            )
+
+        # WP6: Grace EXPIRE of 5 min (300s) on stream keys so downstream can drain
+        with contextlib.suppress(Exception):
+            from .keys import audio_stream_key, transcript_stream_key
+
+            a_key = audio_stream_key(ctx.session.tenant_id, ctx.meeting_id)
+            t_key = transcript_stream_key(ctx.session.tenant_id, ctx.meeting_id)
+            await ctx.redis_client.expire(a_key, 300)
+            await ctx.redis_client.expire(t_key, 300)
 
         ack = AckFrame(
             seq=0,
@@ -302,6 +343,7 @@ async def _handle_control_frame(
 async def _handle_audio_chunk(
     ctx: ConnectionContext,
     data: bytes,
+    recv_ns: int | None = None,
 ) -> None:
     """Process a binary audio chunk with 18-byte big-endian header (WP5)."""
     # 1. State machine & Consent gate check
@@ -358,6 +400,7 @@ async def _handle_audio_chunk(
         client_seq = await ctx.seq_counter.next(ctx.meeting_id)
 
     # 3. Publish to Redis stream mm:{tenant}:audio:{meeting}
+    t_recv = recv_ns if recv_ns is not None else time.perf_counter_ns()
     try:
         await ctx.stream_producer.publish_audio(
             meeting_id=ctx.meeting_id,
@@ -369,8 +412,11 @@ async def _handle_audio_chunk(
             timestamp_ms=int(datetime.now(UTC).timestamp() * 1000),
             client_seq=client_seq,
             capture_ts_ms=capture_ts_ms,
+            recv_ns=t_recv,
             gap_size=gap_size,
         )
+        t_pub = time.perf_counter_ns()
+        ctx.gateway_latencies_ms.append((t_pub - t_recv) / 1_000_000.0)
     except Exception as exc:
         logger.exception("Redis stream publish failed for meeting %s: %s", ctx.meeting_id, exc)
         err = ErrorFrame(code=ErrorCode.INTERNAL_ERROR, message="Failed to store audio frame")
@@ -491,42 +537,89 @@ async def _handle_json_frame(
         await ctx.ws.send_text(err.model_dump_json())
 
 
+DROPPED_OUTBOUND_EVENTS_COUNTER = 0
+
+
 async def _forward_event(ws: WebSocket, data: dict[str, Any], meeting_id: str) -> None:
-    """Forward an intelligence event to the WebSocket client."""
+    """Forward an allow-listed client-facing intelligence event to the WebSocket listener client."""
+    global DROPPED_OUTBOUND_EVENTS_COUNTER
+    if not isinstance(data, dict):
+        logger.warning(
+            "Dropping outbound event for meeting %s: data is not a dict (%s)",
+            meeting_id,
+            type(data).__name__,
+        )
+        DROPPED_OUTBOUND_EVENTS_COUNTER += 1
+        return
+
+    # K5: Require a 'payload' key; otherwise drop event with a WARNING and increment counter
+    if "payload" not in data:
+        logger.warning(
+            "Dropping outbound event for meeting %s: missing required 'payload' key",
+            meeting_id,
+        )
+        DROPPED_OUTBOUND_EVENTS_COUNTER += 1
+        return
+
+    payload = data["payload"]
+    if not isinstance(payload, dict):
+        logger.warning(
+            "Dropping outbound event for meeting %s: 'payload' must be a dict, got %s",
+            meeting_id,
+            type(payload).__name__,
+        )
+        DROPPED_OUTBOUND_EVENTS_COUNTER += 1
+        return
+
+    ev_type = data.get("event_type") or data.get("type", "unknown")
+    if ev_type not in OUTBOUND_EVENT_TYPES:
+        logger.warning(
+            "Dropping outbound event for meeting %s: event_type '%s' not in OUTBOUND_EVENT_TYPES",
+            meeting_id,
+            ev_type,
+        )
+        DROPPED_OUTBOUND_EVENTS_COUNTER += 1
+        return
+
     try:
-        ev_type = data.get("event_type") or data.get("type", "unknown")
-        if ev_type in OUTBOUND_EVENT_TYPES:
-            frame = IntelligenceEventFrame(
-                event_type=ev_type,
-                payload=data.get("payload", data),
-                meeting_id=meeting_id,
-            )
-            await ws.send_text(frame.model_dump_json())
-    except Exception:
-        logger.debug("Failed to forward event to client for meeting %s", meeting_id)
+        from meetmind_schemas.events import build_outbound_frame
+
+        frame = build_outbound_frame(ev_type, payload, meeting_id=meeting_id)
+        await ws.send_text(frame.model_dump_json())
+    except Exception as exc:
+        logger.warning(
+            "Failed to serialize or send outbound event '%s' for meeting %s: %s",
+            ev_type,
+            meeting_id,
+            exc,
+        )
+        DROPPED_OUTBOUND_EVENTS_COUNTER += 1
 
 
 async def _run_lease_heartbeat(
     session_manager: SessionManager,
     meeting_id: str,
-    connection_id: str,
     tenant_id: str,
+    user_id: str,
+    client_instance_id: str,
 ) -> None:
-    """Periodically refresh the single-writer lease while connected."""
+    """Periodically refresh the single-writer lease while connected (K7)."""
     while True:
         try:
             await asyncio.sleep(5.0)
-            refreshed = await session_manager.refresh_writer_lock(
+            refreshed = await session_manager.refresh_writer_lease(
                 meeting_id=meeting_id,
-                connection_id=connection_id,
                 tenant_id=tenant_id,
+                user_id=user_id,
+                client_instance_id=client_instance_id,
                 ttl_ms=15000,
             )
             if not refreshed:
                 logger.warning(
-                    "Writer lease lost for meeting=%s conn=%s",
+                    "Writer lease lost for meeting=%s user=%s instance=%s",
                     meeting_id,
-                    connection_id,
+                    user_id,
+                    client_instance_id,
                 )
                 break
             await session_manager.refresh_activity(meeting_id, tenant_id)
@@ -534,6 +627,22 @@ async def _run_lease_heartbeat(
             break
         except Exception as exc:
             logger.warning("Error refreshing writer lease: %s", exc)
+
+
+async def _run_listen_heartbeat(
+    session_manager: SessionManager,
+    meeting_id: str,
+    tenant_id: str,
+) -> None:
+    """Periodically refresh activity TTL for listen-only connections (K4)."""
+    while True:
+        try:
+            await asyncio.sleep(5.0)
+            await session_manager.refresh_activity(meeting_id, tenant_id)
+        except asyncio.CancelledError:
+            break
+        except Exception as exc:
+            logger.warning("Error refreshing listener activity TTL: %s", exc)
 
 
 async def _run_idle_watchdog(ws: WebSocket, ctx: ConnectionContext, timeout_sec: float) -> None:
@@ -614,6 +723,7 @@ async def _authenticate_ws(
                 session_id=u_dict.get("session_id", ""),
                 claims=u_dict.get("claims", {}),
                 role=u_dict.get("role_claim", u_dict.get("claims", {}).get("role", "")),
+                client_instance_id=u_dict.get("client_instance_id", ""),
             )
         except Exception:
             await ws.accept()
@@ -628,7 +738,15 @@ async def _authenticate_ws(
     if token:
         try:
             user = await authenticator.authenticate(token)
-            return user
+            cid = ws.query_params.get("client_instance_id") or str(uuid.uuid4())
+            return AuthenticatedUser(
+                user_id=user.user_id,
+                tenant_id=user.tenant_id,
+                session_id=user.session_id,
+                claims=user.claims,
+                role=user.role,
+                client_instance_id=cid,
+            )
         except AuthError as e:
             await ws.accept()
             await ws.close(code=e.close_code, reason=str(e.message))
@@ -653,6 +771,16 @@ async def websocket_ingest(
 ) -> None:
     """Main WebSocket handler for meeting stream ingestion (Write endpoint)."""
     settings = getattr(ws.app.state, "settings", None) or get_settings()
+
+    # TLS Rule: in production, reject upgrades if X-Forwarded-Proto is not https
+    if settings.app_env == "production":
+        proto = ws.headers.get("x-forwarded-proto", "").lower()
+        if proto != "https":
+            await ws.close(
+                code=WSCloseCode.PROTOCOL_VIOLATION,
+                reason="TLS required in production",
+            )
+            return
 
     # 1. Authenticate
     user = await _authenticate_ws(
@@ -714,18 +842,20 @@ async def websocket_ingest(
         adapter_type="unknown",
     )
 
-    # 6. Single-writer lease on ingest (SET NX PX 15000)
-    acquired = await session_manager.acquire_writer_lock(
+    # 6. Single-writer lease on ingest (K7: user_id:client_instance_id with immediate takeover)
+    acquired = await session_manager.acquire_or_takeover_writer_lease(
         meeting_id=meeting_id,
-        connection_id=session.connection_id,
         tenant_id=user.tenant_id,
+        user_id=user.user_id,
+        client_instance_id=user.client_instance_id,
         ttl_ms=15000,
     )
     if not acquired:
         logger.warning(
-            "Writer conflict on meeting %s for connection %s",
+            "Writer conflict on meeting %s for user %s instance %s",
             meeting_id,
-            session.connection_id,
+            user.user_id,
+            user.client_instance_id,
         )
         await ws.close(
             code=WSCloseCode.WRITER_CONFLICT,
@@ -735,6 +865,13 @@ async def websocket_ingest(
             await redis_client.decr(uconn_key)
             await redis_client.decr(tconn_key)
         return
+
+    # K7: If old connection was still open on this instance, close with 4409 SUPERSEDED
+    old_ws = _ACTIVE_INGEST_CONNECTIONS.get((user.tenant_id, meeting_id))
+    if old_ws and old_ws is not ws:
+        with contextlib.suppress(Exception):
+            await old_ws.close(code=WSCloseCode.WRITER_CONFLICT, reason="SUPERSEDED")
+    _ACTIVE_INGEST_CONNECTIONS[(user.tenant_id, meeting_id)] = ws
 
     # 7. Consent Gate & Outbound Subscriber
     consent_gate = ConsentGate(
@@ -771,9 +908,15 @@ async def websocket_ingest(
     elif consent_gate.is_open:
         ctx.state = ProtocolState.ACTIVE
 
-    # Lease refresh loop
+    # Lease refresh loop (K7: passes user_id and client_instance_id)
     ctx.lease_task = asyncio.create_task(
-        _run_lease_heartbeat(session_manager, meeting_id, session.connection_id, user.tenant_id)
+        _run_lease_heartbeat(
+            session_manager,
+            meeting_id,
+            user.tenant_id,
+            user.user_id,
+            user.client_instance_id,
+        )
     )
 
     # Idle watchdog loop (default 30s)
@@ -781,13 +924,14 @@ async def websocket_ingest(
         idle_to = float(ws.query_params.get("idle_timeout") or settings.idle_timeout_seconds)
         ctx.idle_task = asyncio.create_task(_run_idle_watchdog(ws, ctx, idle_to))
 
-    # 9. Audit connection (fail-closed)
-    await audit_connection(
-        tenant_id=user.tenant_id,
-        user_id=user.user_id,
-        meeting_id=meeting_id,
-        adapter_type=session.adapter_type,
-    )
+    # 9. Audit connection
+    with contextlib.suppress(Exception):
+        await audit_connection(
+            tenant_id=user.tenant_id,
+            user_id=user.user_id,
+            meeting_id=meeting_id,
+            adapter_type=session.adapter_type,
+        )
 
     # 10. Receive loop
     disconnect_reason = "normal"
@@ -823,7 +967,8 @@ async def websocket_ingest(
                     break
 
                 if b_data:
-                    await _handle_audio_chunk(ctx, b_data)
+                    recv_ns = time.perf_counter_ns()
+                    await _handle_audio_chunk(ctx, b_data, recv_ns=recv_ns)
                 elif t_data:
                     await _handle_json_frame(ctx, t_data)
 
@@ -837,13 +982,19 @@ async def websocket_ingest(
         logger.exception("Error in WebSocket handler for meeting %s", meeting_id)
     finally:
         ctx.mark_closed()
+        if _ACTIVE_INGEST_CONNECTIONS.get((user.tenant_id, meeting_id)) is ws:
+            _ACTIVE_INGEST_CONNECTIONS.pop((user.tenant_id, meeting_id), None)
+
         # Individual try/except per cleanup step
         with contextlib.suppress(Exception):
             await event_subscriber.unsubscribe()
 
         with contextlib.suppress(Exception):
-            await session_manager.release_writer_lock(
-                meeting_id, session.connection_id, user.tenant_id
+            await session_manager.release_writer_lease(
+                meeting_id=meeting_id,
+                tenant_id=user.tenant_id,
+                user_id=user.user_id,
+                client_instance_id=user.client_instance_id,
             )
 
         try:
@@ -880,6 +1031,11 @@ async def websocket_ingest(
                     },
                 )
 
+        if ctx.gateway_latencies_ms:
+            with contextlib.suppress(Exception):
+                mkey = f"mm:{user.tenant_id}:metrics:{meeting_id}"
+                await redis_client.set(mkey, json.dumps(ctx.gateway_latencies_ms), ex=600)
+
         if remaining == 0 and ctx.session.status == MeetingStatus.ENDED:
             with contextlib.suppress(Exception):
                 await session_manager.cleanup_session(meeting_id, user.tenant_id)
@@ -894,6 +1050,16 @@ async def websocket_listen(
 ) -> None:
     """Read-only listener endpoint for meeting events (/v1/meetings/{meeting_id}/listen)."""
     settings = getattr(ws.app.state, "settings", None) or get_settings()
+
+    # TLS Rule: in production, reject upgrades if X-Forwarded-Proto is not https
+    if settings.app_env == "production":
+        proto = ws.headers.get("x-forwarded-proto", "").lower()
+        if proto != "https":
+            await ws.close(
+                code=WSCloseCode.PROTOCOL_VIOLATION,
+                reason="TLS required in production",
+            )
+            return
 
     # 1. Authenticate (must have role="listen" or valid dev token)
     user = await _authenticate_ws(
@@ -938,13 +1104,19 @@ async def websocket_listen(
     with contextlib.suppress(RuntimeError):
         await ws.accept()
 
-    # Register as listener in Redis
+    # Register as listener in Redis and refresh activity (K4)
     conn_id = f"listen_{time.time_ns()}"
     await session_manager.create_session(
         meeting_id=meeting_id,
         tenant_id=user.tenant_id,
         user_id=user.user_id,
         adapter_type="listener",
+    )
+    await session_manager.refresh_activity(meeting_id, user.tenant_id)
+
+    # Listen-only connection activity heartbeat (K4)
+    listen_hb_task = asyncio.create_task(
+        _run_listen_heartbeat(session_manager, meeting_id, user.tenant_id)
     )
 
     # 5. Outbound event subscriber via XREAD BLOCK
@@ -989,6 +1161,9 @@ async def websocket_listen(
     except Exception:
         logger.exception("Error in listener WebSocket for meeting %s", meeting_id)
     finally:
+        listen_hb_task.cancel()
+        with contextlib.suppress(asyncio.CancelledError):
+            await listen_hb_task
         with contextlib.suppress(Exception):
             await event_subscriber.unsubscribe()
         with contextlib.suppress(Exception):

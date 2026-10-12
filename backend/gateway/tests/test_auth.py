@@ -487,3 +487,58 @@ class TestAllowedOriginsEnvParsing:
         with patch.dict("os.environ", env_vars, clear=False):
             s = GatewaySettings()
             assert s.allowed_origins == ["https://app.meetmind.ai", "https://ext.meetmind.ai"]
+
+
+class TestTenantOrgMapEnvParsing:
+    """K2: Tests strict parsing and fail-fast validation of TENANT_ORG_MAP."""
+
+    def test_valid_tenant_org_map_parsed(self):
+        from unittest.mock import patch
+
+        from meetmind_gateway.config import GatewaySettings
+
+        env_vars = {
+            "APP_ENV": "development",
+            "TENANT_ORG_MAP": '{"org_123": "acme", "org_456": "globex"}',
+        }
+        with patch.dict("os.environ", env_vars, clear=False):
+            s = GatewaySettings(_env_file=None)
+            assert s.tenant_org_map == {"org_123": "acme", "org_456": "globex"}
+
+    def test_malformed_json_tenant_org_map_raises_clear_error(self):
+        from unittest.mock import patch
+
+        from meetmind_gateway.config import GatewaySettings
+
+        env_vars = {
+            "APP_ENV": "development",
+            "TENANT_ORG_MAP": '{"org_123": invalid_json',
+        }
+        with (
+            patch.dict("os.environ", env_vars, clear=False),
+            pytest.raises(
+                Exception, match=r"(Invalid TENANT_ORG_MAP JSON format|error parsing value)"
+            ),
+        ):
+            GatewaySettings(_env_file=None)
+
+        with pytest.raises(ValueError, match="Invalid TENANT_ORG_MAP JSON format"):
+            GatewaySettings(_env_file=None, tenant_org_map='{"org_123": invalid_json')
+
+    def test_non_dict_tenant_org_map_raises_clear_error(self):
+        from unittest.mock import patch
+
+        from meetmind_gateway.config import GatewaySettings
+
+        env_vars = {
+            "APP_ENV": "development",
+            "TENANT_ORG_MAP": '["org_123", "org_456"]',
+        }
+        with (
+            patch.dict("os.environ", env_vars, clear=False),
+            pytest.raises(Exception, match=r"(Invalid TENANT_ORG_MAP|tenant_org_map)"),
+        ):
+            GatewaySettings(_env_file=None)
+
+        with pytest.raises(ValueError, match="Invalid TENANT_ORG_MAP"):
+            GatewaySettings(_env_file=None, tenant_org_map='["org_123", "org_456"]')

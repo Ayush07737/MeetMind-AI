@@ -34,7 +34,7 @@ dev-dependencies = [
 
 [tool.pytest.ini_options]
 asyncio_mode = "auto"
-timeout = 180
+timeout = 30
 pythonpath = [
     ".",
     "backend/gateway/tests",

@@ -20,7 +20,7 @@ from meetmind_gateway.keys import audio_stream_key
 from meetmind_schemas.events import WSCloseCode, encode_audio_frame
 from websockets.exceptions import ConnectionClosed
 
-pytestmark = [pytest.mark.integration]
+pytestmark = [pytest.mark.integration, pytest.mark.timeout(120)]
 
 
 @pytest.mark.asyncio
@@ -76,11 +76,13 @@ async def test_t6_cross_tenant_isolation_and_audit(
         ack_audio = json.loads(await ws_a.recv())
         assert ack_audio["seq"] == 1
 
-        # 2. Tenant B attempts ticket exchange for Tenant A's meeting -> 403 Forbidden
+        # 2. Tenant B attempts ticket exchange for Tenant A's meeting -> 404 Not Found (K6 parity)
         token_b = h.jwks.mint_token(sub="user_tenant_b", org_id=h.org_b, org_role="org:admin")
-        status_b, resp_b = await exchange_ws_ticket(h.http_url, token_b, meeting_id, role="ingest")
-        assert status_b == 403
-        assert resp_b.get("detail") == "cross-tenant access denied"
+        status_b, resp_b = await exchange_ws_ticket(
+            h.http_url, token_b, meeting_id, role="ingest", auto_create_meeting=False
+        )
+        assert status_b == 404
+        assert resp_b.get("detail") == "meeting not found"
 
         # 3. Verify cross_tenant_access_denied audit event written to Tenant B schema in Neon
         async with h.tenant_conn(tenant_b) as conn:

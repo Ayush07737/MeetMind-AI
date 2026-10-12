@@ -39,6 +39,7 @@ class WSCloseCode(IntEnum):
     IDLE_TIMEOUT = 4408
     WRITER_CONFLICT = 4409
     RATE_LIMITED = 4429
+    AUDIT_UNAVAILABLE = 4503
 
 
 class ErrorCode(StrEnum):
@@ -79,10 +80,10 @@ class MeetingStatus(StrEnum):
 
 
 OUTBOUND_EVENT_TYPES: tuple[str, ...] = (
-    "transcript_chunk",
     "intelligence_event",
-    "action_required",
-    "summary_update",
+    "pre_meeting_brief",
+    "transcript_interim",
+    "transcript_service_degraded",
 )
 
 
@@ -209,6 +210,65 @@ class IntelligenceEventFrame(BaseModel):
     payload: dict[str, Any] = Field(default_factory=dict)
     meeting_id: str = ""
     timestamp_ms: int = Field(default_factory=lambda: int(datetime.now(UTC).timestamp() * 1000))
+
+
+class PreMeetingBriefFrame(BaseModel):
+    """Pre-meeting brief event frame sent to listener client."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    type: Literal["intelligence_event"] = "intelligence_event"
+    event_type: Literal["pre_meeting_brief"] = "pre_meeting_brief"
+    payload: dict[str, Any] = Field(default_factory=dict)
+    meeting_id: str = ""
+    timestamp_ms: int = Field(default_factory=lambda: int(datetime.now(UTC).timestamp() * 1000))
+
+
+class TranscriptInterimFrame(BaseModel):
+    """Client-facing interim transcript chunk frame."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    type: Literal["intelligence_event"] = "intelligence_event"
+    event_type: Literal["transcript_interim"] = "transcript_interim"
+    payload: dict[str, Any] = Field(default_factory=dict)
+    meeting_id: str = ""
+    timestamp_ms: int = Field(default_factory=lambda: int(datetime.now(UTC).timestamp() * 1000))
+
+
+class TranscriptServiceDegradedFrame(BaseModel):
+    """Client-facing service degradation notice."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    type: Literal["intelligence_event"] = "intelligence_event"
+    event_type: Literal["transcript_service_degraded"] = "transcript_service_degraded"
+    payload: dict[str, Any] = Field(default_factory=dict)
+    meeting_id: str = ""
+    timestamp_ms: int = Field(default_factory=lambda: int(datetime.now(UTC).timestamp() * 1000))
+
+
+OutboundEventFrame = (
+    IntelligenceEventFrame
+    | PreMeetingBriefFrame
+    | TranscriptInterimFrame
+    | TranscriptServiceDegradedFrame
+)
+
+
+def build_outbound_frame(
+    event_type: str, payload: dict[str, Any], meeting_id: str = ""
+) -> OutboundEventFrame:
+    """Build typed outbound frame matching OUTBOUND_EVENT_TYPES."""
+    if event_type == "pre_meeting_brief":
+        return PreMeetingBriefFrame(payload=payload, meeting_id=meeting_id)
+    if event_type == "transcript_interim":
+        return TranscriptInterimFrame(payload=payload, meeting_id=meeting_id)
+    if event_type == "transcript_service_degraded":
+        return TranscriptServiceDegradedFrame(payload=payload, meeting_id=meeting_id)
+    if event_type == "intelligence_event":
+        return IntelligenceEventFrame(event_type=event_type, payload=payload, meeting_id=meeting_id)
+    raise ValueError(f"Unsupported outbound event_type: '{event_type}'")
 
 
 class AckFrame(BaseModel):

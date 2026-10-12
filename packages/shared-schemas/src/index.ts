@@ -68,6 +68,7 @@ export enum WSCloseCode {
   IDLE_TIMEOUT = 4408,
   WRITER_CONFLICT = 4409,
   RATE_LIMITED = 4429,
+  AUDIT_UNAVAILABLE = 4503,
 }
 
 export enum ErrorCode {
@@ -100,10 +101,10 @@ export enum MeetingStatus {
 }
 
 export const OUTBOUND_EVENT_TYPES = [
-  "transcript_chunk",
   "intelligence_event",
-  "action_required",
-  "summary_update",
+  "pre_meeting_brief",
+  "transcript_interim",
+  "transcript_service_degraded",
 ] as const;
 
 export type OutboundEventType = (typeof OUTBOUND_EVENT_TYPES)[number];
@@ -175,6 +176,39 @@ export const IntelligenceEventFrameSchema = z
   })
   .strict();
 export type IntelligenceEventFrame = z.infer<typeof IntelligenceEventFrameSchema>;
+
+export const PreMeetingBriefFrameSchema = z
+  .object({
+    type: z.literal("intelligence_event"),
+    event_type: z.literal("pre_meeting_brief"),
+    payload: z.record(z.unknown()).default({}),
+    meeting_id: z.string().default(""),
+    timestamp_ms: z.number().int().optional(),
+  })
+  .strict();
+export type PreMeetingBriefFrame = z.infer<typeof PreMeetingBriefFrameSchema>;
+
+export const TranscriptInterimFrameSchema = z
+  .object({
+    type: z.literal("intelligence_event"),
+    event_type: z.literal("transcript_interim"),
+    payload: z.record(z.unknown()).default({}),
+    meeting_id: z.string().default(""),
+    timestamp_ms: z.number().int().optional(),
+  })
+  .strict();
+export type TranscriptInterimFrame = z.infer<typeof TranscriptInterimFrameSchema>;
+
+export const TranscriptServiceDegradedFrameSchema = z
+  .object({
+    type: z.literal("intelligence_event"),
+    event_type: z.literal("transcript_service_degraded"),
+    payload: z.record(z.unknown()).default({}),
+    meeting_id: z.string().default(""),
+    timestamp_ms: z.number().int().optional(),
+  })
+  .strict();
+export type TranscriptServiceDegradedFrame = z.infer<typeof TranscriptServiceDegradedFrameSchema>;
 
 export const AckFrameSchema = z
   .object({

@@ -18,7 +18,7 @@ from conftest import ServerHarness, exchange_ws_ticket
 from meetmind_gateway.keys import audio_stream_key, transcript_stream_key
 from meetmind_schemas.events import encode_audio_frame
 
-pytestmark = [pytest.mark.integration]
+pytestmark = [pytest.mark.integration, pytest.mark.timeout(120)]
 
 
 @pytest.mark.asyncio

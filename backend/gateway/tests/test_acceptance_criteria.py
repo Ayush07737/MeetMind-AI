@@ -55,7 +55,7 @@ def _build_test_app(fake_redis, settings: GatewaySettings | None = None) -> Fast
     if settings is None:
         settings = GatewaySettings(
             neon_database_url="postgresql://test:test@localhost/test",
-            redis_url="redis://localhost:6379/0",
+            redis_url="redis://127.0.0.1:6379/0",
             clerk_jwks_url=TEST_JWKS_URL,
             clerk_secret_key=SECRET,
             clerk_publishable_key="pk_test_key",
@@ -495,3 +495,33 @@ class TestDomainAgnosticSignOff:
                     matched.append((py_file.name, kw))
 
         assert len(matched) == 0, f"Found domain-specific terms in gateway: {matched}"
+
+    def test_no_gateway_module_imports_from_domain_pack(self):
+        """Gateway must not import anything from domain packs or domain-specific modules (T13)."""
+        import ast
+
+        forbidden_prefixes = (
+            "meetmind_domain",
+            "domain_pack",
+            "domain_packs",
+            "meetmind.domains",
+            "domains.",
+        )
+        src_dir = Path(__file__).resolve().parents[1] / "meetmind_gateway"
+        violations = []
+
+        for py_file in src_dir.glob("*.py"):
+            tree = ast.parse(py_file.read_text(encoding="utf-8"), filename=py_file.name)
+            for node in ast.walk(tree):
+                if isinstance(node, ast.Import):
+                    for alias in node.names:
+                        if any(alias.name.startswith(p) for p in forbidden_prefixes):
+                            violations.append((py_file.name, alias.name))
+                elif (
+                    isinstance(node, ast.ImportFrom)
+                    and node.module
+                    and any(node.module.startswith(p) for p in forbidden_prefixes)
+                ):
+                    violations.append((py_file.name, node.module))
+
+        assert len(violations) == 0, f"Forbidden domain pack imports found: {violations}"

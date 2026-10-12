@@ -32,7 +32,10 @@ class GatewaySettings(BaseSettings):
     neon_database_url: str = ""
 
     # -- Redis -----------------------------------------------------------------
-    redis_url: str = "redis://localhost:6379/0"
+    redis_url: str = "redis://127.0.0.1:6379/0"
+    audio_redis_url: str = ""
+    audio_redis_persistence_acknowledged: bool = False
+    audio_stream_maxlen: int = 6_000
 
     # -- Clerk Authentication (CA-3: no insecure defaults) --------------------
     clerk_secret_key: str = ""
@@ -52,25 +55,42 @@ class GatewaySettings(BaseSettings):
 
     # -- Gateway-specific ------------------------------------------------------
     ws_max_frame_bytes: int = 64 * 1024  # 64 KB max per WS frame
-    redis_stream_maxlen: int = 10_000  # cap stream length per meeting
+    redis_stream_maxlen: int = 6_000  # cap stream length per meeting (10m @ 10 chunk/s, ~19.2 MB)
     allow_token_in_dev: bool = True
     idle_timeout_seconds: float = 30.0
     max_connections_per_user: int = 10
     max_connections_per_tenant: int = 100
-    frame_rate_limit: int = 120  # frames per sec
-    byte_rate_limit: int = 256 * 1024  # bytes per sec
+    frame_rate_limit: int = 120  # frames per sec (sustained)
+    burst_frame_limit: int = 150  # K8: burst capacity for 5s reconnect retransmits
+    byte_rate_limit: int = 512 * 1024  # 512 KB per sec (sustained)
+    burst_byte_limit: int = 1024 * 1024  # 1 MB burst capacity
+    ticket_ttl_seconds: int = 30  # K9: ticket expiration TTL
 
     @model_validator(mode="before")
     @classmethod
     def parse_complex_fields(cls, data: Any) -> Any:
         if isinstance(data, dict):
-            # Parse tenant_org_map if JSON string
+            # Parse tenant_org_map if JSON string - K2: malformed map must fail startup
             tom = data.get("tenant_org_map")
             if isinstance(tom, str):
-                try:
-                    data["tenant_org_map"] = json.loads(tom)
-                except Exception:
+                tom = tom.strip()
+                if not tom:
                     data["tenant_org_map"] = {}
+                else:
+                    try:
+                        parsed = json.loads(tom)
+                    except json.JSONDecodeError as exc:
+                        raise ValueError(f"Invalid TENANT_ORG_MAP JSON format: {exc}") from exc
+                    if not isinstance(parsed, dict):
+                        raise ValueError(
+                            "Invalid TENANT_ORG_MAP: "
+                            "must be a JSON object mapping org_id to tenant_id"
+                        )
+                    data["tenant_org_map"] = parsed
+            elif tom is not None and not isinstance(tom, dict):
+                raise ValueError(
+                    "Invalid TENANT_ORG_MAP: must be a dictionary or JSON object string"
+                )
 
             # Parse allowed_origins if JSON list string or comma-separated
             origins = data.get("allowed_origins")
@@ -136,6 +156,15 @@ class GatewaySettings(BaseSettings):
                     raise ValueError(
                         f"CLERK_JWKS_URL '{jwks}' must match https://<host>/.well-known/jwks.json"
                     )
+
+        if not self.audio_redis_url:
+            self.audio_redis_url = self.redis_url
+
+        if self.ticket_ttl_seconds > 30:
+            raise ValueError(
+                f"ticket_ttl_seconds must be <= 30 per K9 security invariant, "
+                f"got {self.ticket_ttl_seconds}"
+            )
 
         return self
 

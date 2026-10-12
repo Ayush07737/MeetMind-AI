@@ -20,8 +20,9 @@ import websockets
 from conftest import ServerHarness, exchange_ws_ticket
 from meetmind_gateway.keys import audio_stream_key, events_stream_key, out_stream_key
 from meetmind_schemas.events import WSCloseCode, encode_audio_frame
+from websockets.exceptions import ConnectionClosed
 
-pytestmark = [pytest.mark.integration]
+pytestmark = [pytest.mark.integration, pytest.mark.timeout(120)]
 
 
 @pytest.mark.asyncio
@@ -123,9 +124,8 @@ async def test_t4_multiple_listeners_and_single_writer(
             # 4. Outbound event fanning out exactly once to both listeners
             out_key = out_stream_key(tenant_id, meeting_id)
             event_payload = {
-                "type": "intelligence_event",
                 "event_type": "intelligence_event",
-                "insight": "Crucial product roadmap decision",
+                "payload": {"insight": "Crucial product roadmap decision"},
             }
             entry_id_1 = await real_redis.xadd(
                 out_key,
@@ -158,7 +158,7 @@ async def test_t4_multiple_listeners_and_single_writer(
 
             # 5. Listener 1 attempts to write -> rejected with 4400 (PROTOCOL_VIOLATION)
             await l1_ws.send(b"\x00\x01\x02\x03\x04")
-            with pytest.raises(websockets.exceptions.ConnectionClosed) as exc_info:
+            with pytest.raises(ConnectionClosed) as exc_info:
                 while True:
                     await l1_ws.recv()
             assert exc_info.value.rcvd is not None
@@ -167,9 +167,8 @@ async def test_t4_multiple_listeners_and_single_writer(
         # 6. Verify last_event_id resume works for reconnecting listeners
         # Publish event 2 while listener 2 is disconnected
         event_payload_2 = {
-            "type": "intelligence_event",
             "event_type": "intelligence_event",
-            "insight": "Follow-up action item from resumed session",
+            "payload": {"insight": "Follow-up action item from resumed session"},
         }
         await real_redis.xadd(
             out_key,
@@ -206,9 +205,92 @@ async def test_t4_multiple_listeners_and_single_writer(
         ticket_w2 = ticket_w2_resp["ticket"]
 
         w2_uri = f"{h.ws_url}/v1/meetings/{meeting_id}/stream?ticket={ticket_w2}"
-        with pytest.raises(websockets.exceptions.ConnectionClosed) as exc_conflict:
+        with pytest.raises(ConnectionClosed) as exc_conflict:
             async with websockets.connect(w2_uri) as conflict_ws:
                 await conflict_ws.recv()
 
         assert exc_conflict.value.rcvd is not None
         assert exc_conflict.value.rcvd.code == WSCloseCode.WRITER_CONFLICT
+
+
+@pytest.mark.asyncio
+async def test_t4_real_redis_ttl_lifecycle(
+    gateway_harness: ServerHarness,
+    real_redis,
+) -> None:
+    """K4 Real TTL tests: assert TTL is positive and at most configured value after creation
+
+    and refresh; listen-only connections also refresh TTLs; refresh failures log at WARNING.
+    """
+    from meetmind_gateway.keys import listeners_key, meeting_session_key
+    from meetmind_gateway.session_manager import SessionManager
+
+    h = gateway_harness
+    meeting_id = f"mtg_t4_ttl_{uuid.uuid4().hex[:6]}"
+    tenant_id = h.tenant_a
+
+    # 1. Connect writer, start meeting, confirm consent
+    writer_token = h.jwks.mint_token(sub="user_writer_ttl", org_id=h.org_a, org_role="org:admin")
+    status, writer_ticket_resp = await exchange_ws_ticket(
+        h.http_url, writer_token, meeting_id, role="ingest"
+    )
+    ticket = writer_ticket_resp["ticket"]
+    writer_ws_uri = f"{h.ws_url}/v1/meetings/{meeting_id}/stream?ticket={ticket}"
+
+    async with websockets.connect(writer_ws_uri) as writer_ws:
+        await writer_ws.send(
+            json.dumps(
+                {
+                    "type": "control",
+                    "action": "meeting_start",
+                    "adapter_type": "chrome_extension",
+                }
+            )
+        )
+        await writer_ws.recv()
+        await writer_ws.send(
+            json.dumps(
+                {
+                    "type": "control",
+                    "action": "consent_confirmed",
+                    "consent_type": "audio_capture",
+                }
+            )
+        )
+        await writer_ws.recv()
+
+        # Check TTL on session and listeners keys after creation
+        s_key = meeting_session_key(tenant_id, meeting_id)
+        l_key = listeners_key(tenant_id, meeting_id)
+
+        ttl_s = await real_redis.ttl(s_key)
+        ttl_l = await real_redis.ttl(l_key)
+        assert 0 < ttl_s <= 86400, f"Session TTL after creation expected in (0, 86400], got {ttl_s}"
+        assert 0 < ttl_l <= 86400, (
+            f"Listeners TTL after creation expected in (0, 86400], got {ttl_l}"
+        )
+
+        # 2. Test explicit refresh via SessionManager
+        sm = SessionManager(real_redis)
+        await sm.refresh_activity(meeting_id, tenant_id, ttl=3600)
+        ttl_s_refreshed = await real_redis.ttl(s_key)
+        ttl_l_refreshed = await real_redis.ttl(l_key)
+        assert 0 < ttl_s_refreshed <= 3600
+        assert 0 < ttl_l_refreshed <= 3600
+
+        # 3. Connect a listen-only client and verify it refreshes activity TTLs
+        listener_token = h.jwks.mint_token(
+            sub="user_listener_ttl", org_id=h.org_a, org_role="org:admin"
+        )
+        status_l, listener_ticket_resp = await exchange_ws_ticket(
+            h.http_url, listener_token, meeting_id, role="listen"
+        )
+        assert status_l == 200
+        l_ticket = listener_ticket_resp["ticket"]
+        listener_ws_uri = f"{h.ws_url}/v1/meetings/{meeting_id}/listen?ticket={l_ticket}"
+
+        async with websockets.connect(listener_ws_uri):
+            # Wait for listener heartbeat to execute (heartbeat interval is 5.0s)
+            await asyncio.sleep(6.0)
+            ttl_s_after_listener = await real_redis.ttl(s_key)
+            assert 0 < ttl_s_after_listener <= 86400

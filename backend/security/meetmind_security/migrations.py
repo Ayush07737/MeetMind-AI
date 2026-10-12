@@ -213,6 +213,14 @@ async def apply_migrations_conn(
         await conn.execute(
             f'GRANT USAGE, SELECT ON ALL SEQUENCES IN SCHEMA "{schema}" TO meetmind_app'
         )
+        await conn.execute(
+            f'ALTER DEFAULT PRIVILEGES IN SCHEMA "{schema}" '
+            "GRANT SELECT, INSERT ON TABLES TO meetmind_app"
+        )
+        await conn.execute(
+            f'ALTER DEFAULT PRIVILEGES IN SCHEMA "{schema}" '
+            "GRANT USAGE, SELECT ON SEQUENCES TO meetmind_app"
+        )
 
     return newly_applied
 

@@ -4,21 +4,23 @@ NO MOCKS.
 Spawns:
 - Real local JWKS HTTP server serving RS256 keys
 - Real Neon database throwaway tenant schemas with full migrations applied
-- Real Redis (localhost:6379)
+- Real Redis (127.0.0.1:6379)
 - Real Uvicorn server running MeetMind Gateway
 """
 
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import http.server
 import json
+import os
 import socket
 import threading
 import uuid
 from collections.abc import AsyncGenerator
 from contextlib import asynccontextmanager
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
@@ -111,7 +113,7 @@ class LocalJWKSServer:
             def log_message(self, format: str, *args: Any) -> None:
                 pass  # suppress HTTP server logs in tests
 
-        self._server = http.server.HTTPServer(("127.0.0.1", self.port), JWKSHandler)
+        self._server = http.server.ThreadingHTTPServer(("127.0.0.1", self.port), JWKSHandler)
         self._thread = threading.Thread(target=self._server.serve_forever, daemon=True)
         self._thread.start()
 
@@ -201,6 +203,7 @@ class ServerHarness:
     org_b: str
     schema_a: str
     schema_b: str
+    startup_logs: list[str] = field(default_factory=list)
 
     @asynccontextmanager
     async def tenant_conn(self, tenant_id: str) -> AsyncGenerator[Any, None]:
@@ -225,9 +228,42 @@ def jwks_server() -> Any:
     server.stop()
 
 
+@pytest.fixture(scope="session", autouse=True)
+def enforce_linux_redis_without_persistence() -> None:
+    """Enforce that acceptance tests strictly target a Linux-hosted Redis (Docker Compose)
+    with persistence disabled (save='', appendonly='no').
+    """
+    redis_url = os.environ.get("ACCEPTANCE_REDIS_URL", "redis://127.0.0.1:6379/0")
+    allow_native = os.environ.get("ACCEPTANCE_ALLOW_NATIVE", "false").lower() == "true"
+    import redis
+
+    r = redis.from_url(redis_url, decode_responses=True)
+    try:
+        info = r.info("server")
+    except Exception as exc:
+        pytest.fail(f"Acceptance suite cannot connect to Redis at {redis_url}: {exc}")
+
+    os_str = str(info.get("os", ""))
+    if not allow_native and "linux" not in os_str.lower():
+        pytest.fail(
+            f"Acceptance suite refuses to run against non-Linux Redis ({os_str}). "
+            "Canonical target is Docker Compose Redis (redis:7-alpine). "
+            "To override for offline dev, set ACCEPTANCE_ALLOW_NATIVE=true."
+        )
+
+    save_cfg = r.config_get("save")
+    save_val = save_cfg.get("save", "") if isinstance(save_cfg, dict) else ""
+    aof_cfg = r.config_get("appendonly")
+    aof_val = aof_cfg.get("appendonly", "") if isinstance(aof_cfg, dict) else ""
+
+    assert save_val == "", f"Redis persistence violation: 'save' is not empty ({save_val!r})"
+    assert aof_val == "no", f"Redis persistence violation: 'appendonly' is not 'no' ({aof_val!r})"
+
+
 @pytest.fixture
 async def real_redis() -> AsyncGenerator[aioredis.Redis, None]:
-    client = aioredis.from_url("redis://localhost:6379/0", decode_responses=False)
+    redis_url = os.environ.get("ACCEPTANCE_REDIS_URL", "redis://127.0.0.1:6379/0")
+    client = aioredis.from_url(redis_url, decode_responses=False)
     await client.ping()
     yield client
     # Clean up test keys
@@ -304,6 +340,13 @@ async def gateway_harness(
     port = get_free_port()
     repo_root = Path(__file__).resolve().parents[4]
 
+    app_dsn = (
+        os.environ.get("NEON_TEST_APP_DATABASE_URL")
+        or os.environ.get("NEON_APP_DATABASE_URL")
+        or db.get_app_dsn()
+    )
+    redis_url = os.environ.get("ACCEPTANCE_REDIS_URL", "redis://127.0.0.1:6379/0")
+
     env = os.environ.copy()
     env["CLERK_JWKS_URL"] = jwks_server.jwks_url
     env["CLERK_ISSUER"] = jwks_server.issuer
@@ -311,12 +354,17 @@ async def gateway_harness(
     env["TENANT_ORG_MAP"] = json.dumps({org_a: cfg_a.tenant_id, org_b: cfg_b.tenant_id})
     env["ELEVATED_LISTEN_ROLES"] = json.dumps(["org:admin"])
     env["APP_ENV"] = "test"
-    env["NEON_DATABASE_URL"] = db.get_owner_dsn()
-    env["NEON_APP_DATABASE_URL"] = db.get_owner_dsn()
-    env["REDIS_URL"] = "redis://localhost:6379/0"
+    # Least privilege: server runs with app role DSN only; owner DSN stripped
+    env["NEON_DATABASE_URL"] = app_dsn
+    env["NEON_APP_DATABASE_URL"] = app_dsn
+    env["NEON_TEST_APP_DATABASE_URL"] = app_dsn
+    env.pop("NEON_TEST_DATABASE_URL", None)
+    env.pop("NEON_DIRECT_DATABASE_URL", None)
+    env["REDIS_URL"] = redis_url
+    env["AUDIO_REDIS_URL"] = redis_url
     env["IDLE_TIMEOUT_SECONDS"] = "30.0"
     env["ALLOW_TOKEN_IN_DEV"] = "false"
-    env["LOG_LEVEL"] = "WARNING"
+    env["LOG_LEVEL"] = "INFO"
     env["PYTHONPATH"] = (
         str(repo_root / "backend" / "gateway")
         + os.pathsep
@@ -337,12 +385,28 @@ async def gateway_harness(
             "--port",
             str(port),
             "--log-level",
-            "warning",
+            "info",
         ],
         env=env,
         stdout=subprocess.PIPE,
         stderr=subprocess.PIPE,
     )
+
+    startup_logs: list[str] = []
+
+    def _drain_stream(stream: Any) -> None:
+        try:
+            for line in iter(stream.readline, b""):
+                decoded = line.decode("utf-8", errors="replace").strip()
+                if decoded:
+                    startup_logs.append(decoded)
+        except Exception:
+            pass
+
+    t_out = threading.Thread(target=_drain_stream, args=(proc.stdout,), daemon=True)
+    t_err = threading.Thread(target=_drain_stream, args=(proc.stderr,), daemon=True)
+    t_out.start()
+    t_err.start()
 
     # Wait for /health endpoint to be available
     healthy = False
@@ -357,10 +421,10 @@ async def gateway_harness(
             pass
 
         if proc.poll() is not None:
-            _, stderr = proc.communicate()
+            await asyncio.sleep(0.2)
+            err_msg = "\n".join(startup_logs)
             raise RuntimeError(
-                f"Uvicorn subprocess exited early with code {proc.returncode}:\n"
-                f"{stderr.decode('utf-8')}"
+                f"Uvicorn subprocess exited early with code {proc.returncode}:\n{err_msg}"
             )
         await asyncio.sleep(0.1)
 
@@ -377,7 +441,13 @@ async def gateway_harness(
         org_b=org_b,
         schema_a=cfg_a.pg_schema,
         schema_b=cfg_b.pg_schema,
+        startup_logs=startup_logs,
     )
+
+    print("\n--- SERVER STARTUP LOGS ---")
+    for log_line in startup_logs:
+        print(log_line)
+    print("---------------------------\n")
 
     yield harness
 
@@ -389,20 +459,64 @@ async def gateway_harness(
         proc.wait()
 
 
+async def create_test_meeting(
+    http_url: str,
+    token: str,
+    meeting_id: str | None = None,
+) -> dict[str, Any]:
+    """Create server-issued meeting via POST /v1/meetings (K6)."""
+    import httpx
+
+    payload = {"meeting_id": meeting_id} if meeting_id else {}
+    async with httpx.AsyncClient() as client:
+        resp = await client.post(
+            f"{http_url}/v1/meetings",
+            headers={"Authorization": f"Bearer {token}"},
+            json=payload,
+        )
+        assert resp.status_code == 201, f"Create meeting failed: {resp.text}"
+        return resp.json()
+
+
 async def exchange_ws_ticket(
     http_url: str,
     token: str,
     meeting_id: str,
     role: str = "ingest",
+    client_instance_id: str | None = None,
+    auto_create_meeting: bool = True,
 ) -> tuple[int, dict[str, Any]]:
-    """Exchange token for one-time WebSocket ticket via POST /v1/ws-ticket."""
+    """Exchange token for one-time WebSocket ticket via POST /v1/ws-ticket (K6/K7)."""
+    import uuid
+
     import httpx
 
+    if client_instance_id is None:
+        client_instance_id = str(uuid.uuid4())
+
     async with httpx.AsyncClient() as client:
+        if (
+            auto_create_meeting
+            and not meeting_id.startswith("unknown_")
+            and not meeting_id.startswith("fake_")
+            and not meeting_id.startswith("non_existent")
+        ):
+            # Pre-register meeting under caller's tenant
+            with contextlib.suppress(Exception):
+                await client.post(
+                    f"{http_url}/v1/meetings",
+                    headers={"Authorization": f"Bearer {token}"},
+                    json={"meeting_id": meeting_id},
+                )
+
         resp = await client.post(
             f"{http_url}/v1/ws-ticket",
             headers={"Authorization": f"Bearer {token}"},
-            json={"meeting_id": meeting_id, "role": role},
+            json={
+                "meeting_id": meeting_id,
+                "role": role,
+                "client_instance_id": client_instance_id,
+            },
         )
         try:
             return resp.status_code, resp.json()

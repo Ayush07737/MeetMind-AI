@@ -12,11 +12,11 @@ from meetmind_gateway.keys import (
     last_seq_key,
     listeners_key,
     meeting_session_key,
-    meeting_tenant_binding_key,
     out_stream_key,
     transcript_stream_key,
     user_connections_key,
     validate_key_segment,
+    validate_tenant_segment,
     writer_lease_key,
     ws_ticket_key,
 )
@@ -33,11 +33,23 @@ class TestKeysValidation:
         assert out_stream_key(tenant, meeting) == "mm:tenant_123:out:mtg_456"
         assert meeting_session_key(tenant, meeting) == "mm:tenant_123:meeting:mtg_456"
         assert writer_lease_key(tenant, meeting) == "mm:tenant_123:writer:mtg_456"
-        assert last_seq_key(tenant, meeting) == "mm:tenant_123:lastseq:mtg_456"
+        assert last_seq_key(tenant, meeting) == "mm:tenant_123:seq:mtg_456"
         assert listeners_key(tenant, meeting) == "mm:tenant_123:listeners:mtg_456"
-        assert meeting_tenant_binding_key(meeting) == "mm:binding:mtg_456"
         assert ws_ticket_key("tick_abc") == "mm:ticket:tick_abc"
         assert user_connections_key(tenant, "u1") == "mm:tenant_123:userconns:u1"
+
+    def test_k3_tenant_segment_normalisation(self):
+        """K3: Tenant segments in Redis keys are normalised lowercase ^[a-z0-9_]{1,40}$."""
+        assert audio_stream_key("ACME_CORP", "mtg_1") == "mm:acme_corp:audio:mtg_1"
+        assert validate_tenant_segment("TENANT_01") == "tenant_01"
+
+        # Hyphens or invalid chars rejected for tenant segment
+        with pytest.raises(ValueError, match=r"\^\[a-z0-9_\]\{1,40\}\$"):
+            validate_tenant_segment("tenant-with-hyphen")
+
+        # More than 40 chars rejected
+        with pytest.raises(ValueError, match=r"\^\[a-z0-9_\]\{1,40\}\$"):
+            validate_tenant_segment("a" * 41)
 
     @pytest.mark.parametrize(
         "invalid_segment",

@@ -15,6 +15,7 @@ import asyncio
 import logging
 import os
 import ssl
+import sys
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
 from typing import Any
@@ -111,7 +112,13 @@ async def verify_runtime_role_privileges(
     Returns the current user string.
     """
     current_user: str = await conn.fetchval("SELECT current_user")
-    logger.info("Database runtime connected as user: %s", current_user)
+    sys.stderr.write(
+        f"INFO: Database runtime connected as user: {current_user} (current_user={current_user})\n"
+    )
+    sys.stderr.flush()
+    logger.info(
+        "Database runtime connected as user: %s (current_user=%s)", current_user, current_user
+    )
 
     for table in ["audit_events", "consent_events"]:
         exists = await conn.fetchval(
@@ -152,13 +159,14 @@ async def _create_pool_with_retry(dsn: str, max_retries: int = 3) -> asyncpg.Poo
             logger.info(
                 "Initializing asyncpg connection pool (attempt %d/%d)...", attempt, max_retries
             )
+            pool_max = int(os.environ.get("NEON_POOL_MAX_SIZE", "20"))
             return await asyncpg.create_pool(
                 dsn,
                 min_size=2,
-                max_size=10,
+                max_size=pool_max,
                 ssl=ssl_ctx,
-                timeout=10.0,
-                command_timeout=30.0,
+                timeout=15.0,
+                command_timeout=45.0,
                 statement_cache_size=0,
             )
         except (

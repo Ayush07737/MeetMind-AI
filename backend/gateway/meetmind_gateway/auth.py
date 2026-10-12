@@ -35,6 +35,7 @@ class AuthenticatedUser:
     session_id: str
     claims: dict[str, Any]
     role: str = ""
+    client_instance_id: str = ""
 
 
 class AuthError(Exception):

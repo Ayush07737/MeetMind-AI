@@ -9,7 +9,7 @@ from meetmind_gateway.app import create_app
 from meetmind_gateway.config import GatewaySettings
 from meetmind_schemas.events import WSCloseCode
 
-pytestmark = [pytest.mark.integration]
+pytestmark = [pytest.mark.integration, pytest.mark.timeout(60)]
 
 
 def get_free_port() -> int:
@@ -26,7 +26,7 @@ async def test_real_uvicorn_ws_handshake_succeeds_then_receives_4401():
     port = get_free_port()
     settings = GatewaySettings(
         neon_database_url="postgresql://localhost/test",
-        redis_url="redis://localhost:6379/0",
+        redis_url="redis://127.0.0.1:6379/0",
         app_env="test",
         clerk_jwks_url="https://clerk.meetmind.ai/.well-known/jwks.json",
         clerk_issuer="https://clerk.meetmind.ai",

@@ -111,31 +111,90 @@ class TestTenantRouter:
             self.router.resolve("bad' OR '1'='1")
 
     def test_dev_mode_permits_dynamic_tenant_fallback(self):
-        from unittest.mock import patch
-
-        with patch.dict("os.environ", {"APP_ENV": "development"}, clear=False):
-            router = TenantRouter()
-            resolved = router.resolve("dynamic_dev_tenant")
-            assert resolved.tenant_id == "dynamic_dev_tenant"
-            assert resolved.pg_schema == "tenant_dynamic_dev_tenant"
+        """K2: Injected app_env='development' enables dynamic fallback for dev."""
+        router = TenantRouter(app_env="development")
+        resolved = router.resolve("dynamic_dev_tenant")
+        assert resolved.tenant_id == "dynamic_dev_tenant"
+        assert resolved.pg_schema == "tenant_dynamic_dev_tenant"
 
     def test_prod_mode_rejects_unknown_tenant(self):
-        from unittest.mock import patch
+        """K2: Injected app_env='production' rejects unknown tenants."""
+        router = TenantRouter(app_env="production")
+        with pytest.raises(TenantNotFoundError):
+            router.resolve("unregistered_prod_tenant")
 
-        with patch.dict("os.environ", {"APP_ENV": "production"}, clear=False):
-            router = TenantRouter()
-            with pytest.raises(TenantNotFoundError):
-                router.resolve("unregistered_prod_tenant")
-
-    def test_tenant_org_map_env_registers_tenants(self):
-        import json
-        from unittest.mock import patch
-
+    def test_tenant_org_map_injected_registers_tenants(self):
+        """K2: Injected tenant_org_map registers configured tenants."""
         mapping = {"org_enterprise_1": "tenant_ent_1", "org_enterprise_2": "tenant_ent_2"}
-        with patch.dict("os.environ", {"TENANT_ORG_MAP": json.dumps(mapping)}, clear=False):
-            router = TenantRouter()
-            t1 = router.resolve("tenant_ent_1")
-            assert t1.tenant_id == "tenant_ent_1"
-            assert t1.pg_schema == "tenant_tenant_ent_1"
-            t2 = router.resolve("tenant_ent_2")
-            assert t2.tenant_id == "tenant_ent_2"
+        router = TenantRouter(app_env="production", tenant_org_map=mapping)
+        t1 = router.resolve("tenant_ent_1")
+        assert t1.tenant_id == "tenant_ent_1"
+        assert t1.pg_schema == "tenant_tenant_ent_1"
+        t2 = router.resolve("tenant_ent_2")
+        assert t2.tenant_id == "tenant_ent_2"
+
+    def test_malformed_tenant_org_map_fails(self):
+        """K2: Malformed tenant_org_map entries fail with clear ValueError."""
+        with pytest.raises(ValueError, match="Invalid tenant_org_map"):
+            TenantRouter(tenant_org_map={"org_bad": 12345})  # type: ignore[dict-item]
+
+    def test_k3_tenant_id_normalised_lowercase(self):
+        """K3: Tenant IDs are normalised lowercase and must match ^[a-z0-9_]{1,40}$."""
+        router = TenantRouter(app_env="development")
+        # Mixed-case resolve should normalise to lowercase
+        resolved = router.resolve("Acme_Corp")
+        assert resolved.tenant_id == "acme_corp"
+        assert resolved.pg_schema == "tenant_acme_corp"
+        assert resolved.redis_prefix == "acme_corp"
+
+    def test_k3_tenant_id_length_and_characters_enforced(self):
+        """K3: Tenant IDs longer than 40 chars or with invalid chars are rejected."""
+        router = TenantRouter(app_env="development")
+        # 41 chars -> rejected
+        too_long = "a" * 41
+        with pytest.raises(ValueError, match=r"\^\[a-z0-9_\]\{1,40\}\$"):
+            router.resolve(too_long)
+
+        # Invalid characters (hyphen, space, punctuation) -> rejected
+        with pytest.raises(ValueError, match=r"\^\[a-z0-9_\]\{1,40\}\$"):
+            router.resolve("tenant-with-hyphen")
+
+    def test_k3_registration_duplicate_case_insensitive_and_collision(self):
+        """K3: Registration rejects conflicting schema collision case-insensitively."""
+        router = TenantRouter(app_env="production")
+        # First registration
+        cfg1 = TenantConfig(
+            tenant_id="corp_x",
+            pg_schema="tenant_corp_x",
+            neo4j_namespace="corp_x",
+            qdrant_prefix="corp_x",
+            redis_prefix="corp_x",
+        )
+        router.register(cfg1)
+
+        # Same config registered again with different case is accepted idempotently
+        cfg1_upper = TenantConfig(
+            tenant_id="CORP_X",
+            pg_schema="tenant_corp_x",
+            neo4j_namespace="corp_x",
+            qdrant_prefix="corp_x",
+            redis_prefix="corp_x",
+        )
+        router.register(cfg1_upper)
+
+        # Conflicting schema for same normalised tenant ID fails with collision ValueError
+        cfg_conflict = TenantConfig(
+            tenant_id="CORP_X",
+            pg_schema="tenant_conflicting_schema",
+            neo4j_namespace="corp_x",
+            qdrant_prefix="corp_x",
+            redis_prefix="corp_x",
+        )
+        with pytest.raises(ValueError, match="Tenant collision"):
+            router.register(cfg_conflict)
+
+    def test_k3_redis_keys_use_normalised_id(self):
+        """K3: Redis key shortcuts use normalized lowercase tenant ID."""
+        router = TenantRouter(app_env="development")
+        key = router.redis_key("ACME_CORP", "session:abc")
+        assert key == "acme_corp:session:abc"

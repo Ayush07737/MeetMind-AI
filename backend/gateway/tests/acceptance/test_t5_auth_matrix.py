@@ -24,7 +24,7 @@ from conftest import ServerHarness, exchange_ws_ticket
 from meetmind_schemas.events import WSCloseCode
 from websockets.exceptions import ConnectionClosed
 
-pytestmark = [pytest.mark.integration]
+pytestmark = [pytest.mark.integration, pytest.mark.timeout(120)]
 
 
 @pytest.mark.asyncio
@@ -94,13 +94,13 @@ async def test_t5_auth_token_failures_matrix(
     status, resp = await exchange_ws_ticket(h.http_url, none_token, meeting_id)
     assert status == 401
 
-    # 7. HS256 algorithm confusion attack
+    # 7. HS256 algorithm confusion attack (K9: 32-byte HMAC key removes PyJWT warning)
     hs256_token = h.jwks.mint_token(
         sub="user_hs256",
         org_id=h.org_a,
         org_role="org:admin",
         alg="HS256",
-        sign_key=b"secret_key_confusion",
+        sign_key=b"secret_key_confusion_32_bytes_32",
     )
     status, resp = await exchange_ws_ticket(h.http_url, hs256_token, meeting_id)
     assert status == 401
@@ -177,6 +177,11 @@ async def test_t5_ws_ticket_security_invariants(
     assert status == 200
     ticket_a = resp_a["ticket"]
 
+    # K9: Assert ticket key TTL is positive and at most 30s right after issue
+    t_key_a = ws_ticket_key(ticket_a)
+    ttl_a = await real_redis.ttl(t_key_a)
+    assert 0 < ttl_a <= 30, f"Ticket TTL expected in (0, 30], got {ttl_a}"
+
     wrong_mtg_uri = f"{h.ws_url}/v1/meetings/{meeting_b}/stream?ticket={ticket_a}"
     with pytest.raises(ConnectionClosed) as exc_wrong_mtg:
         async with websockets.connect(wrong_mtg_uri) as ws:
@@ -188,12 +193,18 @@ async def test_t5_ws_ticket_security_invariants(
     keys_b = await real_redis.keys(f"mm:*:{meeting_b}")
     assert len(keys_b) == 0
 
-    # 3. Expired ticket -> 4401 (UNAUTHORIZED)
+    # 3. Real expired ticket -> 4401 (UNAUTHORIZED) (K9: real expiry test)
     status_exp, resp_exp = await exchange_ws_ticket(h.http_url, token, meeting_a, role="ingest")
     assert status_exp == 200
     ticket_expired = resp_exp["ticket"]
-    # Simulate TTL expiration by deleting ticket from Redis
-    await real_redis.delete(ws_ticket_key(ticket_expired))
+    exp_key = ws_ticket_key(ticket_expired)
+
+    # Set 1-second TTL in Redis to test genuine expiry without long wait
+    await real_redis.expire(exp_key, 1)
+    import asyncio
+
+    await asyncio.sleep(1.2)
+    assert await real_redis.exists(exp_key) == 0, "Ticket key should have expired in Redis"
 
     expired_uri = f"{h.ws_url}/v1/meetings/{meeting_a}/stream?ticket={ticket_expired}"
     with pytest.raises(ConnectionClosed) as exc_expired:
