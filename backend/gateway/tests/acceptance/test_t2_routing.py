@@ -99,9 +99,14 @@ async def test_t2_frame_routing_all_adapters(
         audio_entries = await real_redis.xrange(audio_key)
         audio_fields = audio_entries[0][1]
         raw_seq = audio_fields.get(b"client_seq") or audio_fields.get("client_seq")
-        raw_audio = audio_fields.get(b"audio_data") or audio_fields.get("audio_data")
         assert raw_seq in (b"1", "1")
-        assert raw_audio == pcm_bytes
+        raw_audio = audio_fields.get(b"audio_data") or audio_fields.get("audio_data")
+        assert raw_audio == audio_frame
+        from meetmind_schemas.events import decode_audio_frame
+
+        hdr, dec_payload = decode_audio_frame(raw_audio)
+        assert dec_payload == pcm_bytes
+        assert hdr.client_seq == 1
 
         # 5. JSON transcript chunk -> transcript stream
         transcript_text = f"Live transcript chunk from {adapter_type}"

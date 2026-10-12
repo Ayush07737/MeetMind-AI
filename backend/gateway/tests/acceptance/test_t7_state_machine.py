@@ -9,6 +9,7 @@ Verifies:
 
 from __future__ import annotations
 
+import asyncio
 import json
 import uuid
 from datetime import UTC, datetime
@@ -68,8 +69,11 @@ async def test_t7_deduplication_gap_tracking_and_meeting_end(
     tenant_id = h.tenant_a
     stream_key = audio_stream_key(tenant_id, meeting_id)
 
+    cid = str(uuid.uuid4())
     token = h.jwks.mint_token(sub="user_sm_flow", org_id=h.org_a, org_role="org:admin")
-    status, resp = await exchange_ws_ticket(h.http_url, token, meeting_id, role="ingest")
+    status, resp = await exchange_ws_ticket(
+        h.http_url, token, meeting_id, role="ingest", client_instance_id=cid
+    )
     assert status == 200
     ticket = resp["ticket"]
 
@@ -154,37 +158,48 @@ async def test_t7_deduplication_gap_tracking_and_meeting_end(
         raw_gap = entry4_fields.get(b"gap_size") or entry4_fields.get("gap_size")
         assert raw_gap in (b"2", "2")
 
-        # 6. meeting_end
-        await ws.send(
-            json.dumps(
-                {
-                    "type": "control",
-                    "action": "meeting_end",
-                }
+        # P0-2: Ingest reconnect with consent already on file emits duplicate meeting_active
+        await ws.close()
+
+        st_recon, resp_recon = await exchange_ws_ticket(
+            h.http_url, token, meeting_id, role="ingest", client_instance_id=cid
+        )
+        assert st_recon == 200
+        uri_recon = f"{h.ws_url}/v1/meetings/{meeting_id}/stream?ticket={resp_recon['ticket']}"
+        async with websockets.connect(uri_recon) as ws_recon:
+            await asyncio.sleep(0.2)
+
+            # 6. meeting_end on reconnected stream
+            await ws_recon.send(
+                json.dumps(
+                    {
+                        "type": "control",
+                        "action": "meeting_end",
+                    }
+                )
             )
-        )
-        ack_end = json.loads(await ws.recv())
-        assert ack_end["type"] == "ack"
-        assert ack_end["status"] == "accepted"
+            ack_end = json.loads(await ws_recon.recv())
+            assert ack_end["type"] == "ack"
+            assert ack_end["status"] == "accepted"
 
-        # 7. Audio after meeting_end rejected with ErrorFrame(MEETING_ENDED)
-        ts_post = int(datetime.now(UTC).timestamp() * 1000)
-        post_end_frame = encode_audio_frame(
-            client_seq=99,
-            capture_ts_ms=ts_post,
-            payload=b"POST_END_PCM",
-        )
-        await ws.send(post_end_frame)
+            # 7. Audio after meeting_end rejected with ErrorFrame(MEETING_ENDED)
+            ts_post = int(datetime.now(UTC).timestamp() * 1000)
+            post_end_frame = encode_audio_frame(
+                client_seq=99,
+                capture_ts_ms=ts_post,
+                payload=b"POST_END_PCM",
+            )
+            await ws_recon.send(post_end_frame)
 
-        resp_post = json.loads(await ws.recv())
-        assert resp_post["type"] == "error"
-        assert resp_post["code"] == "MEETING_ENDED"
+            resp_post = json.loads(await ws_recon.recv())
+            assert resp_post["type"] == "error"
+            assert resp_post["code"] == "MEETING_ENDED"
 
-        # 8. Connection gracefully closed with 1000 (NORMAL_CLOSURE)
-        with pytest.raises(ConnectionClosed) as exc_closed:
-            await ws.recv()
-        assert exc_closed.value.rcvd is not None
-        assert exc_closed.value.rcvd.code == 1000
+            # 8. Connection gracefully closed with 1000 (NORMAL_CLOSURE)
+            with pytest.raises(ConnectionClosed) as exc_closed:
+                await ws_recon.recv()
+            assert exc_closed.value.rcvd is not None
+            assert exc_closed.value.rcvd.code == 1000
 
     # 8. Verify meeting_end audit event written to Neon
     async with h.tenant_conn(tenant_id) as conn:
@@ -200,3 +215,26 @@ async def test_t7_deduplication_gap_tracking_and_meeting_end(
         assert audit_row is not None
         payload = json.loads(audit_row["payload"])
         assert payload["meeting_id"] == meeting_id
+
+    # P0-2: Verify lifecycle stream entries on mm:system:lifecycle
+    lc_entries = await real_redis.xrange("mm:system:lifecycle", min="-", max="+")
+    m_events = [
+        f
+        for _, f in lc_entries
+        if (f.get(b"meeting_id") or f.get("meeting_id")) in (meeting_id.encode(), meeting_id)
+    ]
+    event_names = [
+        (f.get(b"event") or f.get("event")).decode("utf-8")
+        if isinstance(f.get(b"event") or f.get("event"), bytes)
+        else (f.get(b"event") or f.get("event"))
+        for f in m_events
+    ]
+    assert event_names.count("meeting_active") >= 2, (
+        f"Expected duplicate meeting_active on reconnect, got: {event_names}"
+    )
+    assert "meeting_ended" in event_names, (
+        f"Expected meeting_ended in lifecycle stream, got: {event_names}"
+    )
+    for f in m_events:
+        assert (f.get(b"tenant") or f.get("tenant")) in (tenant_id.encode(), tenant_id)
+        assert (f.get(b"ts_ms") or f.get("ts_ms")) is not None

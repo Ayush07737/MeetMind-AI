@@ -58,3 +58,6 @@ dump.rdb
 *.rdb
 *.aof
 appendonlydir/
+
+# ---------- Scratch / Temporary ----------
+scratch/

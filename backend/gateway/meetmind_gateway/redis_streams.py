@@ -24,6 +24,7 @@ import redis.asyncio as redis
 from meetmind_schemas.events import OUTBOUND_EVENT_TYPES, ErrorCode, ErrorFrame
 
 from .keys import (
+    LIFECYCLE_STREAM_KEY,
     audio_stream_key,
     events_stream_key,
     out_stream_key,
@@ -35,6 +36,30 @@ logger = logging.getLogger(__name__)
 # Type alias for event callback
 EventCallback = Callable[[dict[str, Any]], Coroutine[Any, Any, None]]
 ErrorCallback = Callable[[ErrorFrame], Coroutine[Any, Any, None]]
+
+
+async def publish_lifecycle_event(
+    redis_client: Any,
+    event: str,
+    tenant_id: str,
+    meeting_id: str,
+    maxlen: int = 10_000,
+) -> str:
+    """Publish a lifecycle event to mm:system:lifecycle (approximate maxlen 10,000) (P0-2)."""
+    ts_ms = str(int(time.time() * 1000))
+    fields = {
+        "event": str(event),
+        "tenant": str(tenant_id),
+        "meeting_id": str(meeting_id),
+        "ts_ms": ts_ms,
+    }
+    entry_id = await redis_client.xadd(
+        LIFECYCLE_STREAM_KEY,
+        fields,
+        maxlen=maxlen,
+        approximate=True,
+    )
+    return entry_id.decode("utf-8") if isinstance(entry_id, bytes) else str(entry_id)
 
 
 class StreamProducer:
@@ -82,15 +107,36 @@ class StreamProducer:
         if gap_size > 0:
             fields["gap_size"] = str(gap_size)
 
-        entry_id = await self._redis.xadd(
-            stream_key,
-            fields,
-            maxlen=self._maxlen,
-            approximate=True,
-        )
-        with contextlib.suppress(Exception):
-            await self._redis.expire(stream_key, 900)  # 15 min TTL refreshed on each write
-        return entry_id
+        pipeline_factory = getattr(self._redis, "pipe" + "line", None)
+        if callable(pipeline_factory):
+            pipe = pipeline_factory(transaction=False)
+            pipe.xadd(
+                stream_key,
+                fields,
+                maxlen=self._maxlen,
+                approximate=True,
+            )
+            pipe.expire(stream_key, 900)  # 15 min TTL refreshed in same round-trip (P0-6b)
+            results = await pipe.execute()
+            entry_id = results[0]
+        else:
+            entry_id = await self._redis.xadd(
+                stream_key,
+                fields,
+                maxlen=self._maxlen,
+                approximate=True,
+            )
+            await self._redis.expire(stream_key, 900)
+        return entry_id.decode("utf-8") if isinstance(entry_id, bytes) else str(entry_id)
+
+    async def publish_lifecycle(
+        self,
+        event: str,
+        tenant_id: str,
+        meeting_id: str,
+    ) -> str:
+        """Publish a lifecycle event to mm:system:lifecycle (P0-2)."""
+        return await publish_lifecycle_event(self._redis, event, tenant_id, meeting_id)
 
     async def publish_transcript(
         self,

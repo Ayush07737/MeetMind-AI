@@ -90,23 +90,90 @@ class TestSchemaContracts:
         for case in af["valid"]:
             raw_bytes = bytes.fromhex(case["hex"])
             header, payload = decode_audio_frame(raw_bytes)
-            assert header.version == case["header"]["version"]
-            assert header.flags == case["header"]["flags"]
-            assert header.client_seq == case["header"]["client_seq"]
-            assert header.capture_ts_ms == case["header"]["capture_ts_ms"]
+            if "magic" in case["header"]:
+                assert header.magic.decode("ascii") == case["header"]["magic"]
+                assert header.client_seq == case["header"]["client_seq"]
+                assert header.capture_ts_ms == case["header"]["capture_ts_ms"]
+                assert header.sample_rate == case["header"]["sample_rate"]
+                assert header.channels == case["header"]["channels"]
+                assert header.codec == case["header"]["codec"]
+                re_encoded = encode_audio_frame(
+                    client_seq=header.client_seq,
+                    capture_ts_ms=header.capture_ts_ms,
+                    payload=payload,
+                    sample_rate=header.sample_rate,
+                    channels=header.channels,
+                    codec=header.codec,
+                    magic=header.magic,
+                )
+            else:
+                assert header.version == case["header"]["version"]
+                assert header.flags == case["header"]["flags"]
+                assert header.client_seq == case["header"]["client_seq"]
+                assert header.capture_ts_ms == case["header"]["capture_ts_ms"]
+                re_encoded = encode_audio_frame(
+                    client_seq=header.client_seq,
+                    capture_ts_ms=header.capture_ts_ms,
+                    payload=payload,
+                    flags=header.flags,
+                    version=header.version,
+                )
             assert payload.hex() == case["payload_hex"]
-
-            # Round trip encode
-            re_encoded = encode_audio_frame(
-                client_seq=header.client_seq,
-                capture_ts_ms=header.capture_ts_ms,
-                payload=payload,
-                flags=header.flags,
-                version=header.version,
-            )
             assert re_encoded == raw_bytes
 
         for invalid_case in af["invalid"]:
             raw_bytes = bytes.fromhex(invalid_case["hex"])
             with pytest.raises(ValueError):
                 decode_audio_frame(raw_bytes)
+
+    def test_asr_contract_fixtures(self):
+        from meetmind_schemas.events import (
+            EventEnvelope,
+            TranscriptFinalPayload,
+            TranscriptInterimPayload,
+            TranscriptServiceDegradedPayload,
+            compute_utterance_id,
+        )
+
+        raw = json.loads((FIXTURES_DIR / "asr_contract_fixtures.json").read_text(encoding="utf-8"))
+
+        # 1. Deterministic utterance_id
+        u_case = raw["deterministic_utterance_id"]
+        calc_uid = compute_utterance_id(
+            meeting_id=u_case["meeting_id"],
+            channel=u_case["channel"],
+            speaker_id=u_case["speaker_id"],
+            start_ms=u_case["start_ms"],
+        )
+        assert calc_uid == u_case["expected_utterance_id"]
+
+        # 2. Transcript final envelope and payload
+        tf_data = raw["transcript_final"]
+        tf_env = EventEnvelope.model_validate(tf_data)
+        assert tf_env.event_type == "transcript_final"
+        tf_payload = TranscriptFinalPayload.model_validate(tf_env.payload)
+        assert tf_payload.utterance_id == u_case["expected_utterance_id"]
+        assert tf_payload.channel == 0
+        assert tf_payload.speaker_id == "spk_0"
+        assert tf_payload.text == "Welcome everyone to the quarterly review."
+        assert tf_payload.start_ms == 1200
+        assert tf_payload.end_ms == 3400
+        assert tf_payload.confidence == 0.985
+        assert tf_payload.provider == "deepgram"
+        assert tf_payload.model == "nova-3"
+
+        # 3. Transcript interim envelope and payload
+        ti_data = raw["transcript_interim"]
+        ti_env = EventEnvelope.model_validate(ti_data)
+        assert ti_env.event_type == "transcript_interim"
+        ti_payload = TranscriptInterimPayload.model_validate(ti_env.payload)
+        assert ti_payload.is_stable is False
+        assert ti_payload.confidence == 0.92
+
+        # 4. Transcript service degraded envelope and payload
+        td_data = raw["transcript_service_degraded"]
+        td_env = EventEnvelope.model_validate(td_data)
+        assert td_env.event_type == "transcript_service_degraded"
+        td_payload = TranscriptServiceDegradedPayload.model_validate(td_env.payload)
+        assert td_payload.state == "degraded"
+        assert td_payload.reason == "provider_unreachable"

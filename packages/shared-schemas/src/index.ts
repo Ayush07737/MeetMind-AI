@@ -6,6 +6,7 @@
  * defined in meetmind_schemas.events (Python).
  */
 
+import { createHash } from "crypto";
 import { z } from "zod";
 
 // ── Tenant ──────────────────────────────────────────────────────────────────
@@ -230,31 +231,71 @@ export const ErrorFrameSchema = z
   .strict();
 export type ErrorFrame = z.infer<typeof ErrorFrameSchema>;
 
-// ── Binary Audio Header Codec (WP5) ─────────────────────────────────────────
+// ── Export Keys ─────────────────────────────────────────────────────────────
+
+export * from "./keys.js";
+
+// ── Binary Audio Header Codec (WP5 & §2.3 Canonical) ─────────────────────────
 
 export const BINARY_HEADER_SIZE = 18;
 
 export interface AudioHeader {
+  clientSeq: bigint | number;
+  captureTsMs: bigint | number;
+  sampleRate: number;
+  channels: number;
+  codec: number;
+  magic: string;
   version: number;
   flags: number;
-  clientSeq: bigint;
-  captureTsMs: bigint;
+}
+
+export interface EncodeAudioFrameOptions {
+  sampleRate?: number;
+  channels?: number;
+  codec?: number;
+  flags?: number;
+  version?: number;
+  magic?: string;
 }
 
 export function encodeAudioFrame(
   clientSeq: bigint | number,
   captureTsMs: bigint | number,
   payload: Uint8Array,
-  flags: number = 0,
-  version: number = 1,
+  optionsOrFlags?: number | EncodeAudioFrameOptions,
+  legacyVersion?: number,
 ): Uint8Array {
   const buf = new Uint8Array(BINARY_HEADER_SIZE + payload.byteLength);
   const view = new DataView(buf.buffer, buf.byteOffset, buf.byteLength);
 
-  view.setUint8(0, version);
-  view.setUint8(1, flags);
-  view.setBigUint64(2, BigInt(clientSeq), false); // Big-endian
-  view.setBigUint64(10, BigInt(captureTsMs), false); // Big-endian
+  if (typeof optionsOrFlags === "number" || (legacyVersion !== undefined && legacyVersion !== 1)) {
+    // Legacy WP5 packing (>BBQQ)
+    const flags = typeof optionsOrFlags === "number" ? optionsOrFlags : 0;
+    const version = legacyVersion !== undefined ? legacyVersion : 1;
+    view.setUint8(0, version);
+    view.setUint8(1, flags);
+    view.setBigUint64(2, BigInt(clientSeq), false);
+    view.setBigUint64(10, BigInt(captureTsMs), false);
+  } else {
+    const opts = (optionsOrFlags as EncodeAudioFrameOptions) || {};
+    if (opts.flags !== undefined || (opts.version !== undefined && opts.version !== 1)) {
+      view.setUint8(0, opts.version ?? 1);
+      view.setUint8(1, opts.flags ?? 0);
+      view.setBigUint64(2, BigInt(clientSeq), false);
+      view.setBigUint64(10, BigInt(captureTsMs), false);
+    } else {
+      // Canonical packing (>2sIQHBB: magic "MM", client_seq u32, capture_ts_ms u64, sample_rate u16, channels u8, codec u8)
+      view.setUint8(0, 0x4d); // 'M'
+      view.setUint8(1, 0x4d); // 'M'
+      view.setUint32(2, Number(clientSeq), false);
+      view.setBigUint64(6, BigInt(captureTsMs), false);
+      view.setUint16(14, opts.sampleRate ?? 16000, false);
+      view.setUint8(16, opts.channels ?? 1);
+      view.setUint8(17, opts.codec ?? 1);
+    }
+  }
+
   buf.set(payload, BINARY_HEADER_SIZE);
   return buf;
 }
@@ -266,17 +307,128 @@ export function decodeAudioFrame(data: Uint8Array): { header: AudioHeader; paylo
     );
   }
   const view = new DataView(data.buffer, data.byteOffset, data.byteLength);
-  const version = view.getUint8(0);
-  if (version !== 1) {
-    throw new Error(`Unsupported audio frame version: ${version}, expected 1`);
-  }
-  const flags = view.getUint8(1);
-  const clientSeq = view.getBigUint64(2, false);
-  const captureTsMs = view.getBigUint64(10, false);
   const payload = data.subarray(BINARY_HEADER_SIZE);
 
-  return {
-    header: { version, flags, clientSeq, captureTsMs },
-    payload,
-  };
+  // Check for canonical magic 'MM' (0x4D, 0x4D)
+  if (view.getUint8(0) === 0x4d && view.getUint8(1) === 0x4d) {
+    const clientSeq = view.getUint32(2, false);
+    const captureTsMs = view.getBigUint64(6, false);
+    const sampleRate = view.getUint16(14, false);
+    const channels = view.getUint8(16);
+    const codec = view.getUint8(17);
+    return {
+      header: {
+        clientSeq,
+        captureTsMs,
+        sampleRate,
+        channels,
+        codec,
+        magic: "MM",
+        version: 1,
+        flags: 0,
+      },
+      payload,
+    };
+  }
+
+  // Check for legacy WP5 version = 1
+  if (view.getUint8(0) === 1) {
+    const version = view.getUint8(0);
+    const flags = view.getUint8(1);
+    const clientSeq = view.getBigUint64(2, false);
+    const captureTsMs = view.getBigUint64(10, false);
+    return {
+      header: {
+        clientSeq,
+        captureTsMs,
+        sampleRate: 16000,
+        channels: 1,
+        codec: 1,
+        magic: "",
+        version,
+        flags,
+      },
+      payload,
+    };
+  }
+
+  throw new Error(
+    `Unsupported audio frame version or magic: byte0=0x${view.getUint8(0).toString(16)}`,
+  );
+}
+
+// ── Event Envelope & Payloads (WP-A) ─────────────────────────────────────────
+
+export const DegradedStateSchema = z.enum(["degraded", "recovered"]);
+export type DegradedState = z.infer<typeof DegradedStateSchema>;
+
+export const DegradedReasonSchema = z.enum([
+  "provider_unreachable",
+  "provider_error",
+  "unsupported_codec",
+  "buffer_overflow",
+  "audio_gap",
+]);
+export type DegradedReason = z.infer<typeof DegradedReasonSchema>;
+
+export const TranscriptFinalPayloadSchema = z.object({
+  utterance_id: z.string().length(24),
+  speaker_id: z.string(),
+  speaker_name: z.string().nullable().optional(),
+  channel: z.number().int().nullable().optional(),
+  text: z.string(),
+  start_ms: z.number().int(),
+  end_ms: z.number().int(),
+  start_epoch_ms: z.number().int(),
+  confidence: z.number(),
+  language: z.string(),
+  provider: z.string(),
+  model: z.string(),
+});
+export type TranscriptFinalPayload = z.infer<typeof TranscriptFinalPayloadSchema>;
+
+export const TranscriptInterimPayloadSchema = z.object({
+  speaker_id: z.string(),
+  speaker_name: z.string().nullable().optional(),
+  channel: z.number().int().nullable().optional(),
+  text: z.string(),
+  start_ms: z.number().int(),
+  end_ms: z.number().int(),
+  start_epoch_ms: z.number().int(),
+  confidence: z.number(),
+  language: z.string(),
+  provider: z.string(),
+  model: z.string(),
+  is_stable: z.boolean().default(false),
+});
+export type TranscriptInterimPayload = z.infer<typeof TranscriptInterimPayloadSchema>;
+
+export const TranscriptServiceDegradedPayloadSchema = z.object({
+  state: DegradedStateSchema,
+  reason: DegradedReasonSchema,
+  since_ms: z.number().int(),
+});
+export type TranscriptServiceDegradedPayload = z.infer<
+  typeof TranscriptServiceDegradedPayloadSchema
+>;
+
+export const EventEnvelopeSchema = z.object({
+  event_type: z.string(),
+  meeting_id: z.string(),
+  tenant_id: z.string(),
+  ts_ms: z.number().int(),
+  payload: z.record(z.unknown()),
+});
+export type EventEnvelope = z.infer<typeof EventEnvelopeSchema>;
+
+export function computeUtteranceId(
+  meetingId: string,
+  channel: number | null | undefined,
+  speakerId: string,
+  startMs: number,
+): string {
+  const chStr = channel !== null && channel !== undefined ? String(channel) : "0";
+  const spkStr = speakerId || "spk_0";
+  const key = `${meetingId}|${chStr}|${spkStr}|${startMs}`;
+  return createHash("sha256").update(key).digest("hex").slice(0, 24);
 }

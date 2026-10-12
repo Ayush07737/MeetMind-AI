@@ -100,19 +100,20 @@ graph TB
 
 ## Technology Stack
 
-| Layer               | Technology                         | Rationale                                              |
-| ------------------- | ---------------------------------- | ------------------------------------------------------ |
-| Backend Runtime     | Python 3.12+, FastAPI              | Async-first, WebSocket native                          |
-| Agent Orchestration | LangGraph                          | Stateful agent graphs with checkpointing               |
-| Graph Database      | Neo4j Community Edition            | Decision lineage, relationship-rich queries            |
-| Vector Database     | Qdrant                             | Low-latency semantic search                            |
-| Relational Database | Neon (managed serverless Postgres) | Zero ops burden, branching for dev/prod, scale-to-zero |
-| Cache / PubSub      | Redis 7                            | Session state, real-time event distribution            |
-| Authentication      | Clerk                              | Managed auth, JWT validation via backend SDK           |
-| Frontend            | TypeScript, Vite                   | Fast builds, HMR, modern tooling                       |
-| Extension           | Chrome Manifest V3                 | Cross-browser, service worker based                    |
-| Python Tooling      | uv, ruff, pytest                   | Fast, deterministic, async-native                      |
-| JS/TS Tooling       | pnpm, ESLint, Prettier, Vitest     | Workspace support, consistent formatting               |
+| Layer                | Technology                         | Rationale                                              |
+| -------------------- | ---------------------------------- | ------------------------------------------------------ |
+| Backend Runtime      | Python 3.12+, FastAPI              | Async-first, WebSocket native                          |
+| Agent Orchestration  | LangGraph                          | Stateful agent graphs with checkpointing               |
+| Graph Database       | Neo4j Community Edition            | Decision lineage, relationship-rich queries            |
+| Vector Database      | Qdrant                             | Low-latency semantic search                            |
+| Relational Database  | Neon (managed serverless Postgres) | Zero ops burden, branching for dev/prod, scale-to-zero |
+| Cache / PubSub       | Redis 7                            | Session state, real-time event distribution            |
+| Speech-to-Text (ASR) | Deepgram Nova-3 (WebSocket)        | Streaming diarization, keyterm prompting, MIP opt-out  |
+| Authentication       | Clerk                              | Managed auth, JWT validation via backend SDK           |
+| Frontend             | TypeScript, Vite                   | Fast builds, HMR, modern tooling                       |
+| Extension            | Chrome Manifest V3                 | Cross-browser, service worker based                    |
+| Python Tooling       | uv, ruff, pytest                   | Fast, deterministic, async-native                      |
+| JS/TS Tooling        | pnpm, ESLint, Prettier, Vitest     | Workspace support, consistent formatting               |
 
 ## Database Strategy — Neon
 
@@ -147,3 +148,4 @@ All services resolve connections through `TenantRouter` in `backend/security/mee
 2. **Append-only audit log**: `audit_events` table — INSERT only, no UPDATE/DELETE
 3. **All consent changes audited**: Every `record_consent` / `revoke_consent` call writes to `audit_events`
 4. **Raw audio never persists to disk (WP6)**: Ephemeral Redis Streams only (`AUDIO_REDIS_URL`), bounded stream length (`AUDIO_STREAM_MAXLEN`), 15m write TTL, 5m post-meeting grace TTL. Gateway startup guard refuses to start if Redis persistence is enabled.
+5. **Zero audio persistence in ASR (§2)**: No file-write APIs, DB drivers, tempfile, or audio bytes in logs. At-least-once audio to provider, effectively-once transcripts via deterministic utterance deduplication.

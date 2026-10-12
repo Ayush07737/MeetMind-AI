@@ -1,0 +1,610 @@
+"""Acceptance Test Suite - Fixtures and Harness for ASR Pipeline Service (§2).
+
+NO MOCKS.
+Spawns:
+- Real local JWKS HTTP server serving RS256 keys
+- Real Neon database throwaway tenant schemas with full migrations applied
+- Real Redis (127.0.0.1:6379)
+- Real Uvicorn server running MeetMind Gateway
+- Real MeetMind ASR Service subprocess (uv run python -m meetmind_asr)
+"""
+
+from __future__ import annotations
+
+import asyncio
+import contextlib
+import http.server
+import json
+import os
+import socket
+import subprocess
+import sys
+import threading
+import uuid
+from collections.abc import AsyncGenerator
+from dataclasses import dataclass, field
+from datetime import UTC, datetime
+from pathlib import Path
+from typing import Any
+
+import httpx
+import jwt as pyjwt
+import pytest
+import redis.asyncio as aioredis
+from cryptography.hazmat.primitives.asymmetric import rsa
+from dotenv import load_dotenv
+
+# Load repository .env
+load_dotenv(Path(__file__).resolve().parents[4] / ".env")
+
+from meetmind_schemas.events import encode_audio_frame  # noqa: E402
+from meetmind_security import db  # noqa: E402
+from meetmind_security.tenant import TenantConfig  # noqa: E402
+
+pytestmark = [pytest.mark.integration]
+
+SYNTHETIC_MARKER = b"MEETMIND_TEST_MARKER_AUDIO_32B_"  # exactly 32 bytes
+
+
+def get_free_port() -> int:
+    """Find an available TCP port on localhost."""
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+        s.bind(("127.0.0.1", 0))
+        return int(s.getsockname()[1])
+
+
+class LocalJWKSServer:
+    """Real HTTP server that serves JWKS on localhost for RS256 signature verification."""
+
+    def __init__(self, port: int) -> None:
+        self.port = port
+        self.issuer = f"http://127.0.0.1:{port}"
+        self.jwks_url = f"{self.issuer}/.well-known/jwks.json"
+
+        # Generate primary RS256 keypair
+        self.primary_kid = "test-kid-primary"
+        self.primary_private_key = rsa.generate_private_key(
+            public_exponent=65537,
+            key_size=2048,
+        )
+        self.keys_by_kid: dict[str, rsa.RSAPrivateKey] = {
+            self.primary_kid: self.primary_private_key
+        }
+
+        self._server: http.server.HTTPServer | None = None
+        self._thread: threading.Thread | None = None
+
+    def _get_jwks_payload(self) -> dict[str, Any]:
+        jwk_list = []
+        for kid, priv_key in self.keys_by_kid.items():
+            pub_key = priv_key.public_key()
+            pub_numbers = pub_key.public_numbers()
+
+            def _to_base64url(val: int) -> str:
+                byte_len = (val.bit_length() + 7) // 8
+                raw_bytes = val.to_bytes(byte_len, "big")
+                import base64
+
+                return base64.urlsafe_b64encode(raw_bytes).rstrip(b"=").decode("ascii")
+
+            jwk_list.append(
+                {
+                    "kty": "RSA",
+                    "use": "sig",
+                    "alg": "RS256",
+                    "kid": kid,
+                    "n": _to_base64url(pub_numbers.n),
+                    "e": _to_base64url(pub_numbers.e),
+                }
+            )
+        return {"keys": jwk_list}
+
+    def start(self) -> None:
+        server_instance = self
+
+        class JWKSHandler(http.server.BaseHTTPRequestHandler):
+            def do_GET(self) -> None:
+                if self.path == "/.well-known/jwks.json":
+                    payload = json.dumps(server_instance._get_jwks_payload()).encode("utf-8")
+                    self.send_response(200)
+                    self.send_header("Content-Type", "application/json")
+                    self.send_header("Content-Length", str(len(payload)))
+                    self.end_headers()
+                    self.wfile.write(payload)
+                else:
+                    self.send_response(404)
+                    self.end_headers()
+
+            def log_message(self, format: str, *args: Any) -> None:
+                pass
+
+        self._server = http.server.ThreadingHTTPServer(("127.0.0.1", self.port), JWKSHandler)
+        self._thread = threading.Thread(target=self._server.serve_forever, daemon=True)
+        self._thread.start()
+
+    def stop(self) -> None:
+        if self._server:
+            self._server.shutdown()
+            self._server.server_close()
+        if self._thread:
+            self._thread.join(timeout=2.0)
+
+    def mint_token(
+        self,
+        sub: str = "user_acceptance",
+        org_id: str = "org_acceptance_a",
+        org_role: str = "org:admin",
+        kid: str | None = None,
+        exp_offset: int = 3600,
+        nbf_offset: int = -10,
+        iss: str | None = None,
+        azp: str = "https://app.meetmind.ai",
+        extra_claims: dict[str, Any] | None = None,
+    ) -> str:
+        now = int(datetime.now(UTC).timestamp())
+        payload = {
+            "sub": sub,
+            "iss": iss or self.issuer,
+            "azp": azp,
+            "exp": now + exp_offset,
+            "nbf": now + nbf_offset,
+            "iat": now,
+            "o": {
+                "id": org_id,
+                "rol": org_role,
+                "slg": "acceptance-slug",
+            },
+        }
+        if extra_claims:
+            payload.update(extra_claims)
+
+        chosen_kid = kid or self.primary_kid
+        token_headers = {"kid": chosen_kid}
+        key_to_use = self.keys_by_kid.get(chosen_kid, self.primary_private_key)
+        return pyjwt.encode(payload, key_to_use, algorithm="RS256", headers=token_headers)
+
+
+async def _connect_db_with_retry(dsn: str, max_retries: int = 5) -> Any:
+    import asyncpg
+
+    ssl_ctx = db._create_ssl_context(dsn)
+    for attempt in range(1, max_retries + 1):
+        try:
+            return await asyncpg.connect(dsn, ssl=ssl_ctx, timeout=15.0)
+        except Exception:
+            if attempt == max_retries:
+                raise
+            await asyncio.sleep(1.0 * attempt)
+
+
+@dataclass
+class ServerHarness:
+    http_url: str
+    ws_url: str
+    port: int
+    jwks: LocalJWKSServer
+    tenant_a: str
+    tenant_b: str
+    org_a: str
+    org_b: str
+    schema_a: str
+    schema_b: str
+    startup_logs: list[str] = field(default_factory=list)
+
+
+@pytest.fixture(scope="module")
+def jwks_server() -> Any:
+    port = get_free_port()
+    server = LocalJWKSServer(port)
+    server.start()
+    yield server
+    server.stop()
+
+
+@pytest.fixture(scope="session", autouse=True)
+def enforce_linux_redis_without_persistence(request: pytest.FixtureRequest) -> None:
+    redis_url = os.environ.get("ACCEPTANCE_REDIS_URL", "redis://127.0.0.1:6379/0")
+    allow_native = os.environ.get("ACCEPTANCE_ALLOW_NATIVE", "false").lower() == "true"
+    import redis
+
+    r = redis.from_url(redis_url, decode_responses=True)
+    try:
+        info = r.info("server")
+    except Exception as exc:
+        pytest.fail(f"Acceptance suite cannot connect to Redis at {redis_url}: {exc}")
+
+    os_str = str(info.get("os", ""))
+    if not allow_native and "linux" not in os_str.lower():
+        pytest.fail(f"Acceptance suite refuses to run against non-Linux Redis ({os_str}).")
+
+    save_cfg = r.config_get("save")
+    save_val = save_cfg.get("save", "") if isinstance(save_cfg, dict) else ""
+    aof_cfg = r.config_get("appendonly")
+    aof_val = aof_cfg.get("appendonly", "") if isinstance(aof_cfg, dict) else ""
+
+    assert save_val == "", f"Redis persistence violation: 'save' is not empty ({save_val!r})"
+    assert aof_val == "no", f"Redis persistence violation: 'appendonly' is not 'no' ({aof_val!r})"
+
+
+@pytest.fixture
+async def real_redis() -> AsyncGenerator[aioredis.Redis, None]:
+    redis_url = os.environ.get("ACCEPTANCE_REDIS_URL", "redis://127.0.0.1:6379/0")
+    client = aioredis.from_url(redis_url, decode_responses=False)
+    await client.ping()
+    yield client
+    keys = await client.keys("mm:*")
+    if keys:
+        await client.delete(*keys)
+    await client.aclose()
+
+
+@pytest.fixture(scope="module")
+async def real_db_tenants() -> AsyncGenerator[tuple[TenantConfig, TenantConfig], None]:
+    from meetmind_security.migrations import apply_migrations_conn
+
+    dsn = db.get_owner_dsn()
+    id_a = f"test_a_{uuid.uuid4().hex[:6]}"
+    id_b = f"test_b_{uuid.uuid4().hex[:6]}"
+
+    cfg_a = TenantConfig(
+        tenant_id=id_a,
+        pg_schema=f"tenant_{id_a}",
+        neo4j_namespace=id_a,
+        qdrant_prefix=id_a,
+        redis_prefix=id_a,
+    )
+    cfg_b = TenantConfig(
+        tenant_id=id_b,
+        pg_schema=f"tenant_{id_b}",
+        neo4j_namespace=id_b,
+        qdrant_prefix=id_b,
+        redis_prefix=id_b,
+    )
+
+    db._router.register(cfg_a)
+    db._router.register(cfg_b)
+
+    admin_conn = await _connect_db_with_retry(dsn)
+    try:
+        await admin_conn.execute(f'CREATE SCHEMA IF NOT EXISTS "{cfg_a.pg_schema}"')
+        await admin_conn.execute(f'CREATE SCHEMA IF NOT EXISTS "{cfg_b.pg_schema}"')
+        await apply_migrations_conn(admin_conn, cfg_a.pg_schema)
+        await apply_migrations_conn(admin_conn, cfg_b.pg_schema)
+    finally:
+        await admin_conn.close()
+
+    yield (cfg_a, cfg_b)
+
+    teardown_conn = await _connect_db_with_retry(dsn)
+    try:
+        await teardown_conn.execute(f'DROP SCHEMA IF EXISTS "{cfg_a.pg_schema}" CASCADE')
+        await teardown_conn.execute(f'DROP SCHEMA IF EXISTS "{cfg_b.pg_schema}" CASCADE')
+    finally:
+        await teardown_conn.close()
+
+
+@pytest.fixture(scope="module")
+async def gateway_harness(
+    jwks_server: LocalJWKSServer,
+    real_db_tenants: tuple[TenantConfig, TenantConfig],
+) -> AsyncGenerator[ServerHarness, None]:
+    cfg_a, cfg_b = real_db_tenants
+    org_a = f"org_{cfg_a.tenant_id}"
+    org_b = f"org_{cfg_b.tenant_id}"
+
+    port = get_free_port()
+    repo_root = Path(__file__).resolve().parents[4]
+
+    app_dsn = (
+        os.environ.get("NEON_TEST_APP_DATABASE_URL")
+        or os.environ.get("NEON_APP_DATABASE_URL")
+        or db.get_app_dsn()
+    )
+    redis_url = os.environ.get("ACCEPTANCE_REDIS_URL", "redis://127.0.0.1:6379/0")
+
+    env = os.environ.copy()
+    env["CLERK_JWKS_URL"] = jwks_server.jwks_url
+    env["CLERK_ISSUER"] = jwks_server.issuer
+    env["ALLOWED_ORIGINS"] = json.dumps(["https://app.meetmind.ai"])
+    env["TENANT_ORG_MAP"] = json.dumps({org_a: cfg_a.tenant_id, org_b: cfg_b.tenant_id})
+    env["ELEVATED_LISTEN_ROLES"] = json.dumps(["org:admin"])
+    env["APP_ENV"] = "test"
+    env["NEON_DATABASE_URL"] = app_dsn
+    env["NEON_APP_DATABASE_URL"] = app_dsn
+    env["NEON_TEST_APP_DATABASE_URL"] = app_dsn
+    env.pop("NEON_TEST_DATABASE_URL", None)
+    env.pop("NEON_DIRECT_DATABASE_URL", None)
+    env["REDIS_URL"] = redis_url
+    env["AUDIO_REDIS_URL"] = redis_url
+    env["IDLE_TIMEOUT_SECONDS"] = "30.0"
+    env["ALLOW_TOKEN_IN_DEV"] = "false"
+    env["LOG_LEVEL"] = "INFO"
+    env["PYTHONPATH"] = (
+        str(repo_root / "backend" / "gateway")
+        + os.pathsep
+        + str(repo_root / "backend" / "security")
+        + os.pathsep
+        + str(repo_root / "packages" / "shared-schemas" / "schemas_py")
+    )
+
+    proc = subprocess.Popen(
+        [
+            sys.executable,
+            "-m",
+            "uvicorn",
+            "meetmind_gateway.app:create_app",
+            "--factory",
+            "--host",
+            "127.0.0.1",
+            "--port",
+            str(port),
+            "--log-level",
+            "info",
+        ],
+        env=env,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+    )
+
+    startup_logs: list[str] = []
+
+    def _drain(stream: Any) -> None:
+        try:
+            for line in iter(stream.readline, b""):
+                decoded = line.decode("utf-8", errors="replace").strip()
+                if decoded:
+                    startup_logs.append(decoded)
+        except Exception:
+            pass
+
+    threading.Thread(target=_drain, args=(proc.stdout,), daemon=True).start()
+    threading.Thread(target=_drain, args=(proc.stderr,), daemon=True).start()
+
+    healthy = False
+    for _ in range(150):
+        try:
+            async with httpx.AsyncClient() as client:
+                res = await client.get(f"http://127.0.0.1:{port}/health", timeout=1.0)
+                if res.status_code == 200:
+                    healthy = True
+                    break
+        except Exception:
+            pass
+        if proc.poll() is not None:
+            raise RuntimeError(f"Gateway exited early: {proc.returncode}")
+        await asyncio.sleep(0.1)
+
+    assert healthy, "Gateway subprocess failed to become healthy"
+
+    harness = ServerHarness(
+        http_url=f"http://127.0.0.1:{port}",
+        ws_url=f"ws://127.0.0.1:{port}",
+        port=port,
+        jwks=jwks_server,
+        tenant_a=cfg_a.tenant_id,
+        tenant_b=cfg_b.tenant_id,
+        org_a=org_a,
+        org_b=org_b,
+        schema_a=cfg_a.pg_schema,
+        schema_b=cfg_b.pg_schema,
+        startup_logs=startup_logs,
+    )
+
+    yield harness
+
+    proc.kill()
+    proc.wait()
+
+
+@dataclass
+class AsrProcessHandle:
+    """Handle to a running ASR service subprocess."""
+
+    proc: subprocess.Popen
+    health_port: int
+    health_url: str
+    logs: list[str]
+    worker_id: str
+
+    def kill(self) -> None:
+        """Forcefully kill ASR worker process."""
+        self.proc.kill()
+        self.proc.wait()
+
+    def stop(self) -> None:
+        """Gracefully stop ASR worker process."""
+        self.proc.terminate()
+        try:
+            self.proc.wait(timeout=5.0)
+        except subprocess.TimeoutExpired:
+            self.proc.kill()
+            self.proc.wait()
+
+
+@pytest.fixture
+def asr_worker_factory():
+    """Factory fixture to spawn real ASR worker subprocesses."""
+    spawned_processes: list[AsrProcessHandle] = []
+    repo_root = Path(__file__).resolve().parents[4]
+
+    async def _spawn(
+        provider: str = "stub",
+        worker_id: str | None = None,
+        extra_env: dict[str, str] | None = None,
+    ) -> AsrProcessHandle:
+        health_port = get_free_port()
+        wid = worker_id or f"w_{uuid.uuid4().hex[:6]}"
+        redis_url = os.environ.get("ACCEPTANCE_REDIS_URL", "redis://127.0.0.1:6379/0")
+
+        env = os.environ.copy()
+        env["ASR_PROVIDER"] = provider
+        env["ASR_HEALTH_PORT"] = str(health_port)
+        env["REDIS_URL"] = redis_url
+        env["APP_ENV"] = "development"
+        env["PYTHONPATH"] = (
+            str(repo_root / "backend" / "asr")
+            + os.pathsep
+            + str(repo_root / "backend" / "security")
+            + os.pathsep
+            + str(repo_root / "packages" / "shared-schemas" / "schemas_py")
+        )
+        if extra_env:
+            env.update(extra_env)
+
+        proc = subprocess.Popen(
+            [
+                sys.executable,
+                "-m",
+                "meetmind_asr",
+            ],
+            env=env,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+        )
+
+        logs: list[str] = []
+
+        def _drain(stream: Any) -> None:
+            try:
+                for line in iter(stream.readline, b""):
+                    dec = line.decode("utf-8", errors="replace").strip()
+                    if dec:
+                        logs.append(dec)
+            except Exception:
+                pass
+
+        threading.Thread(target=_drain, args=(proc.stdout,), daemon=True).start()
+        threading.Thread(target=_drain, args=(proc.stderr,), daemon=True).start()
+
+        # Wait for /healthz to be HTTP 200
+        health_url = f"http://127.0.0.1:{health_port}/healthz"
+        healthy = False
+        for _ in range(100):
+            try:
+                async with httpx.AsyncClient() as client:
+                    res = await client.get(health_url, timeout=1.0)
+                    if res.status_code == 200:
+                        healthy = True
+                        break
+            except Exception:
+                pass
+            if proc.poll() is not None:
+                raise RuntimeError(
+                    f"ASR worker exited early with code {proc.returncode}:\n" + "\n".join(logs)
+                )
+            await asyncio.sleep(0.1)
+
+        assert healthy, f"ASR worker on port {health_port} failed to become healthy within timeout"
+
+        handle = AsrProcessHandle(
+            proc=proc,
+            health_port=health_port,
+            health_url=health_url,
+            logs=logs,
+            worker_id=wid,
+        )
+        spawned_processes.append(handle)
+        return handle
+
+    yield _spawn
+
+    for h in spawned_processes:
+        with contextlib.suppress(Exception):
+            h.kill()
+
+
+def make_pcm16_chunk(
+    seq: int,
+    ts_ms: int,
+    channels: int = 1,
+    sample_rate: int = 16000,
+    duration_ms: int = 100,
+    marker: bytes = SYNTHETIC_MARKER,
+) -> bytes:
+    """Generate 100ms of synthetic PCM16 LE audio embedding 32-byte marker pattern."""
+    bytes_per_sample = 2 * channels
+    total_samples = int(sample_rate * (duration_ms / 1000.0))
+    total_bytes = total_samples * bytes_per_sample
+
+    # Fill payload with marker repeatedly or padded with zeros
+    base = bytearray(b"\x00" * total_bytes)
+    # Embed marker at offset 0
+    marker_len = min(len(marker), total_bytes)
+    base[:marker_len] = marker[:marker_len]
+
+    return encode_audio_frame(
+        client_seq=seq,
+        capture_ts_ms=ts_ms,
+        payload=bytes(base),
+        sample_rate=sample_rate,
+        channels=channels,
+        codec=1,
+    )
+
+
+async def create_meeting(
+    http_url: str,
+    token: str,
+    meeting_id: str | None = None,
+    local_user_name: str | None = None,
+    attendees: list[str] | None = None,
+) -> dict[str, Any]:
+    """Create meeting via POST /v1/meetings."""
+    payload: dict[str, Any] = {}
+    if meeting_id:
+        payload["meeting_id"] = meeting_id
+    if local_user_name:
+        payload["local_user_name"] = local_user_name
+    if attendees:
+        payload["attendees"] = attendees
+
+    async with httpx.AsyncClient() as client:
+        resp = await client.post(
+            f"{http_url}/v1/meetings",
+            headers={"Authorization": f"Bearer {token}"},
+            json=payload,
+        )
+        assert resp.status_code == 201, f"Create meeting failed: {resp.text}"
+        return resp.json()
+
+
+async def exchange_ws_ticket(
+    http_url: str,
+    token: str,
+    meeting_id: str,
+    role: str = "ingest",
+    client_instance_id: str | None = None,
+    auto_create_meeting: bool = True,
+) -> tuple[int, dict[str, Any]]:
+    """Exchange token for one-time WebSocket ticket via POST /v1/ws-ticket."""
+    if client_instance_id is None:
+        client_instance_id = str(uuid.uuid4())
+
+    async with httpx.AsyncClient() as client:
+        if (
+            auto_create_meeting
+            and not meeting_id.startswith("unknown_")
+            and not meeting_id.startswith("fake_")
+            and not meeting_id.startswith("non_existent")
+        ):
+            with contextlib.suppress(Exception):
+                await client.post(
+                    f"{http_url}/v1/meetings",
+                    headers={"Authorization": f"Bearer {token}"},
+                    json={"meeting_id": meeting_id},
+                )
+
+        resp = await client.post(
+            f"{http_url}/v1/ws-ticket",
+            headers={"Authorization": f"Bearer {token}"},
+            json={
+                "meeting_id": meeting_id,
+                "role": role,
+                "client_instance_id": client_instance_id,
+            },
+        )
+        try:
+            body = resp.json()
+        except Exception:
+            body = {"raw": resp.text}
+        return resp.status_code, body

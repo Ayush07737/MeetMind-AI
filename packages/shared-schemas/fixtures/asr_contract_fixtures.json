@@ -1,0 +1,60 @@
+{
+  "deterministic_utterance_id": {
+    "meeting_id": "mtg_wpa_001",
+    "channel": 0,
+    "speaker_id": "spk_0",
+    "start_ms": 1200,
+    "expected_utterance_id": "81e90e7e6711da564dc7dffa"
+  },
+  "transcript_final": {
+    "event_type": "transcript_final",
+    "meeting_id": "mtg_wpa_001",
+    "tenant_id": "tenant_wpa",
+    "ts_ms": 1712839200000,
+    "payload": {
+      "utterance_id": "81e90e7e6711da564dc7dffa",
+      "speaker_id": "spk_0",
+      "speaker_name": "Alice Smith",
+      "channel": 0,
+      "text": "Welcome everyone to the quarterly review.",
+      "start_ms": 1200,
+      "end_ms": 3400,
+      "start_epoch_ms": 1712839201200,
+      "confidence": 0.985,
+      "language": "en",
+      "provider": "deepgram",
+      "model": "nova-3"
+    }
+  },
+  "transcript_interim": {
+    "event_type": "transcript_interim",
+    "meeting_id": "mtg_wpa_001",
+    "tenant_id": "tenant_wpa",
+    "ts_ms": 1712839200000,
+    "payload": {
+      "speaker_id": "spk_0",
+      "speaker_name": "Alice Smith",
+      "channel": 0,
+      "text": "Welcome everyone to the quarterly",
+      "start_ms": 1200,
+      "end_ms": 2900,
+      "start_epoch_ms": 1712839201200,
+      "confidence": 0.92,
+      "language": "en",
+      "provider": "deepgram",
+      "model": "nova-3",
+      "is_stable": false
+    }
+  },
+  "transcript_service_degraded": {
+    "event_type": "transcript_service_degraded",
+    "meeting_id": "mtg_wpa_001",
+    "tenant_id": "tenant_wpa",
+    "ts_ms": 1712839200000,
+    "payload": {
+      "state": "degraded",
+      "reason": "provider_unreachable",
+      "since_ms": 1712839200000
+    }
+  }
+}

@@ -287,6 +287,10 @@ async def _handle_control_frame(
         await ctx.session_manager.update_status(
             ctx.meeting_id, MeetingStatus.ACTIVE, ctx.session.tenant_id
         )
+        with contextlib.suppress(Exception):
+            await ctx.stream_producer.publish_lifecycle(
+                "meeting_active", ctx.session.tenant_id, ctx.meeting_id
+            )
 
         # Cancel idle watchdog now that consent is active
         if ctx.idle_task and not ctx.idle_task.done():
@@ -313,6 +317,10 @@ async def _handle_control_frame(
         await ctx.session_manager.update_status(
             ctx.meeting_id, MeetingStatus.ENDED, ctx.session.tenant_id
         )
+        with contextlib.suppress(Exception):
+            await ctx.stream_producer.publish_lifecycle(
+                "meeting_ended", ctx.session.tenant_id, ctx.meeting_id
+            )
 
         with contextlib.suppress(Exception):
             await audit_meeting_end(
@@ -324,12 +332,14 @@ async def _handle_control_frame(
 
         # WP6: Grace EXPIRE of 5 min (300s) on stream keys so downstream can drain
         with contextlib.suppress(Exception):
-            from .keys import audio_stream_key, transcript_stream_key
+            from .keys import audio_stream_key, metrics_key, transcript_stream_key
 
             a_key = audio_stream_key(ctx.session.tenant_id, ctx.meeting_id)
             t_key = transcript_stream_key(ctx.session.tenant_id, ctx.meeting_id)
+            m_key = metrics_key(ctx.session.tenant_id, ctx.meeting_id)
             await ctx.redis_client.expire(a_key, 300)
             await ctx.redis_client.expire(t_key, 300)
+            await ctx.redis_client.expire(m_key, 300)
 
         ack = AckFrame(
             seq=0,
@@ -408,7 +418,7 @@ async def _handle_audio_chunk(
             tenant_id=ctx.session.tenant_id,
             user_id=ctx.session.user_id,
             adapter_type=ctx.session.adapter_type,
-            audio_data=payload,
+            audio_data=data,
             timestamp_ms=int(datetime.now(UTC).timestamp() * 1000),
             client_seq=client_seq,
             capture_ts_ms=capture_ts_ms,
@@ -509,7 +519,8 @@ async def _handle_json_frame(
             err = ErrorFrame(code=ErrorCode.INVALID_FRAME, message=f"Invalid control frame: {e}")
             await ctx.ws.send_text(err.model_dump_json())
         except Exception as e:
-            err = ErrorFrame(code=ErrorCode.INVALID_FRAME, message=f"Invalid control frame: {e}")
+            logger.exception("Internal error handling control frame: %s", e)
+            err = ErrorFrame(code=ErrorCode.INTERNAL_ERROR, message=f"Internal error: {e}")
             await ctx.ws.send_text(err.model_dump_json())
 
     elif frame_type == "transcript_chunk":
@@ -884,6 +895,8 @@ async def websocket_ingest(
     event_subscriber = EventSubscriber(redis_client, tenant_id=user.tenant_id)
     if consent_gate.is_open:
         await session_manager.update_status(meeting_id, MeetingStatus.ACTIVE, user.tenant_id)
+        with contextlib.suppress(Exception):
+            await stream_producer.publish_lifecycle("meeting_active", user.tenant_id, meeting_id)
         await event_subscriber.subscribe(
             meeting_id,
             lambda data: _forward_event(ws, data, meeting_id),
@@ -1034,7 +1047,8 @@ async def websocket_ingest(
         if ctx.gateway_latencies_ms:
             with contextlib.suppress(Exception):
                 mkey = f"mm:{user.tenant_id}:metrics:{meeting_id}"
-                await redis_client.set(mkey, json.dumps(ctx.gateway_latencies_ms), ex=600)
+                ex_ttl = 300 if ctx.session.status == MeetingStatus.ENDED else 600
+                await redis_client.set(mkey, json.dumps(ctx.gateway_latencies_ms), ex=ex_ttl)
 
         if remaining == 0 and ctx.session.status == MeetingStatus.ENDED:
             with contextlib.suppress(Exception):

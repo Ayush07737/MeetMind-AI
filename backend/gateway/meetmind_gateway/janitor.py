@@ -102,13 +102,24 @@ async def run_janitor_sweep(
                         exc,
                     )
 
+                # Lifecycle event (P0-2)
+                with contextlib.suppress(Exception):
+                    from .redis_streams import publish_lifecycle_event
+
+                    await publish_lifecycle_event(
+                        redis_client, "meeting_abandoned", tenant_id, meeting_id
+                    )
+
                 # Expire streams and keys
+                from .keys import metrics_key
+
                 for key_to_expire in (
                     audio_stream_key(tenant_id, meeting_id),
                     transcript_stream_key(tenant_id, meeting_id),
                     k_str,
                     writer_lease_key(tenant_id, meeting_id),
                     listeners_key(tenant_id, meeting_id),
+                    metrics_key(tenant_id, meeting_id),
                 ):
                     with contextlib.suppress(Exception):
                         await redis_client.expire(key_to_expire, expire_grace_seconds)

@@ -9,6 +9,7 @@ All Redis keys are strictly formatted via meetmind_gateway.keys.
 
 from __future__ import annotations
 
+import json
 import logging
 import uuid
 from datetime import UTC, datetime
@@ -80,30 +81,43 @@ class SessionManager:
         tenant_id: str,
         owner_id: str,
         meeting_id: str | None = None,
+        local_user_name: str | None = None,
+        attendees: list[str] | None = None,
     ) -> dict[str, Any]:
         """Create a server-issued meeting bound to tenant and owner (K6)."""
         mid = meeting_id or uuid.uuid4().hex
         skey = meeting_session_key(tenant_id, mid)
         now_iso = datetime.now(UTC).isoformat()
+        mapping: dict[str, Any] = {
+            "meeting_id": mid,
+            "tenant_id": tenant_id,
+            "owner_id": owner_id,
+            "user_id": owner_id,
+            "status": MeetingStatus.PENDING_CONSENT.value,
+            "created_at": now_iso,
+        }
+        if local_user_name is not None:
+            mapping["local_user_name"] = local_user_name
+        if attendees is not None:
+            mapping["attendees"] = json.dumps(attendees)
+
         await self._redis.hset(
             skey,
-            mapping={
-                "meeting_id": mid,
-                "tenant_id": tenant_id,
-                "owner_id": owner_id,
-                "user_id": owner_id,
-                "status": MeetingStatus.PENDING_CONSENT.value,
-                "created_at": now_iso,
-            },
+            mapping=mapping,
         )
         await self._redis.expire(skey, 86400)
-        return {
+        res: dict[str, Any] = {
             "meeting_id": mid,
             "tenant_id": tenant_id,
             "owner_id": owner_id,
             "status": MeetingStatus.PENDING_CONSENT.value,
             "created_at": now_iso,
         }
+        if local_user_name is not None:
+            res["local_user_name"] = local_user_name
+        if attendees is not None:
+            res["attendees"] = attendees
+        return res
 
     async def get_meeting(self, tenant_id: str, meeting_id: str) -> dict[str, str] | None:
         """Lookup an existing meeting within tenant scope (K6)."""

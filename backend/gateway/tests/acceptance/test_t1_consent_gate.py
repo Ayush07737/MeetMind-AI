@@ -15,7 +15,7 @@ import pytest
 import websockets
 from conftest import ServerHarness, exchange_ws_ticket
 from meetmind_gateway.keys import audio_stream_key
-from meetmind_schemas.events import encode_audio_frame
+from meetmind_schemas.events import decode_audio_frame, encode_audio_frame
 
 pytestmark = [pytest.mark.integration, pytest.mark.timeout(120)]
 
@@ -124,6 +124,21 @@ async def test_t1_consent_gate_enforcement(
             assert consent_row["consent_text_version"] == "v2.0"
             assert consent_row["client_version"] == "2.1.0"
 
+        # P0-2: Verify meeting_active event on mm:system:lifecycle
+        lc_entries = await real_redis.xrange("mm:system:lifecycle", min="-", max="+")
+        matching_lc = [
+            f
+            for _, f in lc_entries
+            if (f.get(b"meeting_id") or f.get("meeting_id")) in (meeting_id.encode(), meeting_id)
+        ]
+        assert len(matching_lc) >= 1, (
+            f"Expected meeting_active in lifecycle stream for {meeting_id}"
+        )
+        m_ev = matching_lc[0]
+        assert (m_ev.get(b"event") or m_ev.get("event")) in (b"meeting_active", "meeting_active")
+        assert (m_ev.get(b"tenant") or m_ev.get("tenant")) in (tenant_id.encode(), tenant_id)
+        assert (m_ev.get(b"ts_ms") or m_ev.get("ts_ms")) is not None
+
         # Step 4: Send audio chunk with 18-byte big-endian header and 3,200 bytes REAL PCM payload
         pcm_payload = b"\x00\x01" * 1600  # Exactly 3,200 bytes of PCM audio
         assert len(pcm_payload) == 3200
@@ -147,6 +162,8 @@ async def test_t1_consent_gate_enforcement(
         assert len(entries) == 1
         fields = entries[0][1]
         assert fields[b"client_seq"] == b"1" or fields.get("client_seq") == "1"
-        assert fields[b"audio_data"] == pcm_payload or fields.get("audio_data") == pcm_payload
+        assert fields[b"audio_data"] == framed_audio or fields.get("audio_data") == framed_audio
         stored_bytes = fields.get(b"audio_data") or fields.get("audio_data")
-        assert len(stored_bytes) == 3200
+        assert len(stored_bytes) == len(framed_audio)
+        _, dec_pcm = decode_audio_frame(stored_bytes)
+        assert dec_pcm == pcm_payload
