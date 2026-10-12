@@ -40,8 +40,13 @@ async def test_t9_non_persistence_and_ttl(
     gateway_harness: ServerHarness,
     real_redis,
 ) -> None:
-    # 1. Real Redis config check: save is empty and appendonly is no
-    settings = GatewaySettings(app_env="production", audio_redis_persistence_acknowledged=False)
+    settings = GatewaySettings(
+        app_env="production",
+        clerk_issuer="https://clerk.meetmind.ai",
+        clerk_jwks_url="https://clerk.meetmind.ai/.well-known/jwks.json",
+        allowed_origins=["https://app.meetmind.ai"],
+        audio_redis_persistence_acknowledged=False,
+    )
     # Must pass without error on the production/test Redis
     await assert_audio_redis_not_persistent(real_redis, settings)
 

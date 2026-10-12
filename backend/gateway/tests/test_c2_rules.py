@@ -47,6 +47,7 @@ class TestTLSRule:
             app_env="production",
             clerk_issuer="https://clerk.meetmind.ai",
             clerk_jwks_url="https://clerk.meetmind.ai/.well-known/jwks.json",
+            allowed_origins=["https://app.meetmind.ai"],
             audio_redis_persistence_acknowledged=True,
         )
         app = create_app(settings)
@@ -267,7 +268,13 @@ class TestRateLimitingThresholds:
 class TestWP6RetentionAndJanitor:
     @pytest.mark.asyncio
     async def test_persistence_check_refuses_to_start_if_persistence_enabled(self):
-        settings = GatewaySettings(app_env="production", audio_redis_persistence_acknowledged=False)
+        settings = GatewaySettings(
+            app_env="production",
+            clerk_issuer="https://clerk.meetmind.ai",
+            clerk_jwks_url="https://clerk.meetmind.ai/.well-known/jwks.json",
+            allowed_origins=["https://app.meetmind.ai"],
+            audio_redis_persistence_acknowledged=False,
+        )
 
         mock_redis = AsyncMock()
         # Mock Redis with save persistence enabled

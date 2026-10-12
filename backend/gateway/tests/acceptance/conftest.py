@@ -229,10 +229,17 @@ def jwks_server() -> Any:
 
 
 @pytest.fixture(scope="session", autouse=True)
-def enforce_linux_redis_without_persistence() -> None:
+def enforce_linux_redis_without_persistence(request: pytest.FixtureRequest) -> None:
     """Enforce that acceptance tests strictly target a Linux-hosted Redis (Docker Compose)
     with persistence disabled (save='', appendonly='no').
     """
+    has_acceptance_tests = any(
+        "tests/acceptance" in str(getattr(item, "fspath", "")).replace("\\", "/")
+        for item in request.session.items
+    )
+    if not has_acceptance_tests:
+        return
+
     redis_url = os.environ.get("ACCEPTANCE_REDIS_URL", "redis://127.0.0.1:6379/0")
     allow_native = os.environ.get("ACCEPTANCE_ALLOW_NATIVE", "false").lower() == "true"
     import redis

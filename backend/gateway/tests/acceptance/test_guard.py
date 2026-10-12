@@ -10,6 +10,11 @@ from __future__ import annotations
 import ast
 from pathlib import Path
 
+import pytest
+
+pytestmark = [pytest.mark.integration]
+
+
 FORBIDDEN_TOKENS = [
     "AsyncMock",
     "MagicMock",

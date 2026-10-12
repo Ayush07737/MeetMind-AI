@@ -52,3 +52,9 @@ Thumbs.db
 *.log
 *.tmp
 *.bak
+
+# ---------- Redis Artifacts ----------
+dump.rdb
+*.rdb
+*.aof
+appendonlydir/
