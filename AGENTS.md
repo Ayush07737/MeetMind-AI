@@ -81,6 +81,18 @@ Every service that will eventually need tenant isolation **must** route through 
 5. **Raw audio never persists to disk (WP6)** — ephemeral in-memory Redis Streams only, bounded
    stream length, 15m active TTL, 5m post-meeting grace TTL. Gateway refuses to start if Redis
    persistence is enabled.
+6. **Zero audio persistence in ASR (WP-E)** — `meetmind_asr` contains no file-write APIs, DB drivers,
+   or `tempfile`. Transcript text is never logged at INFO or above.
+
+## Automatic Speech Recognition (ASR) Standards (§2)
+
+- **Package**: `backend/asr/meetmind_asr` (run with `uv run python -m meetmind_asr`).
+- **Contract Isolation**: Never import from `meetmind_gateway`. All shared schemas live in `meetmind_schemas`.
+- **Provider Switching**: Swapping providers is controlled strictly by `ASR_PROVIDER` (`deepgram|stub`) and touches only `config.py` and `providers/`.
+- **Deepgram**: Nova-3 streaming WebSocket, `mip_opt_out=true` by default, repeated `keyterm` query parameters (max 100).
+- **v1 Codec**: Supports `codec=1` (PCM16 LE) only. `codec=2` (Opus) frames are acked and dropped with a single `transcript_service_degraded` event per meeting.
+- **Delivery & Dedupe**: At-least-once audio to provider (delayed ack replay window), effectively-once transcripts (deterministic `utterance_id` + time overlap window).
+- **Audit**: Writes `asr_session_started` and `asr_session_summary` to Neon via `meetmind_security` non-blocking queue. Raw audio and transcript text are NEVER included in audit payloads.
 
 ## Code Style
 

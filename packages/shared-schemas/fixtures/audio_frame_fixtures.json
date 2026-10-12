@@ -1,7 +1,7 @@
 {
   "valid": [
     {
-      "description": "Standard audio frame",
+      "description": "Standard legacy audio frame",
       "hex": "0100000000000000002a0000019270d72180524946465f46414b455f415544494f5f53414d504c455f3132333435363738",
       "header": {
         "version": 1,
@@ -19,6 +19,32 @@
         "flags": 3,
         "client_seq": 1001,
         "capture_ts_ms": 1728470005555
+      },
+      "payload_hex": "000102030405"
+    },
+    {
+      "description": "Canonical audio frame (MM magic, PCM16 mono 16kHz)",
+      "hex": "4d4d0000002a0000019270d721803e800101524946465f46414b455f415544494f5f53414d504c455f3132333435363738",
+      "header": {
+        "magic": "MM",
+        "client_seq": 42,
+        "capture_ts_ms": 1728470000000,
+        "sample_rate": 16000,
+        "channels": 1,
+        "codec": 1
+      },
+      "payload_hex": "524946465f46414b455f415544494f5f53414d504c455f3132333435363738"
+    },
+    {
+      "description": "Canonical audio frame (MM magic, Opus stereo 48kHz)",
+      "hex": "4d4d000003e90000019270d73733bb800202000102030405",
+      "header": {
+        "magic": "MM",
+        "client_seq": 1001,
+        "capture_ts_ms": 1728470005555,
+        "sample_rate": 48000,
+        "channels": 2,
+        "codec": 2
       },
       "payload_hex": "000102030405"
     }

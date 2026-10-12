@@ -239,9 +239,11 @@ def configure_tenant_router(
         default_tenant_id=default_tenant_id,
     )
     try:
-        from . import db
+        from . import audit_log, consent, db
 
         db._router = _global_router
+        audit_log._router = _global_router
+        consent._router = _global_router
     except ImportError:
         pass
     return _global_router

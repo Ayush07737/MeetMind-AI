@@ -8,3 +8,8 @@ service in MeetMind AI depends on:
 - **ConsentService**: Consent record management with audit trail
 - **DB**: Async PostgreSQL connection pool management
 """
+
+from . import audit_log, consent, db, migrations, tenant
+from . import audit_log as audit
+
+__all__ = ["audit", "audit_log", "consent", "db", "migrations", "tenant"]

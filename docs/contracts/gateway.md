@@ -19,10 +19,14 @@ Creates a server-issued unguessable meeting identifier bound to the caller's ten
 - **Request Body** (optional JSON):
   ```json
   {
-    "meeting_id": "optional_preselected_id_min_22_chars"
+    "meeting_id": "optional_preselected_id_min_22_chars",
+    "local_user_name": "Alice Smith",
+    "attendees": ["Bob Jones", "Charlie Brown"]
   }
   ```
-  If omitted or empty, the server generates a 32-character cryptographically random unguessable ID (`uuid4().hex`).
+  - `meeting_id`: Optional unguessable string. If omitted or empty, the server generates a 32-character cryptographically random unguessable ID (`uuid4().hex`).
+  - `local_user_name`: Optional string, at most 100 characters.
+  - `attendees`: Optional list of strings, at most 50 items, each at most 100 characters.
 - **Response** (`201 Created`):
   ```json
   {
@@ -30,7 +34,9 @@ Creates a server-issued unguessable meeting identifier bound to the caller's ten
     "tenant_id": "tenant_abc123",
     "owner_id": "user_2xYz9...",
     "status": "pending_consent",
-    "created_at": "2026-10-11T09:00:00Z"
+    "created_at": "2026-10-11T09:00:00Z",
+    "local_user_name": "Alice Smith",
+    "attendees": ["Bob Jones", "Charlie Brown"]
   }
   ```
 - **Error Codes**:
@@ -216,14 +222,159 @@ All outbound events MUST have a top-level `payload` dictionary. Internal events 
 
 All keys follow strictly normalized lower-case tenant names matching `^[a-z0-9_]{1,40}$`:
 
-| Key Pattern                        | Type   | Retention / Expiration                                            |
-| ---------------------------------- | ------ | ----------------------------------------------------------------- |
-| `mm:{tenant}:audio:{meeting}`      | Stream | `maxlen=20000`, 15m active write TTL, 5m post-meeting grace TTL   |
-| `mm:{tenant}:transcript:{meeting}` | Stream | `maxlen=20000`, 15m active write TTL, 5m post-meeting grace TTL   |
-| `mm:{tenant}:events:{meeting}`     | Stream | Internal event bus (never forwarded to clients)                   |
-| `mm:{tenant}:out:{meeting}`        | Stream | Outbound client events, 24h TTL                                   |
-| `mm:{tenant}:session:{meeting}`    | Hash   | Meeting state, owner, timestamps, 24h TTL                         |
-| `mm:{tenant}:writer:{meeting}`     | String | Single-writer lease (`user:instance`), 15s TTL refreshed every 5s |
-| `mm:{tenant}:listeners:{meeting}`  | Set    | Active listener connection IDs, 15s TTL                           |
-| `mm:{tenant}:ticket:{ticket}`      | String | One-time ticket hash, 30s atomic TTL                              |
-| `mm:system:janitor:lock`           | String | Distributed janitor sweep election lock, 30s TTL                  |
+| Key Pattern                        | Type   | Retention / Expiration                                                          |
+| ---------------------------------- | ------ | ------------------------------------------------------------------------------- |
+| `mm:{tenant}:audio:{meeting}`      | Stream | `AUDIO_STREAM_MAXLEN` (default 6000), 15m active TTL, 5m post-meeting grace TTL |
+| `mm:{tenant}:transcript:{meeting}` | Stream | `maxlen=6000`, 15m active write TTL, 5m post-meeting grace TTL                  |
+| `mm:{tenant}:events:{meeting}`     | Stream | Internal event bus (never forwarded to clients), 24h TTL                        |
+| `mm:{tenant}:out:{meeting}`        | Stream | Outbound client events, maxlen 5000, 24h TTL                                    |
+| `mm:system:lifecycle`              | Stream | System lifecycle stream, maxlen 10000 (approx)                                  |
+| `mm:{tenant}:session:{meeting}`    | Hash   | Meeting state, metadata, owner, timestamps, 24h TTL                             |
+| `mm:{tenant}:writer:{meeting}`     | String | Single-writer lease (`user:instance`), 15s TTL refreshed every 5s               |
+| `mm:{tenant}:asr_owner:{meeting}`  | String | §2 ASR worker ownership lease (`worker_id`), 15s TTL refreshed every 5s         |
+| `mm:{tenant}:listeners:{meeting}`  | Set    | Active listener connection IDs, 15s TTL                                         |
+| `mm:{tenant}:ticket:{ticket}`      | String | One-time ticket hash, 30s atomic TTL                                            |
+| `mm:system:janitor:lock`           | String | Distributed janitor sweep election lock, 30s TTL                                |
+
+---
+
+## 6. Stream Entry Exact Schemas & Wire Samples (P0-4)
+
+### 6.1 Audio Stream Entry (`mm:{tenant}:audio:{meeting}`)
+
+Published by gateway `StreamProducer.publish_audio`. Verified real Redis `XRANGE` sample (`COUNT 2`):
+
+```redis
+1) 1) "1791784425000-0"
+   2) 1) "seq"
+      2) "1"
+      3) "client_seq"
+      4) "1"
+      5) "tenant_id"
+      6) "tenant_sample"
+      7) "user_id"
+      8) "user_alice"
+      9) "adapter_type"
+      10) "chrome_extension"
+      11) "audio_data"
+      12) "\x4d\x4d\x00\x00\x00\x01\x00\x00\x01\x8e\xd9\x1e\x44\x00\x3e\x80\x01\x01..." (3218 bytes)
+      13) "timestamp_ms"
+      14) "1712839200050"
+      15) "capture_ts_ms"
+      16) "1712839200000"
+      17) "recv_ns"
+      18) "1000000000"
+      19) "published_ns"
+      20) "78718661555300"
+2) 1) "1791784425006-0"
+   2) 1) "seq"
+      2) "2"
+      3) "client_seq"
+      4) "2"
+      5) "tenant_id"
+      6) "tenant_sample"
+      7) "user_id"
+      8) "user_alice"
+      9) "adapter_type"
+      10) "chrome_extension"
+      11) "audio_data"
+      12) "\x4d\x4d\x00\x00\x00\x02\x00\x00\x01\x8e\xd9\x1e\x44\x64\x3e\x80\x01\x01..." (3218 bytes)
+      13) "timestamp_ms"
+      14) "1712839200150"
+      15) "capture_ts_ms"
+      16) "1712839200100"
+      17) "recv_ns"
+      18) "1000100000"
+      19) "published_ns"
+      20) "78718716030600"
+```
+
+Field types:
+
+- `seq` (string): Monotonically increasing gateway sequence number.
+- `client_seq` (string): Client-reported sequence number (1, 2, 3...).
+- `tenant_id` (string): Tenant identifier string.
+- `user_id` (string): Ingesting user ID string.
+- `adapter_type` (string): Capture adapter name (`chrome_extension`, `desktop_app`).
+- `audio_data` (bytes): 18-byte big-endian header (`MM`, u32 client_seq, u64 capture_ts_ms, u16 sample_rate, u8 channels, u8 codec) concatenated with raw audio payload.
+- `timestamp_ms` (string): Ingestion arrival Unix timestamp in ms.
+- `capture_ts_ms` (string): Origin capture Unix timestamp in ms.
+- `recv_ns` (string): Gateway arrival timestamp in monotonic nanoseconds (`time.perf_counter_ns()`).
+- `published_ns` (string): Redis publish completion in monotonic nanoseconds.
+- `gap_size` (string, optional): Included only if `client_seq > last_acked_client_seq + 1`.
+
+### 6.2 Lifecycle Stream Entry (`mm:system:lifecycle`)
+
+Appended by the gateway and janitor to announce meeting state transitions without key scanning.
+
+- **Fields**:
+  - `event` (string): `"meeting_active"` (on ingest connection reaching ACTIVE, including reconnects), `"meeting_ended"` (clean user end), `"meeting_abandoned"` (janitor inactive sweep).
+  - `tenant` (string): Tenant identifier.
+  - `meeting_id` (string): Meeting identifier.
+  - `ts_ms` (string): Event timestamp in Unix milliseconds.
+
+### 6.3 Outbound & Internal Event Bus Formats
+
+- **Internal Event Bus (`mm:{tenant}:events:{meeting}`)**:
+  - Entry fields: `payload`: JSON string serialization of the standardized event envelope.
+- **Client Outbound Stream (`mm:{tenant}:out:{meeting}`)**:
+  - Entry fields:
+    - `event_type`: string matching allow-listed outbound types.
+    - `payload`: JSON string serialization of the standardized event envelope.
+- **Standardized Event Envelope**:
+  ```json
+  {
+    "event_type": "transcript_interim",
+    "meeting_id": "mtg_123",
+    "tenant_id": "tenant_abc",
+    "ts_ms": 1712839200000,
+    "payload": {
+      "channel": 0,
+      "speaker_id": "spk_0",
+      "speaker_name": "Alice",
+      "text": "Hello world",
+      "start_ms": 0,
+      "end_ms": 1200,
+      "start_epoch_ms": 1712839200000,
+      "confidence": 0.98,
+      "language": "en",
+      "provider": "deepgram",
+      "model": "nova-3",
+      "is_stable": true
+    }
+  }
+  ```
+
+---
+
+## 7. Consumer-Group Contract for §2 (ASR Service)
+
+- **Consumer Group Name**: `asr`
+- **Meeting Discovery**:
+  - Workers listen to `mm:system:lifecycle` via `XREADGROUP GROUP asr <worker_id> BLOCK 2000 STREAMS mm:system:lifecycle >`.
+  - Competing consumers pattern across ASR workers.
+  - Capacity check: A worker claims a meeting only if active meetings < `ASR_MAX_MEETINGS_PER_WORKER`.
+  - Idempotency: Duplicate `meeting_active` events (e.g. from reconnects) are acknowledged without starting duplicate pipelines.
+  - Pending recovery: `XAUTOCLAIM mm:system:lifecycle asr <worker_id> 10000 0-0 COUNT 10` claims entries idle > 10s from crashed workers.
+- **Meeting Ownership Lease**:
+  - Key: `mm:{tenant}:asr_owner:{meeting}`
+  - Value: `<worker_id>`
+  - TTL: 15 seconds, refreshed every 5 seconds via Lua compare-and-set.
+  - Ownership invariant: Only the lease holder reads that meeting's audio stream. If lease renewal fails, the worker immediately aborts transcription and stops reading without acking unfinalized audio.
+- **Audio Stream Reader**:
+  - Group: `asr` on `mm:{tenant}:audio:{meeting}`.
+  - `XREADGROUP GROUP asr <worker_id> BLOCK 500 COUNT 50 STREAMS mm:{tenant}:audio:{meeting} >`.
+  - Idle reclaim: `XAUTOCLAIM mm:{tenant}:audio:{meeting} asr <worker_id> 5000 0-0 COUNT 50` reclaims entries idle > 5 seconds.
+- **Delayed Acknowledgment Policy**:
+  - Entries are `XACK`ed with a delay equal to `ASR_REPLAY_WINDOW_MS` (default 5000ms).
+  - An entry is acknowledged only AFTER:
+    1. It has been successfully forwarded to the ASR provider, AND
+    2. It is older than the replay window.
+  - If a worker crashes, the replacement worker claims pending unacked entries and replays at most 5 seconds of audio.
+- **Shutdown & Drain**:
+  - Upon receiving `meeting_ended` or `meeting_abandoned`:
+    1. Drain remaining audio chunks from the Redis audio stream.
+    2. Flush and close the provider session (`finish()`).
+    3. Publish remaining finals to `mm:{tenant}:events:{meeting}` (up to 5s timeout).
+    4. Acknowledge all audio entries.
+    5. Delete the ownership lease key.

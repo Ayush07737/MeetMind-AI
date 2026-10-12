@@ -21,6 +21,7 @@ from typing import Any
 
 import redis.asyncio as aioredis
 from fastapi import FastAPI, HTTPException, Request, WebSocket, status
+from fastapi.responses import JSONResponse
 
 from .auth import (
     AuthForbiddenError,
@@ -43,11 +44,20 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
     """Manage application lifecycle: start/stop Redis connections."""
     settings: GatewaySettings = app.state.settings
 
+    from redis.asyncio.retry import Retry
+    from redis.backoff import ExponentialBackoff
+    from redis.exceptions import ConnectionError as RedisConnectionError
+    from redis.exceptions import TimeoutError as RedisTimeoutError
+
+    retry_policy = Retry(ExponentialBackoff(cap=0.5, base=0.05), retries=3)
+
     # -- Start Redis connection ------------------------------------------------
     redis_client = aioredis.from_url(
         settings.redis_url,
         decode_responses=True,
         max_connections=50,
+        retry=retry_policy,
+        retry_on_error=[RedisConnectionError, RedisTimeoutError],
     )
     # Separate client for binary data (audio chunks have bytes) — WP6: audio_redis_url
     audio_redis_url = settings.audio_redis_url or settings.redis_url
@@ -55,6 +65,8 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
         audio_redis_url,
         decode_responses=False,
         max_connections=50,
+        retry=retry_policy,
+        retry_on_error=[RedisConnectionError, RedisTimeoutError],
     )
 
     # WP6: Startup non-persistence check
@@ -182,6 +194,8 @@ def create_app(settings: GatewaySettings | None = None) -> FastAPI:
                 detail="Missing or invalid Authorization header",
             )
         token = auth_header[7:].strip()
+        t_req_start = time.perf_counter()
+        t0 = time.perf_counter()
         try:
             user = await app.state.authenticator.authenticate(token)
         except AuthForbiddenError as exc:
@@ -194,19 +208,84 @@ def create_app(settings: GatewaySettings | None = None) -> FastAPI:
                 status_code=status.HTTP_401_UNAUTHORIZED,
                 detail=str(exc.message),
             ) from exc
+        t_jwt = (time.perf_counter() - t0) * 1000
+
+        t0 = time.perf_counter()
+        tenant_id = user.tenant_id
+        t_tenant = (time.perf_counter() - t0) * 1000
 
         body: dict[str, Any] = {}
         with contextlib.suppress(Exception):
-            body = await request.json()
+            parsed = await request.json()
+            if isinstance(parsed, dict):
+                body = parsed
+            elif parsed is not None:
+                raise HTTPException(
+                    status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+                    detail="Request body must be a JSON object",
+                )
 
         raw_mid = str(body.get("meeting_id") or "").strip()
         meeting_id = raw_mid or uuid.uuid4().hex  # 32 characters (>= 22)
+
+        local_user_name = body.get("local_user_name")
+        if local_user_name is not None:
+            if not isinstance(local_user_name, str):
+                raise HTTPException(
+                    status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+                    detail="local_user_name must be a string",
+                )
+            if len(local_user_name) > 100:
+                raise HTTPException(
+                    status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+                    detail="local_user_name must be at most 100 characters",
+                )
+
+        attendees = body.get("attendees")
+        if attendees is not None:
+            if not isinstance(attendees, list):
+                raise HTTPException(
+                    status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+                    detail="attendees must be a list of strings",
+                )
+            if len(attendees) > 50:
+                raise HTTPException(
+                    status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+                    detail="attendees must contain at most 50 items",
+                )
+            for att in attendees:
+                if not isinstance(att, str):
+                    raise HTTPException(
+                        status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+                        detail="All attendees items must be strings",
+                    )
+                if len(att) > 100:
+                    raise HTTPException(
+                        status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+                        detail="Attendee item must be at most 100 characters",
+                    )
+
+        t0 = time.perf_counter()
         record = await app.state.session_manager.create_meeting(
-            tenant_id=user.tenant_id,
+            tenant_id=tenant_id,
             owner_id=user.user_id,
             meeting_id=meeting_id,
+            local_user_name=local_user_name,
+            attendees=attendees,
         )
-        return record
+        t_redis = (time.perf_counter() - t0) * 1000
+        t_total = (time.perf_counter() - t_req_start) * 1000
+
+        return JSONResponse(
+            content=record,
+            status_code=status.HTTP_201_CREATED,
+            headers={
+                "Server-Timing": (
+                    f"jwt;dur={t_jwt:.2f}, tenant;dur={t_tenant:.2f}, "
+                    f"redis;dur={t_redis:.2f}, total;dur={t_total:.2f}"
+                )
+            },
+        )
 
     # ── One-Time WebSocket Ticket Exchange (WP4, K6, K7) ──────────────────
     @app.post("/v1/ws-ticket")

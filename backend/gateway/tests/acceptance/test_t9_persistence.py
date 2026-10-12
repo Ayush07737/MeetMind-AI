@@ -20,6 +20,7 @@ import uuid
 from pathlib import Path
 
 import pytest
+import redis.asyncio as aioredis
 import websockets
 from conftest import ServerHarness, exchange_ws_ticket, get_free_port
 from meetmind_gateway.config import GatewaySettings
@@ -55,59 +56,39 @@ async def test_t9_non_persistence_and_ttl(
     assert cfg_save.get("save") == "" or cfg_save.get(b"save") == b""
     assert cfg_aof.get("appendonly") == "no" or cfg_aof.get(b"appendonly") == b"no"
 
-    # 2. Startup check refuses to start against Redis with persistence enabled
-    redis_dir = (
-        Path(os.environ.get("USERPROFILE", ""))
-        / ".gemini"
-        / "antigravity-ide"
-        / "brain"
-        / "980c3b9c-2a1d-4000-9616-bbc9da2aa8f8"
-        / "scratch"
-        / "redis"
-        / "Redis-8.10.2-Windows-x64-msys2"
-    )
-    redis_bin = redis_dir / "redis-server.exe"
+    # 2. Startup check refuses to start against Redis with persistence enabled (P0-5)
     port_persistent = get_free_port()
-    container_id: str | None = None
+    run_res = subprocess.run(
+        [
+            "docker",
+            "run",
+            "-d",
+            "--rm",
+            "-p",
+            f"{port_persistent}:6379",
+            "redis:7-alpine",
+            "redis-server",
+            "--save",
+            "900 1",
+            "--appendonly",
+            "yes",
+        ],
+        capture_output=True,
+        text=True,
+        check=True,
+    )
+    container_id = run_res.stdout.strip()
     proc_redis_persist = None
 
-    if redis_bin.exists():
-        proc_redis_persist = subprocess.Popen(
-            [
-                str(redis_bin),
-                "--port",
-                str(port_persistent),
-                "--save",
-                "900 1",
-                "--appendonly",
-                "yes",
-            ],
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-        )
-    else:
-        run_res = subprocess.run(
-            [
-                "docker",
-                "run",
-                "-d",
-                "--rm",
-                "-p",
-                f"{port_persistent}:6379",
-                "redis:7-alpine",
-                "redis-server",
-                "--save",
-                "900 1",
-                "--appendonly",
-                "yes",
-            ],
-            capture_output=True,
-            text=True,
-            check=True,
-        )
-        container_id = run_res.stdout.strip()
-
-    await asyncio.sleep(1.0)
+    # Wait for persistent Redis container to be ready
+    r_check = aioredis.from_url(f"redis://127.0.0.1:{port_persistent}/0")
+    for _ in range(30):
+        try:
+            await r_check.ping()
+            break
+        except Exception:
+            await asyncio.sleep(0.2)
+    await r_check.aclose()
     try:
         repo_root = Path(__file__).resolve().parents[4]
         port_gw = get_free_port()
@@ -209,8 +190,17 @@ async def test_t9_non_persistence_and_ttl(
         ack_end = json.loads(await ws.recv())
         assert ack_end["type"] == "ack"
 
+    from meetmind_gateway.keys import metrics_key
+
     a_key = audio_stream_key(tenant_id, meeting_id)
     t_key = transcript_stream_key(tenant_id, meeting_id)
+    m_key = metrics_key(tenant_id, meeting_id)
+
+    # Allow server-side connection teardown to finish writing session/metrics
+    for _ in range(10):
+        if await real_redis.exists(m_key):
+            break
+        await asyncio.sleep(0.1)
     ttl_audio = await real_redis.ttl(a_key)
     # Stream key has 300s (5 min) grace expire set
     assert 0 < ttl_audio <= 300
@@ -218,6 +208,7 @@ async def test_t9_non_persistence_and_ttl(
     # Simulate expiration by setting short 1s expire and waiting
     await real_redis.expire(a_key, 1)
     await real_redis.expire(t_key, 1)
+    await real_redis.expire(m_key, 1)
     await real_redis.expire(meeting_session_key(tenant_id, meeting_id), 1)
     await real_redis.expire(listeners_key(tenant_id, meeting_id), 1)
 
@@ -225,4 +216,21 @@ async def test_t9_non_persistence_and_ttl(
     remaining_keys = await real_redis.keys(f"mm:{tenant_id}:*:{meeting_id}")
     assert len(remaining_keys) == 0, (
         f"Expected no keys remaining after expiration, found: {remaining_keys}"
+    )
+
+    # P0-2: Verify meeting_ended event in lifecycle stream
+    lc_entries = await real_redis.xrange("mm:system:lifecycle", min="-", max="+")
+    m_events = [
+        f
+        for _, f in lc_entries
+        if (f.get(b"meeting_id") or f.get("meeting_id")) in (meeting_id.encode(), meeting_id)
+    ]
+    event_names = [
+        (f.get(b"event") or f.get("event")).decode("utf-8")
+        if isinstance(f.get(b"event") or f.get("event"), bytes)
+        else (f.get(b"event") or f.get("event"))
+        for f in m_events
+    ]
+    assert "meeting_ended" in event_names, (
+        f"Expected meeting_ended in lifecycle stream, got: {event_names}"
     )

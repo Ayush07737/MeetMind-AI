@@ -6,6 +6,7 @@ type changes MUST be applied to both files simultaneously.
 
 from __future__ import annotations
 
+import hashlib
 import struct
 import uuid
 from dataclasses import dataclass
@@ -293,31 +294,73 @@ class ErrorFrame(BaseModel):
     message: str
 
 
-# -- Binary Audio Frame Codec (WP5) -------------------------------------------
+# -- Binary Audio Frame Codec (WP5 & §2.3 Canonical) -------------------------
 
-BINARY_HEADER_FORMAT = ">BBQQ"
-BINARY_HEADER_SIZE = struct.calcsize(BINARY_HEADER_FORMAT)  # 18 bytes
+CANONICAL_BINARY_HEADER_FORMAT = (
+    ">2sIQHBB"  # magic(2), client_seq(4), capture_ts_ms(8), sample_rate(2), channels(1), codec(1)
+)
+LEGACY_BINARY_HEADER_FORMAT = ">BBQQ"  # version(1), flags(1), client_seq(8), capture_ts_ms(8)
+BINARY_HEADER_FORMAT = CANONICAL_BINARY_HEADER_FORMAT
+BINARY_HEADER_SIZE = 18
 
 
 @dataclass(frozen=True)
 class AudioHeader:
-    """Header prepended to all binary audio chunks."""
+    """Header prepended to all binary audio chunks (18 bytes)."""
 
-    version: int
-    flags: int
     client_seq: int
     capture_ts_ms: int
+    sample_rate: int = 16000
+    channels: int = 1
+    codec: int = 1
+    magic: bytes = b"MM"
+    # Backwards-compatibility fields for legacy WP5 fixtures/callers
+    version: int = 1
+    flags: int = 0
 
 
 def encode_audio_frame(
     client_seq: int,
     capture_ts_ms: int,
     payload: bytes,
-    flags: int = 0,
-    version: int = 1,
+    *,
+    sample_rate: int = 16000,
+    channels: int = 1,
+    codec: int = 1,
+    flags: int | None = None,
+    version: int | None = None,
+    magic: bytes = b"MM",
 ) -> bytes:
-    """Encode an 18-byte big-endian header followed by binary audio payload."""
-    header = struct.pack(BINARY_HEADER_FORMAT, version, flags, client_seq, capture_ts_ms)
+    """Encode an 18-byte big-endian header followed by binary audio payload.
+
+    Canonical format (>2sIQHBB):
+        magic: 0x4D4D ('MM') (2 bytes)
+        client_seq: uint32 (4 bytes)
+        capture_ts_ms: uint64 (8 bytes)
+        sample_rate: uint16 (2 bytes, default 16000)
+        channels: uint8 (1 byte, default 1)
+        codec: uint8 (1 byte, 1 = PCM16 LE, 2 = Opus)
+    Legacy WP5 format (>BBQQ):
+        version: uint8 (1 byte)
+        flags: uint8 (1 byte)
+        client_seq: uint64 (8 bytes)
+        capture_ts_ms: uint64 (8 bytes)
+    """
+    if flags is not None or (version is not None and version != 1) or magic != b"MM":
+        v = version if version is not None else 1
+        fl = flags if flags is not None else 0
+        header = struct.pack(LEGACY_BINARY_HEADER_FORMAT, v, fl, client_seq, capture_ts_ms)
+        return header + payload
+
+    header = struct.pack(
+        CANONICAL_BINARY_HEADER_FORMAT,
+        magic,
+        client_seq,
+        capture_ts_ms,
+        sample_rate,
+        channels,
+        codec,
+    )
     return header + payload
 
 
@@ -327,9 +370,127 @@ def decode_audio_frame(data: bytes) -> tuple[AudioHeader, bytes]:
         raise ValueError(
             f"Binary audio frame too short: {len(data)} bytes, expected {BINARY_HEADER_SIZE}"
         )
-    version, flags, client_seq, capture_ts_ms = struct.unpack(
-        BINARY_HEADER_FORMAT, data[:BINARY_HEADER_SIZE]
+    if data[:2] == b"MM":
+        magic, client_seq, capture_ts_ms, sample_rate, channels, codec = struct.unpack(
+            CANONICAL_BINARY_HEADER_FORMAT, data[:BINARY_HEADER_SIZE]
+        )
+        return (
+            AudioHeader(
+                client_seq=client_seq,
+                capture_ts_ms=capture_ts_ms,
+                sample_rate=sample_rate,
+                channels=channels,
+                codec=codec,
+                magic=magic,
+                version=1,
+                flags=0,
+            ),
+            data[BINARY_HEADER_SIZE:],
+        )
+    if data[0] == 1:
+        version, flags, client_seq, capture_ts_ms = struct.unpack(
+            LEGACY_BINARY_HEADER_FORMAT, data[:BINARY_HEADER_SIZE]
+        )
+        return (
+            AudioHeader(
+                client_seq=client_seq,
+                capture_ts_ms=capture_ts_ms,
+                sample_rate=16000,
+                channels=1,
+                codec=1,
+                magic=b"",
+                version=version,
+                flags=flags,
+            ),
+            data[BINARY_HEADER_SIZE:],
+        )
+    raise ValueError(
+        f"Unsupported audio frame format: magic {data[:2]!r}, first byte 0x{data[0]:02x}"
     )
-    if version != 1:
-        raise ValueError(f"Unsupported audio frame version: {version}, expected 1")
-    return AudioHeader(version, flags, client_seq, capture_ts_ms), data[BINARY_HEADER_SIZE:]
+
+
+# ── Event Envelope & Payloads (WP-A) ─────────────────────────────────────────
+
+DegradedState = Literal["degraded", "recovered"]
+DegradedReason = Literal[
+    "provider_unreachable",
+    "provider_error",
+    "unsupported_codec",
+    "buffer_overflow",
+    "audio_gap",
+]
+
+
+class TranscriptFinalPayload(BaseModel):
+    """Payload for transcript_final event (internal bus only)."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    utterance_id: str = Field(..., min_length=24, max_length=24)
+    speaker_id: str
+    speaker_name: str | None = None
+    channel: int | None = None
+    text: str
+    start_ms: int
+    end_ms: int
+    start_epoch_ms: int
+    confidence: float
+    language: str
+    provider: str
+    model: str
+
+
+class TranscriptInterimPayload(BaseModel):
+    """Payload for transcript_interim event (out stream only)."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    speaker_id: str
+    speaker_name: str | None = None
+    channel: int | None = None
+    text: str
+    start_ms: int
+    end_ms: int
+    start_epoch_ms: int
+    confidence: float
+    language: str
+    provider: str
+    model: str
+    is_stable: bool = False
+
+
+class TranscriptServiceDegradedPayload(BaseModel):
+    """Payload for transcript_service_degraded event (both streams)."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    state: DegradedState
+    reason: DegradedReason
+    since_ms: int
+
+
+class EventEnvelope(BaseModel):
+    """Standardized event envelope across internal events and client out streams."""
+
+    model_config = ConfigDict(extra="allow")
+
+    event_type: str
+    meeting_id: str
+    tenant_id: str
+    ts_ms: int
+    payload: dict[str, Any]
+
+
+def compute_utterance_id(
+    meeting_id: str,
+    channel: int | None,
+    speaker_id: str,
+    start_ms: int,
+) -> str:
+    """Deterministic utterance_id:
+    First 24 hex chars of sha256 of meeting|channel|speaker|start_ms.
+    """
+    ch_str = str(channel) if channel is not None else "0"
+    spk_str = str(speaker_id) if speaker_id else "spk_0"
+    key = f"{meeting_id}|{ch_str}|{spk_str}|{start_ms}"
+    return hashlib.sha256(key.encode("utf-8")).hexdigest()[:24]

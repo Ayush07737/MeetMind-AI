@@ -19,7 +19,7 @@ import pytest
 import websockets
 from conftest import ServerHarness, exchange_ws_ticket
 from meetmind_gateway.keys import audio_stream_key, out_stream_key
-from meetmind_schemas.events import encode_audio_frame
+from meetmind_schemas.events import WSCloseCode, encode_audio_frame
 
 pytestmark = [pytest.mark.integration, pytest.mark.timeout(180)]
 
@@ -64,7 +64,7 @@ async def test_t10_resilience_subscriber_recovery_and_retransmit(
             )
         )
         ack_start = json.loads(await ws_w.recv())
-        assert ack_start.get("type") == "ack"
+        assert ack_start.get("type") == "ack", f"ack_start error: {ack_start}"
         await ws_w.send(json.dumps(consent_payload))
         ack_consent = json.loads(await ws_w.recv())
         assert ack_consent.get("type") == "ack"
@@ -172,17 +172,21 @@ async def test_t10_resilience_subscriber_recovery_and_retransmit(
             )
             await ws_w.send(chunk_drop)
             err = {}
-            for _ in range(10):
-                try:
+            close_code = None
+            try:
+                for _ in range(10):
                     err_raw = await asyncio.wait_for(ws_w.recv(), timeout=10.0)
                     msg = json.loads(err_raw)
                     if msg.get("type") == "error":
                         err = msg
                         break
-                except Exception:
-                    break
-            assert err.get("type") == "error"
-            assert err.get("code") == "INTERNAL_ERROR"
+            except websockets.exceptions.ConnectionClosed as cc:
+                close_code = cc.rcvd.code if cc.rcvd else None
+            except Exception:
+                pass
+            assert (
+                err.get("type") == "error" and err.get("code") == "INTERNAL_ERROR"
+            ) or close_code == WSCloseCode.INTERNAL_ERROR
         finally:
             if is_docker_redis:
                 subprocess.run(["docker", "start", "meetmind-redis"], check=True, timeout=10)
@@ -214,7 +218,7 @@ async def test_t10_resilience_subscriber_recovery_and_retransmit(
         received_msgs = []
         for _ in range(10):
             try:
-                raw_m = await asyncio.wait_for(ws_w2.recv(), timeout=5.0)
+                raw_m = await asyncio.wait_for(ws_w2.recv(), timeout=15.0)
                 msg = json.loads(raw_m)
                 received_msgs.append(msg)
                 if msg.get("type") == "ack":

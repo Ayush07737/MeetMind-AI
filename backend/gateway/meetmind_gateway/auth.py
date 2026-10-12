@@ -15,12 +15,15 @@ Security invariants:
 
 from __future__ import annotations
 
+import asyncio
 import logging
+import time
 from dataclasses import dataclass
 from typing import Any
 
+import httpx
 import jwt as pyjwt
-from jwt import PyJWKClient
+from jwt import PyJWK, PyJWKClient
 from meetmind_schemas.events import WSCloseCode
 
 logger = logging.getLogger(__name__)
@@ -81,9 +84,73 @@ class ClerkAuthenticator:
         self.app_env = app_env
         self.clerk_secret_key = clerk_secret_key
         self._jwks_client: PyJWKClient | None = None
+        self._keys_cache: dict[str, PyJWK] = {}
+        self._fetch_lock: asyncio.Lock | None = None
+        self._last_fetch_time: float = 0.0
+
+    def _get_fetch_lock(self) -> asyncio.Lock:
+        if self._fetch_lock is None:
+            self._fetch_lock = asyncio.Lock()
+        return self._fetch_lock
+
+    async def _fetch_jwks_keys(self) -> None:
+        """Fetch JWKS asynchronously without blocking the event loop."""
+        headers: dict[str, str] = {}
+        if self.clerk_secret_key and not self.jwks_url.endswith("/.well-known/jwks.json"):
+            headers["Authorization"] = f"Bearer {self.clerk_secret_key}"
+
+        try:
+            async with httpx.AsyncClient(timeout=5.0) as client:
+                resp = await client.get(self.jwks_url, headers=headers)
+                resp.raise_for_status()
+                data = resp.json()
+        except Exception as exc:
+            logger.warning("Failed to fetch JWKS from %s: %s", self.jwks_url, exc)
+            raise pyjwt.PyJWKClientError(f"Failed to fetch JWKS: {exc}") from exc
+
+        keys_data = data.get("keys", [])
+        for k in keys_data:
+            try:
+                jwk = PyJWK.from_dict(k)
+                if jwk.key_id:
+                    self._keys_cache[jwk.key_id] = jwk
+                if "_default" not in self._keys_cache:
+                    self._keys_cache["_default"] = jwk
+            except Exception as e:
+                logger.warning("Failed to parse JWK: %s", e)
+        self._last_fetch_time = time.time()
+
+    async def get_signing_key_for_token(self, token: str) -> Any:
+        """Retrieve signing key for token from cache or single-flight JWKS fetch."""
+        try:
+            unverified_header = pyjwt.get_unverified_header(token)
+        except Exception as exc:
+            raise pyjwt.InvalidTokenError(f"Unable to decode token header: {exc}") from exc
+
+        kid = unverified_header.get("kid")
+        if kid and kid in self._keys_cache:
+            return self._keys_cache[kid].key
+
+        lock = self._get_fetch_lock()
+        async with lock:
+            if kid and kid in self._keys_cache:
+                return self._keys_cache[kid].key
+
+            # Non-blocking async fetch
+            await self._fetch_jwks_keys()
+
+            if kid and kid in self._keys_cache:
+                return self._keys_cache[kid].key
+            elif not kid and self._keys_cache:
+                default_jwk = self._keys_cache.get("_default") or next(
+                    iter(self._keys_cache.values())
+                )
+                return default_jwk.key
+            else:
+                raise pyjwt.PyJWKClientError(f"Signing key with kid '{kid}' not found in JWKS")
 
     def _get_jwks_client(self) -> PyJWKClient:
-        """Lazily create and cache the PyJWKClient (handles caching & rotation)."""
+        """Lazily create and cache the PyJWKClient (legacy fallback)."""
         if self._jwks_client is None:
             headers: dict[str, str] = {}
             if self.clerk_secret_key and not self.jwks_url.endswith("/.well-known/jwks.json"):
@@ -188,18 +255,12 @@ class ClerkAuthenticator:
             raise AuthUnauthorizedError("No authentication token provided")
 
         try:
-            jwks_client = self._get_jwks_client()
-            try:
-                signing_key = jwks_client.get_signing_key_from_jwt(token)
-            except pyjwt.PyJWKClientError:
-                # Key rotation: refresh JWKS and retry lookup
-                jwks_client.get_jwk_set(refresh=True)
-                signing_key = jwks_client.get_signing_key_from_jwt(token)
+            signing_key = await self.get_signing_key_for_token(token)
 
             # Strictly enforce RS256 - no HS256 or 'none'
             claims = pyjwt.decode(
                 token,
-                signing_key.key,
+                signing_key,
                 algorithms=["RS256"],
                 leeway=5,
                 options={
