@@ -61,3 +61,4 @@ appendonlydir/
 
 # ---------- Scratch / Temporary ----------
 scratch/
+logs/

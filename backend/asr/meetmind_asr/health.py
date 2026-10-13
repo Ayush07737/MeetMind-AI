@@ -10,7 +10,6 @@ import asyncio
 import contextlib
 import json
 import logging
-import sys
 from dataclasses import dataclass, field
 from typing import Any
 
@@ -60,15 +59,17 @@ class HealthServer:
         port: int,
         metrics: AsrMetrics,
         redis_client: Any,
+        host: str = "127.0.0.1",
     ) -> None:
         self.port = port
+        self.host = host
         self.metrics = metrics
         self._redis = redis_client
         self._server: asyncio.Server | None = None
 
     async def start(self) -> None:
-        self._server = await asyncio.start_server(self._handle_client, "0.0.0.0", self.port)
-        logger.info("ASR Health endpoint listening on port %d", self.port)
+        self._server = await asyncio.start_server(self._handle_client, self.host, self.port)
+        logger.info("ASR Health endpoint listening on %s:%d", self.host, self.port)
 
     async def stop(self) -> None:
         if self._server:
@@ -112,13 +113,6 @@ class HealthServer:
                             "degraded_seconds": round(self.metrics.degraded_seconds, 2),
                             "publish_latencies": self.metrics.get_latency_percentiles(),
                         }
-                        stub_mod = sys.modules.get("meetmind_asr.providers.stub")
-                        if stub_mod is not None:
-                            stub_cls = getattr(stub_mod, "Stub" + "Provider", None)
-                            if stub_cls is not None:
-                                resp_data["stub_sessions"] = getattr(
-                                    stub_cls, "recorded_sessions", {}
-                                )
 
                     body = json.dumps(resp_data).encode("utf-8")
                     status_text = "OK" if status_code == 200 else "Service Unavailable"

@@ -160,22 +160,37 @@ async def test_b7_tenant_isolation_concurrent(
     assert len(await real_redis.xrange(cross_key_1)) == 0
     assert len(await real_redis.xrange(cross_key_2)) == 0
 
-    # 4. Verify stub sessions recorded exact per-tenant keyterms via /healthz?verbose=1
+    # 4. Verify /healthz?verbose=1 returns aggregate metrics without tenant IDs or text
     async with httpx.AsyncClient() as client:
         res = await client.get(f"{worker.health_url}?verbose=1", timeout=2.0)
         assert res.status_code == 200
         health_data = res.json()
-        sessions_data = health_data.get("stub_sessions", {})
+        assert "metrics" in health_data
+        health_text = json.dumps(health_data)
+        assert tenant_a not in health_text
+        assert tenant_b not in health_text
+        assert mtg_a not in health_text
+        assert mtg_b not in health_text
+        assert "text" not in health_data.get("metrics", {})
 
-    assert mtg_a in sessions_data
-    assert sessions_data[mtg_a]["tenant_id"] == tenant_a
-    assert sessions_data[mtg_a]["keyterms"] == ["AlphaCorp", "QuarterlyTarget"]
-    assert sessions_data[mtg_a]["language"] == "en-US"
+    # 5. Verify exact per-tenant keyterms and language recorded on tenant-isolated Redis keys
+    raw_sess_a = await real_redis.get(f"mm:{tenant_a}:asr_session:{mtg_a}")
+    assert raw_sess_a is not None, "Missing tenant A session record in Redis"
+    sess_a = json.loads(raw_sess_a.decode("utf-8") if isinstance(raw_sess_a, bytes) else raw_sess_a)
+    assert sess_a["tenant_id"] == tenant_a
+    assert sess_a["keyterms"] == ["AlphaCorp", "QuarterlyTarget"]
+    assert sess_a["language"] == "en-US"
 
-    assert mtg_b in sessions_data
-    assert sessions_data[mtg_b]["tenant_id"] == tenant_b
-    assert sessions_data[mtg_b]["keyterms"] == ["BetaSystems", "Roadmap2026"]
-    assert sessions_data[mtg_b]["language"] == "en-IN"
+    raw_sess_b = await real_redis.get(f"mm:{tenant_b}:asr_session:{mtg_b}")
+    assert raw_sess_b is not None, "Missing tenant B session record in Redis"
+    sess_b = json.loads(raw_sess_b.decode("utf-8") if isinstance(raw_sess_b, bytes) else raw_sess_b)
+    assert sess_b["tenant_id"] == tenant_b
+    assert sess_b["keyterms"] == ["BetaSystems", "Roadmap2026"]
+    assert sess_b["language"] == "en-IN"
+
+    # Cross keys must NOT exist
+    assert await real_redis.get(f"mm:{tenant_a}:asr_session:{mtg_b}") is None
+    assert await real_redis.get(f"mm:{tenant_b}:asr_session:{mtg_a}") is None
 
     # Clean up temp file
     cfg_file.unlink(missing_ok=True)
