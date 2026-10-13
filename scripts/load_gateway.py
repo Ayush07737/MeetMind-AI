@@ -112,6 +112,10 @@ class MeetingMetrics:
     setup_start_ms: float = 0.0
     setup_end_ms: float = 0.0
     create_meeting_ms: float = 0.0
+    server_create_meeting_ms: float = 0.0
+    server_jwt_ms: float = 0.0
+    server_tenant_ms: float = 0.0
+    server_redis_ms: float = 0.0
     ticket_exchange_ms: float = 0.0
     ws_connect_ms: float = 0.0
     consent_confirm_ms: float = 0.0
@@ -179,6 +183,23 @@ async def run_meeting_worker(
                 metrics.errors.append(f"create_meeting failed: {resp.status_code}")
                 return
             metrics.create_meeting_ms = (time.perf_counter() - t0) * 1000
+
+            server_timing = resp.headers.get("Server-Timing", "")
+            if server_timing:
+                for part in server_timing.split(","):
+                    part = part.strip()
+                    if part.startswith("total;dur="):
+                        with contextlib.suppress(Exception):
+                            metrics.server_create_meeting_ms = float(part.split("=")[1])
+                    elif part.startswith("jwt;dur="):
+                        with contextlib.suppress(Exception):
+                            metrics.server_jwt_ms = float(part.split("=")[1])
+                    elif part.startswith("tenant;dur="):
+                        with contextlib.suppress(Exception):
+                            metrics.server_tenant_ms = float(part.split("=")[1])
+                    elif part.startswith("redis;dur="):
+                        with contextlib.suppress(Exception):
+                            metrics.server_redis_ms = float(part.split("=")[1])
 
             # 2. POST /v1/ws-ticket
             client_instance_id = str(uuid.uuid4())
@@ -570,6 +591,12 @@ async def run_load_benchmark(
 
     setup_totals = [m.total_setup_ms for m in all_metrics if m.total_setup_ms > 0]
     create_mtg_times = [m.create_meeting_ms for m in all_metrics if m.create_meeting_ms > 0]
+    server_create_times = [
+        m.server_create_meeting_ms for m in all_metrics if m.server_create_meeting_ms > 0
+    ]
+    server_jwt_times = [m.server_jwt_ms for m in all_metrics if m.server_jwt_ms > 0]
+    server_tenant_times = [m.server_tenant_ms for m in all_metrics if m.server_tenant_ms > 0]
+    server_redis_times = [m.server_redis_ms for m in all_metrics if m.server_redis_ms > 0]
     ticket_times = [m.ticket_exchange_ms for m in all_metrics if m.ticket_exchange_ms > 0]
     consent_times = [m.consent_confirm_ms for m in all_metrics if m.consent_confirm_ms > 0]
 
@@ -583,6 +610,10 @@ async def run_load_benchmark(
 
     setup_p = compute_percentiles(setup_totals)
     create_p = compute_percentiles(create_mtg_times)
+    srv_create_p = compute_percentiles(server_create_times)
+    srv_jwt_p = compute_percentiles(server_jwt_times)
+    srv_tenant_p = compute_percentiles(server_tenant_times)
+    srv_redis_p = compute_percentiles(server_redis_times)
     ticket_p = compute_percentiles(ticket_times)
     consent_p = compute_percentiles(consent_times)
     rtt_p = compute_percentiles(all_ack_rtts)
@@ -619,9 +650,28 @@ async def run_load_benchmark(
         f"| P99={setup_p['p99']}ms | Max={setup_p['max']}ms"
     )
     print(
-        f"   Create Meeting: P50={create_p['p50']}ms | P95={create_p['p95']}ms "
-        f"| P99={create_p['p99']}ms"
+        f"   Create Meeting (Client RTT): P50={create_p['p50']}ms | P95={create_p['p95']}ms "
+        f"| P99={create_p['p99']}ms (includes client connection queueing under load)"
     )
+    print(
+        f"   Create Meeting (Server-Timing): P50={srv_create_p['p50']}ms | "
+        f"P95={srv_create_p['p95']}ms | P99={srv_create_p['p99']}ms"
+    )
+    print(
+        f"     Server Stage Breakdown (P50): JWT={srv_jwt_p['p50']}ms | "
+        f"Tenant={srv_tenant_p['p50']}ms | Redis={srv_redis_p['p50']}ms"
+    )
+    if all_metrics and all_metrics[0].create_meeting_ms > 0:
+        m0 = all_metrics[0]
+        print("   First Request (Meeting 0):")
+        print(
+            f"     Client RTT: {m0.create_meeting_ms:.2f}ms | "
+            f"Server Total: {m0.server_create_meeting_ms:.2f}ms"
+        )
+        print(
+            f"     Stages: JWT={m0.server_jwt_ms:.2f}ms, "
+            f"Tenant={m0.server_tenant_ms:.2f}ms, Redis={m0.server_redis_ms:.2f}ms"
+        )
     print(
         f"   Ticket Exchange:P50={ticket_p['p50']}ms | P95={ticket_p['p95']}ms "
         f"| P99={ticket_p['p99']}ms"

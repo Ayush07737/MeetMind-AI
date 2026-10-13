@@ -116,6 +116,35 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
             pool.get_min_size(),
             current_user,
         )
+        app.state.db_pool = pool
+
+        # Verify registered tenant schemas exist in database (Item 2)
+        verified_schemas: set[str] = set()
+        try:
+            from meetmind_security.tenant import get_tenant_router
+
+            router = get_tenant_router()
+            tenant_ids_to_check = set(settings.tenant_org_map.values())
+            if settings.default_tenant_id:
+                tenant_ids_to_check.add(settings.default_tenant_id)
+            for tid in tenant_ids_to_check:
+                try:
+                    cfg = router.resolve(tid)
+                    check_sql = (
+                        "SELECT EXISTS (SELECT 1 FROM information_schema.schemata "
+                        "WHERE schema_name = $1)"
+                    )
+                    exists = await pool.fetchval(check_sql, cfg.pg_schema)
+                    if exists:
+                        verified_schemas.add(cfg.pg_schema)
+                        logger.info("Verified tenant schema '%s' exists", cfg.pg_schema)
+                    else:
+                        logger.warning("Tenant schema '%s' is NOT provisioned", cfg.pg_schema)
+                except Exception as e:
+                    logger.warning("Error checking tenant '%s': %s", tid, e)
+        except Exception as exc:
+            logger.warning("Could not verify registered tenant schemas at startup: %s", exc)
+        app.state.verified_schemas = verified_schemas
     except RuntimeError as exc:
         if "Security violation" in str(exc) or "holds illegal privilege" in str(exc):
             logger.critical("Startup refused due to database privilege violation: %s", exc)
@@ -212,6 +241,37 @@ def create_app(settings: GatewaySettings | None = None) -> FastAPI:
 
         t0 = time.perf_counter()
         tenant_id = user.tenant_id
+
+        # Verify tenant schema is provisioned (Item 2)
+        verified = getattr(app.state, "verified_schemas", set())
+        if verified:
+            from meetmind_security.tenant import get_tenant_router
+
+            try:
+                cfg = get_tenant_router().resolve(tenant_id)
+                schema_name = cfg.pg_schema
+            except Exception:
+                schema_name = f"tenant_{tenant_id}"
+
+            if schema_name not in verified:
+                pool = getattr(app.state, "db_pool", None)
+                if pool:
+                    check_sql = (
+                        "SELECT EXISTS (SELECT 1 FROM information_schema.schemata "
+                        "WHERE schema_name = $1)"
+                    )
+                    exists = await pool.fetchval(check_sql, schema_name)
+                    if exists:
+                        verified.add(schema_name)
+                    else:
+                        err_msg = (
+                            f"Tenant schema '{schema_name}' is not provisioned. "
+                            "Provision tenant schema before creating meetings."
+                        )
+                        raise HTTPException(
+                            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+                            detail=err_msg,
+                        )
         t_tenant = (time.perf_counter() - t0) * 1000
 
         body: dict[str, Any] = {}
@@ -221,7 +281,7 @@ def create_app(settings: GatewaySettings | None = None) -> FastAPI:
                 body = parsed
             elif parsed is not None:
                 raise HTTPException(
-                    status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+                    status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
                     detail="Request body must be a JSON object",
                 )
 
@@ -232,12 +292,12 @@ def create_app(settings: GatewaySettings | None = None) -> FastAPI:
         if local_user_name is not None:
             if not isinstance(local_user_name, str):
                 raise HTTPException(
-                    status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+                    status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
                     detail="local_user_name must be a string",
                 )
             if len(local_user_name) > 100:
                 raise HTTPException(
-                    status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+                    status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
                     detail="local_user_name must be at most 100 characters",
                 )
 
@@ -245,23 +305,23 @@ def create_app(settings: GatewaySettings | None = None) -> FastAPI:
         if attendees is not None:
             if not isinstance(attendees, list):
                 raise HTTPException(
-                    status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+                    status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
                     detail="attendees must be a list of strings",
                 )
             if len(attendees) > 50:
                 raise HTTPException(
-                    status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+                    status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
                     detail="attendees must contain at most 50 items",
                 )
             for att in attendees:
                 if not isinstance(att, str):
                     raise HTTPException(
-                        status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+                        status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
                         detail="All attendees items must be strings",
                     )
                 if len(att) > 100:
                     raise HTTPException(
-                        status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+                        status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
                         detail="Attendee item must be at most 100 characters",
                     )
 

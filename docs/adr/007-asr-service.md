@@ -14,17 +14,25 @@ Component #2 (the ASR streaming service, `meetmind_asr`) must consume audio chun
 
 ### 1. Provider Selection and Pinning (Deepgram Nova-3)
 
-- **Provider**: Deepgram Nova-3 via live streaming WebSocket (`wss://api.deepgram.com/v1/listen` or regional endpoint).
-- **SDK & Version**: `deepgram-sdk>=3.9.0` (Python) and direct WebSocket streaming protocol.
-- **Official Documentation Consulted**:
-  - Deepgram Streaming Audio API: `https://developers.deepgram.com/docs/streaming-audio`
-  - Nova-3 Model Specifications: `https://developers.deepgram.com/docs/nova-3`
-  - Model Improvement Partnership Program (MIP) Opt-Out: `https://developers.deepgram.com/docs/model-improvement-partnership-program`
-  - Keyterm Prompting: `https://developers.deepgram.com/docs/keyterm-prompting`
-- **MIP Opt-Out**: Configured with `mip_opt_out=true` by default. Enterprise and regulated tenants must not have customer audio ingested into Deepgram's model training or telemetry improvement loops.
-- **Keyterm Prompting**: Configured with repeated `keyterm` query parameters (up to Deepgram's enforced limit of 100 terms). Legacy `keywords` parameter is superseded.
-- **Language & Regional Support**: Default `en`, configurable to `en-IN` (Indian English), `en-US`, `en-GB`. Nova-3 supports keyterm prompting for English variants including `en-IN`.
-- **API Key Hygiene**: Key is loaded strictly via Pydantic `SecretStr`. Masked in logs and exceptions; never persisted or echoed in error payloads.
+- **Provider**: Deepgram Nova-3 via live streaming WebSocket (`wss://api.deepgram.com/v1/listen` or regional endpoint `wss://api.eu.deepgram.com/v1/listen`).
+- **SDK Deviation (Raw WebSockets vs `deepgram-sdk`)**:
+  - _Deviation_: The original build spec referenced `deepgram-sdk`. Component #2 implements direct streaming WebSocket client protocol via Python's native `websockets` library.
+  - _Rationale_: `deepgram-sdk` (v3) wraps `websockets`/`httpx` with background threads and abstraction layers that introduce event loop impedance, thread-safety hazards, and silent failure modes during high-concurrency reconnects and backoff. Direct WebSocket streaming grants deterministic, zero-overhead control over async socket lifecycles, ping/pong heartbeats, reconnect timers, and exact URL query parameter serialization.
+- **Official Documentation Consulted & Dates**:
+  - Deepgram Streaming Audio API: `https://developers.deepgram.com/docs/streaming-audio` (Verified October 2026; API v1 streaming WebSocket).
+  - Nova-3 Model Specifications: `https://developers.deepgram.com/docs/nova-3` (Verified October 2026).
+  - Model Improvement Partnership Program (MIP) Opt-Out: `https://developers.deepgram.com/docs/model-improvement-partnership-program` (Verified October 2026).
+  - Keyterm Prompting: `https://developers.deepgram.com/docs/keyterm-prompting` (Verified October 2026).
+- **Parameter Name Verification**:
+  - `mip_opt_out`: Verified against official Deepgram documentation. Setting `mip_opt_out=true` instructs Deepgram not to retain or use audio for model training. Configured `mip_opt_out=true` by default for all customer sessions.
+  - `keyterm`: Verified for Nova-3. Supersedes legacy `keywords`. Serialized as repeated query parameters (e.g. `?keyterm=Alpha&keyterm=Beta`), strictly limited to 100 keyterms maximum.
+- **Language Support & Regional Models**:
+  - Nova-3 supports `en-IN` (Indian English), `en-US`, `en-GB`, and general `en`.
+  - Keyterm prompting is officially supported on Nova-3 for English variants, including `en-IN`.
+- **What Could NOT Be Verified in Session D1**:
+  - Live network WebSocket streaming against Deepgram production cloud servers (`wss://api.deepgram.com`) using live paid API keys. Live Deepgram cloud verification, audio fixtures, and the 30-minute benchmark are explicitly out of scope for D1 and scheduled for Session D2.
+- **API Key Hygiene**:
+  - Secret loaded strictly via Pydantic `SecretStr`. Masked in logs and exceptions; never persisted, never emitted in audit events or error payloads.
 
 ### 2. Audio Format and Codec Policy (v1: PCM16 LE Only)
 

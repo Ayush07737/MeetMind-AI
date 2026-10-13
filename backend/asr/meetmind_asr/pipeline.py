@@ -211,6 +211,17 @@ class MeetingPipeline:
             keyterms=self.tenant_config.keyterms,
         )
         await self.provider.open(session)
+        session_key = f"mm:{self.tenant_id}:asr_session:{self.meeting_id}"
+        session_data = json.dumps(
+            {
+                "tenant_id": self.tenant_id,
+                "meeting_id": self.meeting_id,
+                "language": self.tenant_config.language,
+                "keyterms": list(self.tenant_config.keyterms),
+            }
+        )
+        with contextlib.suppress(Exception):
+            await self.redis.set(session_key, session_data, ex=86400)
 
     async def _audio_read_loop(self) -> None:
         """Read audio frames from Redis stream mm:{tenant}:audio:{meeting}."""
@@ -235,7 +246,7 @@ class MeetingPipeline:
                     "asr",
                     self.worker_id,
                     {self._audio_key: ">"},
-                    count=20,
+                    count=100,
                     block=250,
                 )
                 if entries:
@@ -448,6 +459,7 @@ class MeetingPipeline:
 
                 if to_ack:
                     await self.redis.xack(self._audio_key, "asr", *to_ack)
+                    await self.redis.xdel(self._audio_key, *to_ack)
                     self.metrics.chunks_acked += len(to_ack)
 
                 await asyncio.sleep(0.2)
@@ -680,6 +692,7 @@ class MeetingPipeline:
             to_ack = [eid for _, eid in self._pending_acks]
             with contextlib.suppress(Exception):
                 await self.redis.xack(self._audio_key, "asr", *to_ack)
+                await self.redis.xdel(self._audio_key, *to_ack)
                 self.metrics.chunks_acked += len(to_ack)
 
         # 5. Record session summary audit
