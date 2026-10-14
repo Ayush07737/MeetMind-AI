@@ -421,11 +421,24 @@ class AsrProcessHandle:
             self.proc.wait()
 
 
+@pytest.hookimpl(hookwrapper=True)
+def pytest_runtest_makereport(item, call):
+    outcome = yield
+    rep = outcome.get_result()
+    setattr(item, "rep_" + rep.when, rep)
+    if rep.when == "call" and rep.failed:
+        workers = getattr(item, "_asr_spawned_workers", [])
+        for idx, h in enumerate(workers):
+            log_text = "\n".join(f"[{h.worker_id}] {line}" for line in h.logs)
+            rep.sections.append((f"ASR Worker {idx} ({h.worker_id}) Logs", log_text))
+
+
 @pytest.fixture
-def asr_worker_factory():
+def asr_worker_factory(request: pytest.FixtureRequest):
     """Factory fixture to spawn real ASR worker subprocesses."""
     spawned_processes: list[AsrProcessHandle] = []
     repo_root = Path(__file__).resolve().parents[4]
+    request.node._asr_spawned_workers = spawned_processes
 
     async def _spawn(
         provider: str = "stub",
@@ -439,6 +452,7 @@ def asr_worker_factory():
         env = os.environ.copy()
         env["ASR_PROVIDER"] = provider
         env["ASR_HEALTH_PORT"] = str(health_port)
+        env["ASR_WORKER_ID"] = wid
         env["REDIS_URL"] = redis_url
         env["APP_ENV"] = "development"
         env["PYTHONPATH"] = (
@@ -507,6 +521,16 @@ def asr_worker_factory():
         return handle
 
     yield _spawn
+
+    rep_call = getattr(request.node, "rep_call", None)
+    is_failed = (rep_call and rep_call.failed) or (sys.exc_info()[0] is not None)
+    if is_failed:
+        for idx, h in enumerate(spawned_processes):
+            banner = f"=== ASR WORKER {idx} ({h.worker_id}) STDOUT/STDERR ({len(h.logs)} lines) ==="
+            print(f"\n{banner}", file=sys.stderr)
+            for line in h.logs:
+                print(f"[{h.worker_id}] {line}", file=sys.stderr)
+            print(f"=== END ASR WORKER {idx} ===\n", file=sys.stderr)
 
     for h in spawned_processes:
         with contextlib.suppress(Exception):

@@ -119,6 +119,12 @@ async def test_t7_deduplication_gap_tracking_and_meeting_end(
             )
             assert consent_count == 1
 
+        act_set = {
+            s.decode() if isinstance(s, bytes) else str(s)
+            for s in await real_redis.smembers("mm:system:active_meetings")
+        }
+        assert f"{tenant_id}|{meeting_id}" in act_set
+
         # 3. Send Frame client_seq=1
         ts1 = int(datetime.now(UTC).timestamp() * 1000)
         pcm1 = b"PCM_AUDIO_SEQ_1"
@@ -238,3 +244,140 @@ async def test_t7_deduplication_gap_tracking_and_meeting_end(
     for f in m_events:
         assert (f.get(b"tenant") or f.get("tenant")) in (tenant_id.encode(), tenant_id)
         assert (f.get(b"ts_ms") or f.get("ts_ms")) is not None
+
+    # Assert: mm:system:active_meetings removed on meeting_end
+    active_members_raw = await real_redis.smembers("mm:system:active_meetings")
+    active_members = {s.decode() if isinstance(s, bytes) else str(s) for s in active_members_raw}
+    assert f"{tenant_id}|{meeting_id}" not in active_members
+
+
+@pytest.mark.asyncio
+async def test_t7_active_meetings_set_maintained_lifecycle(
+    gateway_harness: ServerHarness,
+    real_redis,
+) -> None:
+    """Verify mm:system:active_meetings set is maintained across full lifecycle:
+
+    1. SADD on meeting_active
+    2. Reconnect is idempotent (member retained)
+    3. SREM on meeting_ended
+    4. SREM on meeting_abandoned (janitor / lifecycle sweep)
+    """
+    h = gateway_harness
+    tenant_id = h.tenant_a
+    meeting_id = f"mtg_t7_set_{uuid.uuid4().hex[:6]}"
+    member = f"{tenant_id}|{meeting_id}"
+
+    token = h.jwks.mint_token(sub="user_set_tester", org_id=h.org_a, org_role="org:admin")
+    status, resp = await exchange_ws_ticket(h.http_url, token, meeting_id, role="ingest")
+    assert status == 200
+    ticket = resp["ticket"]
+    uri = f"{h.ws_url}/v1/meetings/{meeting_id}/stream?ticket={ticket}"
+
+    async with websockets.connect(uri) as ws:
+        # Before consent, not yet active
+        pre_members = {
+            s.decode() if isinstance(s, bytes) else str(s)
+            for s in await real_redis.smembers("mm:system:active_meetings")
+        }
+        assert member not in pre_members
+
+        # meeting_start + consent_confirmed -> meeting_active emitted
+        await ws.send(
+            json.dumps(
+                {
+                    "type": "control",
+                    "action": "meeting_start",
+                    "adapter_type": "chrome_extension",
+                }
+            )
+        )
+        await ws.recv()
+        await ws.send(
+            json.dumps(
+                {
+                    "type": "control",
+                    "action": "consent_confirmed",
+                    "consent_type": "audio_capture",
+                    "external_participants": False,
+                    "consent_text_version": "v1.0",
+                    "client_version": "1.0.0",
+                }
+            )
+        )
+        await ws.recv()
+
+        # 1. Assert: SADD on meeting_active
+        active_members = {
+            s.decode() if isinstance(s, bytes) else str(s)
+            for s in await real_redis.smembers("mm:system:active_meetings")
+        }
+        assert member in active_members
+
+    # 2. Reconnect: reconnect idempotent, member remains
+    st_recon, resp_recon = await exchange_ws_ticket(h.http_url, token, meeting_id, role="ingest")
+    assert st_recon == 200
+    uri_recon = f"{h.ws_url}/v1/meetings/{meeting_id}/stream?ticket={resp_recon['ticket']}"
+    async with websockets.connect(uri_recon) as ws_recon:
+        active_recon = {
+            s.decode() if isinstance(s, bytes) else str(s)
+            for s in await real_redis.smembers("mm:system:active_meetings")
+        }
+        assert member in active_recon
+
+        # 3. Assert: SREM on meeting_ended
+        await ws_recon.send(json.dumps({"type": "control", "action": "meeting_end"}))
+        await ws_recon.recv()
+
+    post_end_members = {
+        s.decode() if isinstance(s, bytes) else str(s)
+        for s in await real_redis.smembers("mm:system:active_meetings")
+    }
+    assert member not in post_end_members
+
+    # 4. Assert: SREM on meeting_abandoned
+    # Start second meeting to active, then abandon
+    mid_abandon = f"mtg_t7_ab_{uuid.uuid4().hex[:6]}"
+    mem_abandon = f"{tenant_id}|{mid_abandon}"
+    _, resp_ab = await exchange_ws_ticket(h.http_url, token, mid_abandon, role="ingest")
+    ws_url_ab = f"{h.ws_url}/v1/meetings/{mid_abandon}/stream?ticket={resp_ab['ticket']}"
+    async with websockets.connect(ws_url_ab) as ws_ab:
+        await ws_ab.send(
+            json.dumps(
+                {
+                    "type": "control",
+                    "action": "meeting_start",
+                    "adapter_type": "chrome_extension",
+                }
+            )
+        )
+        await ws_ab.recv()
+        await ws_ab.send(
+            json.dumps(
+                {
+                    "type": "control",
+                    "action": "consent_confirmed",
+                    "consent_type": "audio_capture",
+                    "external_participants": False,
+                    "consent_text_version": "v1.0",
+                    "client_version": "1.0.0",
+                }
+            )
+        )
+        await ws_ab.recv()
+
+        ab_active = {
+            s.decode() if isinstance(s, bytes) else str(s)
+            for s in await real_redis.smembers("mm:system:active_meetings")
+        }
+        assert mem_abandon in ab_active
+
+    # Publish meeting_abandoned (janitor flow)
+    from meetmind_gateway.redis_streams import publish_lifecycle_event
+
+    await publish_lifecycle_event(real_redis, "meeting_abandoned", tenant_id, mid_abandon)
+    ab_after = {
+        s.decode() if isinstance(s, bytes) else str(s)
+        for s in await real_redis.smembers("mm:system:active_meetings")
+    }
+    assert mem_abandon not in ab_after

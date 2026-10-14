@@ -87,11 +87,22 @@ class ClerkAuthenticator:
         self._keys_cache: dict[str, PyJWK] = {}
         self._fetch_lock: asyncio.Lock | None = None
         self._last_fetch_time: float = 0.0
+        self.cache_hits: int = 0
+        self.cache_misses: int = 0
+        self.warm_jwt_times_ms: list[float] = []
 
     def _get_fetch_lock(self) -> asyncio.Lock:
         if self._fetch_lock is None:
             self._fetch_lock = asyncio.Lock()
         return self._fetch_lock
+
+    async def warm_cache(self) -> None:
+        """Pre-warm JWKS keys cache at startup to eliminate cold-start fetch queueing."""
+        try:
+            await self._fetch_jwks_keys()
+            logger.info("JWKS keys cache pre-warmed successfully (%d keys)", len(self._keys_cache))
+        except Exception as exc:
+            logger.warning("JWKS cache pre-warm skipped or failed: %s", exc)
 
     async def _fetch_jwks_keys(self) -> None:
         """Fetch JWKS asynchronously without blocking the event loop."""
@@ -128,13 +139,25 @@ class ClerkAuthenticator:
             raise pyjwt.InvalidTokenError(f"Unable to decode token header: {exc}") from exc
 
         kid = unverified_header.get("kid")
-        if kid and kid in self._keys_cache:
-            return self._keys_cache[kid].key
+        if kid:
+            if kid in self._keys_cache:
+                self.cache_hits += 1
+                return self._keys_cache[kid].key
+        elif self._keys_cache:
+            self.cache_hits += 1
+            default_jwk = self._keys_cache.get("_default") or next(iter(self._keys_cache.values()))
+            return default_jwk.key
 
+        self.cache_misses += 1
         lock = self._get_fetch_lock()
         async with lock:
             if kid and kid in self._keys_cache:
                 return self._keys_cache[kid].key
+            if not kid and self._keys_cache:
+                default_jwk = self._keys_cache.get("_default") or next(
+                    iter(self._keys_cache.values())
+                )
+                return default_jwk.key
 
             # Non-blocking async fetch
             await self._fetch_jwks_keys()
@@ -148,6 +171,19 @@ class ClerkAuthenticator:
                 return default_jwk.key
             else:
                 raise pyjwt.PyJWKClientError(f"Signing key with kid '{kid}' not found in JWKS")
+
+    def get_stats(self) -> dict[str, Any]:
+        """Return JWKS cache and warm JWT verification statistics."""
+        from .lag_monitor import compute_percentiles
+
+        total = self.cache_hits + self.cache_misses
+        hit_rate = round((self.cache_hits / total) * 100.0, 2) if total > 0 else 100.0
+        return {
+            "cache_hits": self.cache_hits,
+            "cache_misses": self.cache_misses,
+            "hit_rate_pct": hit_rate,
+            "warm_jwt_ms": compute_percentiles(self.warm_jwt_times_ms),
+        }
 
     def _get_jwks_client(self) -> PyJWKClient:
         """Lazily create and cache the PyJWKClient (legacy fallback)."""
@@ -254,6 +290,8 @@ class ClerkAuthenticator:
         if not token or not token.strip():
             raise AuthUnauthorizedError("No authentication token provided")
 
+        t0 = time.perf_counter()
+        is_warm = bool(self._keys_cache)
         try:
             signing_key = await self.get_signing_key_for_token(token)
 
@@ -271,6 +309,8 @@ class ClerkAuthenticator:
                     "require": ["sub", "exp"],
                 },
             )
+            if is_warm:
+                self.warm_jwt_times_ms.append((time.perf_counter() - t0) * 1000)
 
         except pyjwt.ExpiredSignatureError as err:
             raise AuthUnauthorizedError("Token has expired") from err

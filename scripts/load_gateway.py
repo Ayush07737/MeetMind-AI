@@ -106,6 +106,13 @@ def get_system_hardware() -> dict[str, Any]:
     }
 
 
+TIMEOUT_CREATE_MEETING = 60.0
+TIMEOUT_WS_TICKET = 60.0
+TIMEOUT_WS_CONNECT = 60.0
+TIMEOUT_CONSENT = 60.0
+TIMEOUT_STREAMING_CHUNK = 10.0
+
+
 @dataclass
 class MeetingMetrics:
     meeting_id: str
@@ -125,6 +132,7 @@ class MeetingMetrics:
     chunks_sent: int = 0
     chunks_acked: int = 0
     errors: list[str] = field(default_factory=list)
+    failed_stage: str | None = None
 
 
 async def setup_test_tenant(tenant_id: str) -> None:
@@ -170,9 +178,11 @@ async def run_meeting_worker(
     metrics.meeting_id = meeting_id
 
     passed_barrier = False
+    current_stage = "create meeting"
     try:
         # 1. POST /v1/meetings
-        async with httpx.AsyncClient(timeout=60.0) as http_client:
+        current_stage = "create meeting"
+        async with httpx.AsyncClient(timeout=TIMEOUT_CREATE_MEETING) as http_client:
             t0 = time.perf_counter()
             resp = await http_client.post(
                 f"{base_http_url}/v1/meetings",
@@ -180,7 +190,8 @@ async def run_meeting_worker(
                 json={"meeting_id": meeting_id},
             )
             if resp.status_code != 201:
-                metrics.errors.append(f"create_meeting failed: {resp.status_code}")
+                metrics.failed_stage = current_stage
+                metrics.errors.append(f"create_meeting failed: status {resp.status_code}")
                 return
             metrics.create_meeting_ms = (time.perf_counter() - t0) * 1000
 
@@ -202,6 +213,7 @@ async def run_meeting_worker(
                             metrics.server_redis_ms = float(part.split("=")[1])
 
             # 2. POST /v1/ws-ticket
+            current_stage = "ticket"
             client_instance_id = str(uuid.uuid4())
             t0 = time.perf_counter()
             resp_ticket = await http_client.post(
@@ -212,25 +224,29 @@ async def run_meeting_worker(
                     "role": "ingest",
                     "client_instance_id": client_instance_id,
                 },
+                timeout=TIMEOUT_WS_TICKET,
             )
             if resp_ticket.status_code != 200:
-                metrics.errors.append(f"ws_ticket failed: {resp_ticket.status_code}")
+                metrics.failed_stage = current_stage
+                metrics.errors.append(f"ws_ticket failed: status {resp_ticket.status_code}")
                 return
             ticket = resp_ticket.json()["ticket"]
             metrics.ticket_exchange_ms = (time.perf_counter() - t0) * 1000
 
         # 3. WebSocket connect & control handshake
+        current_stage = "ws connect"
         ws_uri = f"{base_ws_url}/v1/meetings/{meeting_id}/stream?ticket={ticket}"
         t0 = time.perf_counter()
         async with websockets.connect(
             ws_uri,
-            open_timeout=60.0,
+            open_timeout=TIMEOUT_WS_CONNECT,
             ping_interval=None,
             close_timeout=10.0,
         ) as ws:
             metrics.ws_connect_ms = (time.perf_counter() - t0) * 1000
 
             # Handshake: meeting_start & consent_confirmed
+            current_stage = "consent"
             t_consent0 = time.perf_counter()
             await ws.send(
                 json.dumps(
@@ -241,9 +257,10 @@ async def run_meeting_worker(
                     }
                 )
             )
-            ack_start_raw = await asyncio.wait_for(ws.recv(), timeout=60.0)
+            ack_start_raw = await asyncio.wait_for(ws.recv(), timeout=TIMEOUT_CONSENT)
             ack_start = json.loads(ack_start_raw)
             if ack_start.get("type") != "ack":
+                metrics.failed_stage = current_stage
                 metrics.errors.append(f"meeting_start rejected: {ack_start}")
                 return
 
@@ -260,9 +277,10 @@ async def run_meeting_worker(
                     }
                 )
             )
-            ack_consent_raw = await asyncio.wait_for(ws.recv(), timeout=60.0)
+            ack_consent_raw = await asyncio.wait_for(ws.recv(), timeout=TIMEOUT_CONSENT)
             ack_consent = json.loads(ack_consent_raw)
             if ack_consent.get("type") != "ack":
+                metrics.failed_stage = current_stage
                 metrics.errors.append(f"consent_confirmed rejected: {ack_consent}")
                 return
 
@@ -270,8 +288,13 @@ async def run_meeting_worker(
             metrics.total_setup_ms = (time.perf_counter() - t_setup_start) * 1000
 
             # Barrier: steady state begins only after ALL meetings have completed setup
+            current_stage = "streaming"
             if barrier:
                 passed_barrier = True
+                if meeting_index == 0:
+                    async with httpx.AsyncClient() as hc:
+                        with contextlib.suppress(Exception):
+                            await hc.post(f"{base_http_url}/v1/system/mark-steady", timeout=5.0)
                 with contextlib.suppress(asyncio.BrokenBarrierError, TimeoutError):
                     await asyncio.wait_for(barrier.wait(), timeout=75.0)
 
@@ -294,8 +317,9 @@ async def run_meeting_worker(
                 metrics.chunks_sent += 1
 
                 try:
-                    ack_raw = await asyncio.wait_for(ws.recv(), timeout=10.0)
+                    ack_raw = await asyncio.wait_for(ws.recv(), timeout=TIMEOUT_STREAMING_CHUNK)
                 except Exception as e:
+                    metrics.failed_stage = current_stage
                     metrics.errors.append(f"chunk {client_seq} recv error: {e}")
                     break
 
@@ -306,6 +330,7 @@ async def run_meeting_worker(
                     metrics.chunks_acked += 1
                     metrics.ack_rtts_ms.append((t_ack - t_send) * 1000)
                 else:
+                    metrics.failed_stage = current_stage
                     metrics.errors.append(f"Unexpected ack frame: {ack_raw}")
 
                 client_seq += 1
@@ -318,7 +343,9 @@ async def run_meeting_worker(
                 await ws.send(json.dumps({"type": "control", "action": "meeting_end"}))
                 await asyncio.wait_for(ws.recv(), timeout=5.0)
     except Exception as exc:
-        metrics.errors.append(f"ws streaming error: {type(exc).__name__}: {exc}")
+        if not metrics.failed_stage:
+            metrics.failed_stage = current_stage
+        metrics.errors.append(f"{current_stage} error: {type(exc).__name__}: {exc}")
     finally:
         if barrier and not passed_barrier:
             with contextlib.suppress(Exception):
@@ -619,11 +646,32 @@ async def run_load_benchmark(
     rtt_p = compute_percentiles(all_ack_rtts)
     gw_p = compute_percentiles(continuity["gateway_latencies_ms"])
 
+    # Query server-side investigation metrics from gateway
+    server_sys_metrics: dict[str, Any] = {}
+    async with httpx.AsyncClient() as c:
+        try:
+            res_metrics = await c.get(f"{http_url}/v1/system/metrics", timeout=5.0)
+            if res_metrics.status_code == 200:
+                server_sys_metrics = res_metrics.json()
+        except Exception as e:
+            print(f"[WARNING] Could not fetch server metrics from {http_url}: {e}")
+
+    stage_timeouts = {
+        "create meeting": f"{TIMEOUT_CREATE_MEETING}s",
+        "ticket": f"{TIMEOUT_WS_TICKET}s",
+        "ws connect": f"{TIMEOUT_WS_CONNECT}s",
+        "consent": f"{TIMEOUT_CONSENT}s",
+        "streaming": f"{TIMEOUT_STREAMING_CHUNK}s",
+    }
+    stage_failures = {
+        "create meeting": sum(1 for m in all_metrics if m.failed_stage == "create meeting"),
+        "ticket": sum(1 for m in all_metrics if m.failed_stage == "ticket"),
+        "ws connect": sum(1 for m in all_metrics if m.failed_stage == "ws connect"),
+        "consent": sum(1 for m in all_metrics if m.failed_stage == "consent"),
+        "streaming": sum(1 for m in all_metrics if m.failed_stage == "streaming"),
+    }
+
     all_errors = [err for m in all_metrics for err in m.errors]
-    if all_errors:
-        print(f"\n[WARNING] {len(all_errors)} errors encountered during benchmark:")
-        for err in all_errors[:10]:
-            print(f"  - {err}")
 
     print("\n" + "=" * 80)
     print(" BENCHMARK RESULTS SUMMARY (C2 SPEC)")
@@ -644,6 +692,26 @@ async def run_load_benchmark(
     print(f"Zero-Gap Continuity:       {p_cnt}/{v_mtg} (100% strictly sequential)")
     print("-" * 80)
 
+    print("STAGE ERROR TABLE:")
+    print("-" * 80)
+    print(f"{'Stage':<18} | {'Timeout':<10} | {'Failures':<10} | {'Status':<10}")
+    print("-" * 80)
+    for stg in ["create meeting", "ticket", "ws connect", "consent", "streaming"]:
+        fails = stage_failures[stg]
+        status_str = "PASSED" if fails == 0 else f"FAILED ({fails})"
+        print(f"{stg:<18} | {stage_timeouts[stg]:<10} | {fails:<10} | {status_str:<10}")
+    print("-" * 80)
+
+    sent_counts = [m.chunks_sent for m in all_metrics]
+    min_sent = min(sent_counts) if sent_counts else 0
+    p50_sent = int(statistics.median(sent_counts)) if sent_counts else 0
+    max_sent = max(sent_counts) if sent_counts else 0
+    print("\nPER-MEETING CHUNK DISTRIBUTION:")
+    print(f"   Chunks Sent per Meeting: Min={min_sent} | P50={p50_sent} | Max={max_sent}")
+    print(f"   Expected Total Chunks:   {expected_chunks:,}")
+    print(f"   Actual Total Chunks:     {total_sent:,} (Acked: {total_acked:,})")
+    print("-" * 80)
+
     print("1. SETUP LATENCY (POST /v1/meetings, /v1/ws-ticket, WS connect, consent_confirmed):")
     print(
         f"   Total Setup:    P50={setup_p['p50']}ms | P95={setup_p['p95']}ms "
@@ -651,7 +719,7 @@ async def run_load_benchmark(
     )
     print(
         f"   Create Meeting (Client RTT): P50={create_p['p50']}ms | P95={create_p['p95']}ms "
-        f"| P99={create_p['p99']}ms (includes client connection queueing under load)"
+        f"| P99={create_p['p99']}ms"
     )
     print(
         f"   Create Meeting (Server-Timing): P50={srv_create_p['p50']}ms | "
@@ -699,7 +767,45 @@ async def run_load_benchmark(
     print("   Database Statements / Streaming: 0 statements (100% Redis Streams)")
     print("-" * 80)
 
-    print("3. RESOURCE UTILIZATION:")
+    print("3. SERVER-SIDE HEALTH & INVESTIGATION METRICS (4 Uvicorn Workers):")
+    print("-" * 80)
+    if server_sys_metrics:
+        lag_setup = server_sys_metrics.get("lag", {}).get("setup", {})
+        lag_steady = server_sys_metrics.get("lag", {}).get("steady", {})
+        jwks_st = server_sys_metrics.get("jwks", {})
+        jwt_warm = server_sys_metrics.get("warm_jwt_ms", {})
+        redis_st = server_sys_metrics.get("redis_create_meeting_ms", {})
+
+        print(f"   Workers Reporting:       {server_sys_metrics.get('workers_reporting', 'N/A')}")
+        print(
+            f"   Event-Loop Lag (Setup):  P50={lag_setup.get('p50', 0)}ms | "
+            f"P95={lag_setup.get('p95', 0)}ms | P99={lag_setup.get('p99', 0)}ms | "
+            f"Max={lag_setup.get('max', 0)}ms"
+        )
+        print(
+            f"   Event-Loop Lag (Steady): P50={lag_steady.get('p50', 0)}ms | "
+            f"P95={lag_steady.get('p95', 0)}ms | P99={lag_steady.get('p99', 0)}ms | "
+            f"Max={lag_steady.get('max', 0)}ms"
+        )
+        print(
+            f"   JWKS Cache Hit Rate:     {jwks_st.get('hit_rate_pct', 100.0)}% "
+            f"(Hits: {jwks_st.get('hits', 0)}, Misses: {jwks_st.get('misses', 0)})"
+        )
+        print(
+            f"   WARM JWT Verify Time:    P50={jwt_warm.get('p50', 0)}ms | "
+            f"P95={jwt_warm.get('p95', 0)}ms | P99={jwt_warm.get('p99', 0)}ms | "
+            f"Max={jwt_warm.get('max', 0)}ms"
+        )
+        print(
+            f"   Redis Stage Time (HSET): P50={redis_st.get('p50', 0)}ms | "
+            f"P95={redis_st.get('p95', 0)}ms | P99={redis_st.get('p99', 0)}ms | "
+            f"Max={redis_st.get('max', 0)}ms"
+        )
+    else:
+        print("   [INFO] Server metrics endpoint /v1/system/metrics was not collected.")
+    print("-" * 80)
+
+    print("4. RESOURCE UTILIZATION:")
     print(
         f"   Server Procs CPU: Mean={server_cpu_mean}% | Peak={server_cpu_peak}% "
         "(across Uvicorn worker processes)"
@@ -709,6 +815,29 @@ async def run_load_benchmark(
         f"   Redis Memory:    Initial={used_mem_initial} | End={used_mem_final} | Peak={peak_mem}"
     )
     print("=" * 80)
+
+    if all_errors:
+        print(f"\n[WARNING] {len(all_errors)} errors encountered during benchmark:")
+        for err in all_errors[:10]:
+            print(f"  - {err}")
+
+    failed_meetings = sum(1 for m in all_metrics if m.errors or m.failed_stage)
+    if failed_meetings > 0:
+        print(
+            f"\n[FAILED] Run incomplete: {failed_meetings}/{concurrency} "
+            "meetings encountered errors."
+        )
+        if server_proc:
+            server_proc.kill()
+            server_proc.wait()
+        jwks.stop()
+        await redis_client.aclose()
+        sys.exit(1)
+    else:
+        print(
+            f"\n[COMPLETE] Run succeeded: 0/{concurrency} meetings errored. "
+            "100% gap-free continuity."
+        )
 
     if server_proc:
         server_proc.kill()

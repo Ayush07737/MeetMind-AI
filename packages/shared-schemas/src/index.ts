@@ -432,3 +432,9 @@ export function computeUtteranceId(
   const key = `${meetingId}|${chStr}|${spkStr}|${startMs}`;
   return createHash("sha256").update(key).digest("hex").slice(0, 24);
 }
+
+export const ACTIVE_MEETINGS_SET_KEY = "mm:system:active_meetings";
+
+export function activeMeetingsSetKey(): string {
+  return ACTIVE_MEETINGS_SET_KEY;
+}

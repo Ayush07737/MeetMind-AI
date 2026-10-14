@@ -11,6 +11,7 @@ import asyncio
 import contextlib
 import json
 import logging
+import os
 import secrets
 import sys
 import time
@@ -96,6 +97,46 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
 
     janitor_task = asyncio.create_task(run_janitor_loop(redis_client, app.state.session_manager))
 
+    # Event-loop lag monitor
+    from .lag_monitor import EventLoopLagMonitor
+
+    lag_monitor = EventLoopLagMonitor()
+    lag_monitor.start()
+    app.state.lag_monitor = lag_monitor
+
+    # Pre-warm JWKS keys cache at startup to avoid runtime request queueing
+    await app.state.authenticator.warm_cache()
+
+    # Background worker metrics flush
+    async def _flush_worker_metrics() -> None:
+        while True:
+            await asyncio.sleep(1.0)
+            try:
+                pid = os.getpid()
+                data = {
+                    "pid": pid,
+                    "lag": app.state.lag_monitor.get_stats(),
+                    "auth": app.state.authenticator.get_stats(),
+                    "session": app.state.session_manager.get_stats(),
+                    "lag_setup_samples": app.state.lag_monitor.setup_lags_ms[-1000:],
+                    "lag_steady_samples": app.state.lag_monitor.steady_lags_ms[-1000:],
+                    "warm_jwt_samples": app.state.authenticator.warm_jwt_times_ms[-1000:],
+                    "redis_samples": app.state.session_manager.create_meeting_times_ms[-1000:],
+                }
+                await app.state.redis.set(
+                    f"mm:system:worker_metrics:{pid}", json.dumps(data), ex=120
+                )
+                if not app.state.lag_monitor.is_steady:
+                    val = await app.state.redis.get("mm:system:mark_steady")
+                    if val in ("1", b"1"):
+                        app.state.lag_monitor.mark_steady()
+            except asyncio.CancelledError:
+                break
+            except Exception:
+                pass
+
+    metrics_flush_task = asyncio.create_task(_flush_worker_metrics())
+
     # -- Warm DB connection pool via app role (CA-1) ---------------------------
     try:
         from meetmind_security.db import get_app_dsn, init_db
@@ -158,6 +199,10 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
     yield
 
     # -- Shutdown --------------------------------------------------------------
+    metrics_flush_task.cancel()
+    with contextlib.suppress(asyncio.CancelledError):
+        await metrics_flush_task
+    lag_monitor.stop()
     janitor_task.cancel()
     with contextlib.suppress(asyncio.CancelledError):
         await janitor_task
@@ -211,6 +256,111 @@ def create_app(settings: GatewaySettings | None = None) -> FastAPI:
     @app.get("/health")
     async def health_check() -> dict[str, str]:
         return {"status": "ok", "service": "gateway"}
+
+    # ── System Metrics & Phase Transitions (Item 3) ──────────────────────
+    @app.post("/v1/system/mark-steady")
+    async def mark_steady() -> dict[str, str]:
+        """Mark steady-state streaming phase across all gateway workers."""
+        if hasattr(app.state, "lag_monitor"):
+            app.state.lag_monitor.mark_steady()
+        if hasattr(app.state, "redis"):
+            with contextlib.suppress(Exception):
+                await app.state.redis.set("mm:system:mark_steady", "1", ex=3600)
+        return {"status": "ok", "state": "steady"}
+
+    @app.get("/v1/system/metrics")
+    async def get_system_metrics() -> dict[str, Any]:
+        """Aggregate event-loop lag, JWKS hit rate, JWT verify, and Redis times."""
+        from .lag_monitor import compute_percentiles
+
+        pid = os.getpid()
+        lag_stats = app.state.lag_monitor.get_stats() if hasattr(app.state, "lag_monitor") else {}
+        auth_stats = (
+            app.state.authenticator.get_stats() if hasattr(app.state, "authenticator") else {}
+        )
+        session_stats = (
+            app.state.session_manager.get_stats() if hasattr(app.state, "session_manager") else {}
+        )
+
+        cur_data = {
+            "pid": pid,
+            "lag": lag_stats,
+            "auth": auth_stats,
+            "session": session_stats,
+            "lag_setup_samples": (
+                app.state.lag_monitor.setup_lags_ms[-1000:]
+                if hasattr(app.state, "lag_monitor")
+                else []
+            ),
+            "lag_steady_samples": (
+                app.state.lag_monitor.steady_lags_ms[-1000:]
+                if hasattr(app.state, "lag_monitor")
+                else []
+            ),
+            "warm_jwt_samples": (
+                app.state.authenticator.warm_jwt_times_ms[-1000:]
+                if hasattr(app.state, "authenticator")
+                else []
+            ),
+            "redis_samples": (
+                app.state.session_manager.create_meeting_times_ms[-1000:]
+                if hasattr(app.state, "session_manager")
+                else []
+            ),
+        }
+        if hasattr(app.state, "redis"):
+            with contextlib.suppress(Exception):
+                await app.state.redis.set(
+                    f"mm:system:worker_metrics:{pid}", json.dumps(cur_data), ex=120
+                )
+
+        all_workers: list[dict[str, Any]] = []
+        if hasattr(app.state, "redis"):
+            try:
+                keys = await app.state.redis.keys("mm:system:worker_metrics:*")
+                for k in keys:
+                    raw = await app.state.redis.get(k)
+                    if raw:
+                        all_workers.append(json.loads(raw))
+            except Exception as e:
+                logger.warning("Error fetching worker metrics from Redis: %s", e)
+
+        if not all_workers:
+            all_workers = [cur_data]
+
+        all_setup_lags: list[float] = []
+        all_steady_lags: list[float] = []
+        all_warm_jwt: list[float] = []
+        all_redis_times: list[float] = []
+        total_hits = 0
+        total_misses = 0
+
+        for w in all_workers:
+            all_setup_lags.extend(w.get("lag_setup_samples", []))
+            all_steady_lags.extend(w.get("lag_steady_samples", []))
+            all_warm_jwt.extend(w.get("warm_jwt_samples", []))
+            all_redis_times.extend(w.get("redis_samples", []))
+            auth_st = w.get("auth", {})
+            total_hits += auth_st.get("cache_hits", 0)
+            total_misses += auth_st.get("cache_misses", 0)
+
+        total_reqs = total_hits + total_misses
+        hit_rate = round((total_hits / total_reqs) * 100.0, 2) if total_reqs > 0 else 100.0
+
+        return {
+            "workers_reporting": len(all_workers),
+            "lag": {
+                "setup": compute_percentiles(all_setup_lags),
+                "steady": compute_percentiles(all_steady_lags),
+            },
+            "jwks": {
+                "hits": total_hits,
+                "misses": total_misses,
+                "hit_rate_pct": hit_rate,
+            },
+            "warm_jwt_ms": compute_percentiles(all_warm_jwt),
+            "redis_create_meeting_ms": compute_percentiles(all_redis_times),
+        }
 
     # ── Server-Issued Meeting Lifecycle (K6) ─────────────────────────────
     @app.post("/v1/meetings", status_code=status.HTTP_201_CREATED)

@@ -24,6 +24,7 @@ import redis.asyncio as redis
 from meetmind_schemas.events import OUTBOUND_EVENT_TYPES, ErrorCode, ErrorFrame
 
 from .keys import (
+    ACTIVE_MEETINGS_SET_KEY,
     LIFECYCLE_STREAM_KEY,
     audio_stream_key,
     events_stream_key,
@@ -45,7 +46,12 @@ async def publish_lifecycle_event(
     meeting_id: str,
     maxlen: int = 10_000,
 ) -> str:
-    """Publish a lifecycle event to mm:system:lifecycle (approximate maxlen 10,000) (P0-2)."""
+    """Publish a lifecycle event to mm:system:lifecycle (approximate maxlen 10,000) (P0-2).
+
+    Maintains mm:system:active_meetings set:
+    - SADD on 'meeting_active' (including reconnects)
+    - SREM on 'meeting_ended' or 'meeting_abandoned'
+    """
     ts_ms = str(int(time.time() * 1000))
     fields = {
         "event": str(event),
@@ -59,6 +65,14 @@ async def publish_lifecycle_event(
         maxlen=maxlen,
         approximate=True,
     )
+
+    # Maintain system-wide active meetings set
+    member = f"{tenant_id}|{meeting_id}"
+    if event == "meeting_active":
+        await redis_client.sadd(ACTIVE_MEETINGS_SET_KEY, member)
+    elif event in ("meeting_ended", "meeting_abandoned"):
+        await redis_client.srem(ACTIVE_MEETINGS_SET_KEY, member)
+
     return entry_id.decode("utf-8") if isinstance(entry_id, bytes) else str(entry_id)
 
 

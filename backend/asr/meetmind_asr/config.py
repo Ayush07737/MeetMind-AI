@@ -35,7 +35,9 @@ class AsrSettings(BaseSettings):
     asr_buffer_max_seconds: int = Field(default=30, alias="ASR_BUFFER_MAX_SECONDS")
     asr_tenant_config_path: str | None = Field(default=None, alias="ASR_TENANT_CONFIG_PATH")
     asr_health_port: int = Field(default=8080, alias="ASR_HEALTH_PORT")
-    asr_lifecycle_idle_ms: int = Field(default=10000, alias="ASR_LIFECYCLE_IDLE_MS")
+    asr_worker_id: str | None = Field(default=None, alias="ASR_WORKER_ID")
+    asr_reconcile_interval_ms: int = Field(default=2000, alias="ASR_RECONCILE_INTERVAL_MS")
+    asr_owner_lease_ttl_ms: int = Field(default=15000, alias="ASR_OWNER_LEASE_TTL_MS")
     asr_audio_idle_ms: int = Field(default=5000, alias="ASR_AUDIO_IDLE_MS")
 
     @model_validator(mode="after")

@@ -23,7 +23,7 @@ logger = logging.getLogger("meetmind_asr")
 
 async def _run() -> None:
     settings = get_settings()
-    service = AsrService(settings)
+    service = AsrService(settings, worker_id=settings.asr_worker_id)
 
     stop_event = asyncio.Event()
 
