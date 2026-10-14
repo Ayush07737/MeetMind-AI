@@ -14,7 +14,7 @@ import uuid
 from typing import Any
 
 import redis.asyncio as aioredis
-from meetmind_schemas.keys import asr_owner_key
+from meetmind_schemas.keys import ACTIVE_MEETINGS_SET_KEY, asr_owner_key
 from meetmind_security.tenant import configure_tenant_router
 
 from .audit import AsrAuditor
@@ -31,10 +31,10 @@ LIFECYCLE_STREAM = "mm:system:lifecycle"
 LEASE_LUA_SCRIPT = """
 local key = KEYS[1]
 local worker_id = ARGV[1]
-local ttl = tonumber(ARGV[2])
+local ttl_ms = tonumber(ARGV[2])
 local current = redis.call('GET', key)
 if current == false or current == worker_id then
-    redis.call('SET', key, worker_id, 'EX', ttl)
+    redis.call('SET', key, worker_id, 'PX', ttl_ms)
     return 1
 else
     return 0
@@ -63,6 +63,7 @@ class AsrService:
         self._lease_tasks: dict[str, asyncio.Task[None]] = {}
         self._is_running = False
         self._discovery_task: asyncio.Task[None] | None = None
+        self._reconcile_task: asyncio.Task[None] | None = None
 
     async def start(self) -> None:
         """Start ASR worker daemon."""
@@ -89,6 +90,7 @@ class AsrService:
         await self._ensure_lifecycle_group()
 
         self._discovery_task = asyncio.create_task(self._lifecycle_discovery_loop())
+        self._reconcile_task = asyncio.create_task(self._reconcile_loop())
         logger.info("MeetMind ASR Service started with worker_id=%s", self.worker_id)
 
     async def _ensure_lifecycle_group(self) -> None:
@@ -99,14 +101,14 @@ class AsrService:
                 logger.warning("Error creating asr group on %s: %s", LIFECYCLE_STREAM, exc)
 
     async def _acquire_lease(self, tenant_id: str, meeting_id: str) -> bool:
-        """Acquire or verify ownership lease in Redis."""
+        """Acquire or verify ownership lease in Redis using configured TTL (ms)."""
         l_key = asr_owner_key(tenant_id, meeting_id)
         res = await self.redis.eval(
             LEASE_LUA_SCRIPT,
             1,
             l_key,
             self.worker_id,
-            15,  # 15s TTL
+            self.settings.asr_owner_lease_ttl_ms,
         )
         return bool(res == 1)
 
@@ -121,9 +123,10 @@ class AsrService:
                 await self.redis.delete(l_key)
 
     async def _run_lease_heartbeat(self, tenant_id: str, meeting_id: str) -> None:
-        """Refresh lease every 5s; abort pipeline if lease lost."""
+        """Refresh lease periodically; abort pipeline if lease lost."""
+        interval = max(0.2, (self.settings.asr_owner_lease_ttl_ms / 3000.0))
         while self._is_running and meeting_id in self._active_pipelines:
-            await asyncio.sleep(5.0)
+            await asyncio.sleep(interval)
             if not self._is_running or meeting_id not in self._active_pipelines:
                 break
             acquired = await self._acquire_lease(tenant_id, meeting_id)
@@ -138,26 +141,113 @@ class AsrService:
                     asyncio.create_task(pipeline.stop(is_ended=False))
                 break
 
-    async def _lifecycle_discovery_loop(self) -> None:
-        """Consume mm:system:lifecycle to discover active/ended meetings."""
+    async def _start_pipeline(
+        self,
+        tenant: str,
+        meeting_id: str,
+        lifecycle_entry_id: str | None = None,
+    ) -> None:
+        """Instantiate and run MeetingPipeline."""
+        if meeting_id in self._active_pipelines:
+            return
+
+        t_cfg = await self.tenant_config_provider.get_config(tenant)
+        provider_kwargs: dict[str, Any] = {
+            "redis_client": self.redis,
+        }
+        if self.settings.asr_provider == "deepgram" and self.settings.deepgram_api_key:
+            provider_kwargs.update(
+                {
+                    "api_key": self.settings.deepgram_api_key,
+                    "base_url": self.settings.deepgram_base_url,
+                    "mip_opt_out": True,
+                }
+            )
+
+        prov = get_provider(self.settings.asr_provider, **provider_kwargs)
+        pipeline = MeetingPipeline(
+            tenant_id=tenant,
+            meeting_id=meeting_id,
+            worker_id=self.worker_id,
+            redis_client=self.redis,
+            provider=prov,
+            tenant_config=t_cfg,
+            settings=self.settings,
+            metrics=self.metrics,
+            auditor=self.auditor,
+        )
+        if lifecycle_entry_id:
+            pipeline._lifecycle_entry_id = lifecycle_entry_id
+
+        self._active_pipelines[meeting_id] = pipeline
+        self._lease_tasks[meeting_id] = asyncio.create_task(
+            self._run_lease_heartbeat(tenant, meeting_id)
+        )
+
+        await pipeline.start()
+        logger.info(
+            "Worker %s successfully started pipeline for %s/%s",
+            self.worker_id,
+            tenant,
+            meeting_id,
+        )
+
+    async def _reconcile_loop(self) -> None:
+        """Periodic reconciler checking mm:system:active_meetings for unowned meetings."""
+        interval = max(0.2, self.settings.asr_reconcile_interval_ms / 1000.0)
         while self._is_running:
             try:
-                # 1. Periodic autoclaim for pending entries idle > asr_lifecycle_idle_ms
-                # (reclaims crashed worker meetings)
-                with contextlib.suppress(Exception):
-                    claimed = await self.redis.xautoclaim(
-                        LIFECYCLE_STREAM,
-                        "asr",
-                        self.worker_id,
-                        min_idle_time=self.settings.asr_lifecycle_idle_ms,
-                        start_id="0-0",
-                        count=10,
-                    )
-                    if claimed and len(claimed) >= 2 and claimed[1]:
-                        for entry_id, fields in claimed[1]:
-                            await self._handle_lifecycle_entry(entry_id, fields)
+                await asyncio.sleep(interval)
+                if not self._is_running:
+                    break
 
-                # 2. Read new lifecycle events
+                if len(self._active_pipelines) >= self.settings.asr_max_meetings_per_worker:
+                    continue
+
+                members = await self.redis.smembers(ACTIVE_MEETINGS_SET_KEY)
+                if not members:
+                    continue
+
+                for m_raw in members:
+                    if len(self._active_pipelines) >= self.settings.asr_max_meetings_per_worker:
+                        break
+
+                    m_str = m_raw.decode("utf-8") if isinstance(m_raw, bytes) else str(m_raw)
+                    if "|" not in m_str:
+                        continue
+                    tenant, meeting_id = m_str.split("|", 1)
+
+                    if meeting_id in self._active_pipelines:
+                        continue
+
+                    # Check if live lease exists in Redis
+                    l_key = asr_owner_key(tenant, meeting_id)
+                    current_owner = await self.redis.get(l_key)
+                    if current_owner is not None:
+                        continue
+
+                    # No live lease found -> attempt claim via Lua CAS
+                    acquired = await self._acquire_lease(tenant, meeting_id)
+                    if acquired:
+                        logger.info(
+                            "Reconciler: worker %s acquired unowned meeting %s/%s",
+                            self.worker_id,
+                            tenant,
+                            meeting_id,
+                        )
+                        await self._start_pipeline(tenant, meeting_id)
+
+            except asyncio.CancelledError:
+                break
+            except Exception as exc:
+                if self._is_running:
+                    logger.warning("Reconciler loop error: %s", exc)
+                    await asyncio.sleep(0.5)
+
+    async def _lifecycle_discovery_loop(self) -> None:
+        """Consume mm:system:lifecycle to discover active/ended meetings (fast path)."""
+        while self._is_running:
+            try:
                 entries = await self.redis.xreadgroup(
                     "asr",
                     self.worker_id,
@@ -209,42 +299,13 @@ class AsrService:
                 await self.redis.xack(LIFECYCLE_STREAM, "asr", eid_str)
                 return
 
-            # Ownership secured -> start pipeline
-            t_cfg = await self.tenant_config_provider.get_config(tenant)
-            provider_kwargs: dict[str, Any] = {}
-            if self.settings.asr_provider == "deepgram" and self.settings.deepgram_api_key:
-                provider_kwargs = {
-                    "api_key": self.settings.deepgram_api_key,
-                    "base_url": self.settings.deepgram_base_url,
-                    "mip_opt_out": True,
-                }
-
-            prov = get_provider(self.settings.asr_provider, **provider_kwargs)
-            pipeline = MeetingPipeline(
-                tenant_id=tenant,
-                meeting_id=meeting_id,
-                worker_id=self.worker_id,
-                redis_client=self.redis,
-                provider=prov,
-                tenant_config=t_cfg,
-                settings=self.settings,
-                metrics=self.metrics,
-                auditor=self.auditor,
-            )
-            pipeline._lifecycle_entry_id = eid_str
-
-            self._active_pipelines[meeting_id] = pipeline
-            self._lease_tasks[meeting_id] = asyncio.create_task(
-                self._run_lease_heartbeat(tenant, meeting_id)
-            )
-
-            await pipeline.start()
+            # Ownership secured -> ack lifecycle entry and start pipeline
+            await self.redis.xack(LIFECYCLE_STREAM, "asr", eid_str)
+            await self._start_pipeline(tenant, meeting_id, lifecycle_entry_id=eid_str)
 
         elif event in ("meeting_ended", "meeting_abandoned"):
-            # Acknowledge event
             await self.redis.xack(LIFECYCLE_STREAM, "asr", eid_str)
 
-            # Shutdown pipeline if running on this worker
             if meeting_id in self._active_pipelines:
                 lease_task = self._lease_tasks.pop(meeting_id, None)
                 if lease_task:
@@ -252,9 +313,6 @@ class AsrService:
 
                 pipeline = self._active_pipelines.pop(meeting_id)
                 await pipeline.stop(is_ended=True)
-                if hasattr(pipeline, "_lifecycle_entry_id") and pipeline._lifecycle_entry_id:
-                    with contextlib.suppress(Exception):
-                        await self.redis.xack(LIFECYCLE_STREAM, "asr", pipeline._lifecycle_entry_id)
                 await self._release_lease(tenant, meeting_id)
 
     async def stop(self) -> None:
@@ -262,6 +320,8 @@ class AsrService:
         self._is_running = False
         if self._discovery_task:
             self._discovery_task.cancel()
+        if self._reconcile_task:
+            self._reconcile_task.cancel()
 
         for lt in self._lease_tasks.values():
             lt.cancel()

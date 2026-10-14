@@ -19,6 +19,7 @@ KEY_SEGMENT_PATTERN = re.compile(r"^[A-Za-z0-9_-]{1,64}$")
 
 LIFECYCLE_STREAM_KEY = "mm:system:lifecycle"
 JANITOR_LEASE_KEY = "mm:global:janitor:lease"
+ACTIVE_MEETINGS_SET_KEY = "mm:system:active_meetings"
 
 
 def validate_tenant_segment(tenant: str) -> str:
@@ -140,3 +141,8 @@ def lifecycle_stream_key() -> str:
 def janitor_lock_key() -> str:
     """Janitor election lock key: mm:global:janitor:lease."""
     return JANITOR_LEASE_KEY
+
+
+def active_meetings_set_key() -> str:
+    """System-wide set of active meetings: mm:system:active_meetings."""
+    return ACTIVE_MEETINGS_SET_KEY

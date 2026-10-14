@@ -10,6 +10,7 @@ Deterministic test provider with:
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import json
 import os
 import time
@@ -46,9 +47,11 @@ class StubProvider(ASRProvider):
         self,
         fault_config: StubFaultConfig | None = None,
         scripted_phrases: list[str] | None = None,
+        redis_client: Any | None = None,
         **kwargs: Any,
     ) -> None:
         self._fault_config = fault_config or StubFaultConfig()
+        self._redis_client = redis_client
         self._load_env_faults()
 
         self._scripted_phrases = scripted_phrases or [
@@ -123,6 +126,13 @@ class StubProvider(ASRProvider):
         self.received_chunks.append(chunk)
         self._chunk_count += 1
         self._chunk_buffer.append(chunk)
+
+        if self.session and self._redis_client:
+            with contextlib.suppress(Exception):
+                s_key = f"mm:{self.session.tenant_id}:stub_seqs:{self.session.meeting_id}"
+                l_key = f"mm:{self.session.tenant_id}:stub_seqs_list:{self.session.meeting_id}"
+                await self._redis_client.sadd(s_key, str(chunk.client_seq))
+                await self._redis_client.rpush(l_key, str(chunk.client_seq))
 
         # Check error fault injection
         if (

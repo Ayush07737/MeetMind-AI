@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import json
 import logging
+import time
 import uuid
 from datetime import UTC, datetime
 from typing import Any
@@ -75,6 +76,7 @@ class SessionManager:
 
     def __init__(self, redis_client: redis.Redis) -> None:
         self._redis = redis_client
+        self.create_meeting_times_ms: list[float] = []
 
     async def create_meeting(
         self,
@@ -101,11 +103,14 @@ class SessionManager:
         if attendees is not None:
             mapping["attendees"] = json.dumps(attendees)
 
+        t0 = time.perf_counter()
         await self._redis.hset(
             skey,
             mapping=mapping,
         )
         await self._redis.expire(skey, 86400)
+        self.create_meeting_times_ms.append((time.perf_counter() - t0) * 1000)
+
         res: dict[str, Any] = {
             "meeting_id": mid,
             "tenant_id": tenant_id,
@@ -118,6 +123,14 @@ class SessionManager:
         if attendees is not None:
             res["attendees"] = attendees
         return res
+
+    def get_stats(self) -> dict[str, Any]:
+        """Return Redis create_meeting timing statistics."""
+        from .lag_monitor import compute_percentiles
+
+        return {
+            "create_meeting_ms": compute_percentiles(self.create_meeting_times_ms),
+        }
 
     async def get_meeting(self, tenant_id: str, meeting_id: str) -> dict[str, str] | None:
         """Lookup an existing meeting within tenant scope (K6)."""
