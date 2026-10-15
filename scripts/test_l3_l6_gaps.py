@@ -325,6 +325,7 @@ async def run_429_retry_backoff() -> None:
     )
 
     t_start = time.time()
+
     # Test retry behaviour over 2.5 seconds
     async def try_open_repeatedly():
         backoffs = [0.0, 0.25, 0.5, 1.0, 2.0]
@@ -345,7 +346,7 @@ async def run_429_retry_backoff() -> None:
     print(f"Total Connection Attempts:     {total_attempts} across 2.5s window")
     if len(connection_attempts) >= 2:
         intervals = [
-            f"{(connection_attempts[i+1] - connection_attempts[i])*1000:.1f}ms"
+            f"{(connection_attempts[i + 1] - connection_attempts[i]) * 1000:.1f}ms"
             for i in range(len(connection_attempts) - 1)
         ]
         print(f"Retry Intervals:               {', '.join(intervals)}")
@@ -385,6 +386,7 @@ async def stream_audio_for_wer(
     async with websockets.connect(
         url, additional_headers=headers, family=socket.AF_INET, open_timeout=15.0
     ) as ws:
+
         async def reader():
             try:
                 async for raw in ws:

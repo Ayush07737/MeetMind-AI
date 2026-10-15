@@ -475,11 +475,13 @@ class MeetingPipeline:
                 with contextlib.suppress(Exception):
                     await self.redis.rpush(
                         f"mm:{self.tenant_id}:asr_reconnects:{self.meeting_id}",
-                        json.dumps({
-                            "reaccept_ms": dur_s * 1000.0,
-                            "t_disconnect": t_disconnect,
-                            "t_recovery": recovery_time,
-                        }),
+                        json.dumps(
+                            {
+                                "reaccept_ms": dur_s * 1000.0,
+                                "t_disconnect": t_disconnect,
+                                "t_recovery": recovery_time,
+                            }
+                        ),
                     )
 
                 if degraded_event_sent:

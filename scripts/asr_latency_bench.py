@@ -398,18 +398,20 @@ async def run_benchmark(
     csv_path.parent.mkdir(parents=True, exist_ok=True)
     with open(csv_path, "w", newline="", encoding="utf-8") as f:
         writer = csv.writer(f)
-        writer.writerow([
-            "timestamp_iso",
-            "time_s",
-            "pid",
-            "cmdline",
-            "rss_mb",
-            "event_loop_lag_ms",
-            "queue_depth_reconnect",
-            "queue_depth_pending_acks",
-            "dedupe_lru_size",
-            "redis_meeting_keys_mem_bytes",
-        ])
+        writer.writerow(
+            [
+                "timestamp_iso",
+                "time_s",
+                "pid",
+                "cmdline",
+                "rss_mb",
+                "event_loop_lag_ms",
+                "queue_depth_reconnect",
+                "queue_depth_pending_acks",
+                "dedupe_lru_size",
+                "redis_meeting_keys_mem_bytes",
+            ]
+        )
 
     t_start = time.perf_counter()
     next_sample_time = t_start + 10.0
@@ -457,9 +459,7 @@ async def run_benchmark(
             if now >= next_sample_time:
                 time_s = int(now - t_start)
                 rss_mb = (
-                    round(asr_psutil.memory_info().rss / (1024 * 1024), 2)
-                    if asr_psutil
-                    else 0.0
+                    round(asr_psutil.memory_info().rss / (1024 * 1024), 2) if asr_psutil else 0.0
                 )
 
                 # Query health endpoint for internal ASR metrics
@@ -503,18 +503,20 @@ async def run_benchmark(
                 iso_now = datetime.now(UTC).isoformat()
                 with open(csv_path, "a", newline="", encoding="utf-8") as f:
                     writer = csv.writer(f)
-                    writer.writerow([
-                        iso_now,
-                        time_s,
-                        real_pid,
-                        real_cmd,
-                        rss_mb,
-                        loop_lag_ms,
-                        rec_depth,
-                        ack_depth,
-                        dedupe_size,
-                        redis_mem_bytes,
-                    ])
+                    writer.writerow(
+                        [
+                            iso_now,
+                            time_s,
+                            real_pid,
+                            real_cmd,
+                            rss_mb,
+                            loop_lag_ms,
+                            rec_depth,
+                            ack_depth,
+                            dedupe_size,
+                            redis_mem_bytes,
+                        ]
+                    )
 
                 sample = {
                     "time_s": time_s,
@@ -666,7 +668,6 @@ async def run_benchmark(
     print("     whereas the actual Python runtime with its dependencies (FastAPI, Redis, etc.)")
     print("     operates in the 45-65 MB RSS range.")
     print("=" * 80)
-
 
 
 if __name__ == "__main__":

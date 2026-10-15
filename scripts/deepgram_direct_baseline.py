@@ -42,20 +42,10 @@ for p in (
 from ml.asr_eval.wer import calculate_wer  # noqa: E402
 
 AUDIO_PATH = (
-    REPO_ROOT
-    / "tests"
-    / "fixtures"
-    / "audio"
-    / "generated"
-    / "30s_two_speaker_overlap_mono.wav"
+    REPO_ROOT / "tests" / "fixtures" / "audio" / "generated" / "30s_two_speaker_overlap_mono.wav"
 )
 TXT_PATH = (
-    REPO_ROOT
-    / "tests"
-    / "fixtures"
-    / "audio"
-    / "generated"
-    / "30s_two_speaker_overlap_mono.txt"
+    REPO_ROOT / "tests" / "fixtures" / "audio" / "generated" / "30s_two_speaker_overlap_mono.txt"
 )
 KT_PATH = (
     REPO_ROOT

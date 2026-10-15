@@ -261,7 +261,7 @@ async def test_complete_connection_phases(api_key: str, samples: int = 5) -> Non
         total_times.append(t_total)
 
         print(
-            f"  [Sample {idx+1}] DNS: {t_dns:6.2f}ms | TCP: {t_tcp:6.2f}ms | "
+            f"  [Sample {idx + 1}] DNS: {t_dns:6.2f}ms | TCP: {t_tcp:6.2f}ms | "
             f"TLS: {t_tls:6.2f}ms | WS Connect: {t_ws:6.2f}ms | Total: {t_total:6.2f}ms"
         )
         await asyncio.sleep(0.5)

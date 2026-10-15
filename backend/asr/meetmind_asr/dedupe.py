@@ -76,9 +76,7 @@ class Deduplicator:
                 if (
                     norm_candidate in existing.normalized_text
                     or existing.normalized_text in norm_candidate
-                ) and (
-                    overlap_dur >= 0.5 * min(cand_dur, exist_dur) or overlap_dur >= 500
-                ):
+                ) and (overlap_dur >= 0.5 * min(cand_dur, exist_dur) or overlap_dur >= 500):
                     return True
 
                 w_cand = set(norm_candidate.split())

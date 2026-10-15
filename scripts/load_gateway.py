@@ -875,9 +875,7 @@ async def run_load_benchmark(
         f"   Client Loop Lag: P50={c_lag['p50']}ms | P95={c_lag['p95']}ms "
         f"| P99={c_lag['p99']}ms | Max={c_lag['max']}ms"
     )
-    print(
-        f"   Client GC Pauses: Count={gc_cnt} | Max={gc_max_ms:.2f}ms | Total={gc_tot_ms:.2f}ms"
-    )
+    print(f"   Client GC Pauses: Count={gc_cnt} | Max={gc_max_ms:.2f}ms | Total={gc_tot_ms:.2f}ms")
     print("=" * 80)
 
     if all_errors:

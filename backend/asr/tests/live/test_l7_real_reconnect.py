@@ -138,11 +138,7 @@ async def _stream_with_drops(
                     )
 
                 # Trigger provider outage
-                if (
-                    outage_time_s is not None
-                    and not outage_triggered
-                    and elapsed >= outage_time_s
-                ):
+                if outage_time_s is not None and not outage_triggered and elapsed >= outage_time_s:
                     outage_triggered = True
                     print(
                         f"\n[FAULT INJECTION] Simulating {outage_duration_s:.1f}s outage at "
@@ -189,9 +185,7 @@ async def _stream_with_drops(
                 final_texts.append(f_payload.text)
 
     # Fetch reconnect events
-    raw_reconnects = await real_redis.lrange(
-        f"mm:{tenant_id}:asr_reconnects:{meeting_id}", 0, -1
-    )
+    raw_reconnects = await real_redis.lrange(f"mm:{tenant_id}:asr_reconnects:{meeting_id}", 0, -1)
     reconnect_ms_list: list[float] = []
     for r in raw_reconnects:
         r_str = r.decode() if isinstance(r, bytes) else r

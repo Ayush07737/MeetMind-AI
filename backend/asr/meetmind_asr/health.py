@@ -229,4 +229,3 @@ class HealthServer:
             writer.close()
             with contextlib.suppress(Exception):
                 await writer.wait_closed()
-

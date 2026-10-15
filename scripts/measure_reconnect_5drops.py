@@ -296,12 +296,14 @@ async def run_5_drop_measurement() -> None:
 
                 measured_drop_to_accept_ms = (time.perf_counter() - t_drop) * 1000.0
                 final_ms = reconn_dur_ms if reconn_dur_ms > 0 else measured_drop_to_accept_ms
-                reconnect_results.append({
-                    "drop_num": drop_num,
-                    "seq": chunk_idx,
-                    "drop_to_reaccept_ms": final_ms,
-                    "target_met": final_ms <= 2000.0,
-                })
+                reconnect_results.append(
+                    {
+                        "drop_num": drop_num,
+                        "seq": chunk_idx,
+                        "drop_to_reaccept_ms": final_ms,
+                        "target_met": final_ms <= 2000.0,
+                    }
+                )
                 print(
                     f"  [DROP #{drop_num} RESULT] Drop-to-reaccept: {final_ms:.1f}ms "
                     f"(Target <= 2000ms: {final_ms <= 2000.0})"
@@ -357,7 +359,6 @@ async def run_5_drop_measurement() -> None:
         print("Observation: Reconnect starts immediately (0ms initial delay) with forced IPv4.")
         print("All drops successfully reconnected and resumed chunk acceptance under 2.0s.")
     print("=" * 80)
-
 
 
 if __name__ == "__main__":

@@ -64,25 +64,29 @@ async def test_b12_worker_starts_before_lifecycle_stream_and_uses_fastpath(
 
         # 1. meeting_start transitions to CONSENT_PENDING
         await ws_ingest.send(
-            json.dumps({
-                "type": "control",
-                "action": "meeting_start",
-                "adapter_type": "chrome_extension",
-            })
+            json.dumps(
+                {
+                    "type": "control",
+                    "action": "meeting_start",
+                    "adapter_type": "chrome_extension",
+                }
+            )
         )
         assert (await recv_ack())["status"] == "accepted"
 
         # 2. consent_confirmed activates meeting and publishes meeting_active to lifecycle stream
         await ws_ingest.send(
-            json.dumps({
-                "type": "control",
-                "action": "consent_confirmed",
-                "consent_type": "audio_capture",
-                "external_participants": False,
-                "jurisdiction_hint": "US",
-                "consent_text_version": "v1.0",
-                "client_version": "1.0.0",
-            })
+            json.dumps(
+                {
+                    "type": "control",
+                    "action": "consent_confirmed",
+                    "consent_type": "audio_capture",
+                    "external_participants": False,
+                    "jurisdiction_hint": "US",
+                    "consent_text_version": "v1.0",
+                    "client_version": "1.0.0",
+                }
+            )
         )
         assert (await recv_ack())["status"] == "accepted"
         t_start = asyncio.get_running_loop().time()
