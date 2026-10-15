@@ -11,6 +11,7 @@
     "meeting_id": "mtg_wpa_001",
     "tenant_id": "tenant_wpa",
     "ts_ms": 1712839200000,
+    "trace_id": "0123456789abcdef0123456789abcdef",
     "payload": {
       "utterance_id": "81e90e7e6711da564dc7dffa",
       "speaker_id": "spk_0",

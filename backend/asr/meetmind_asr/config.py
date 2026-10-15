@@ -39,9 +39,14 @@ class AsrSettings(BaseSettings):
     asr_reconcile_interval_ms: int = Field(default=2000, alias="ASR_RECONCILE_INTERVAL_MS")
     asr_owner_lease_ttl_ms: int = Field(default=15000, alias="ASR_OWNER_LEASE_TTL_MS")
     asr_audio_idle_ms: int = Field(default=5000, alias="ASR_AUDIO_IDLE_MS")
+    asr_stub_replay_jitter_ms: int = Field(default=0, alias="ASR_STUB_REPLAY_JITTER_MS")
+    asr_test_hooks: bool = Field(default=False, alias="ASR_TEST_HOOKS")
 
     @model_validator(mode="after")
     def validate_provider_requirements(self) -> AsrSettings:
+        is_prod = self.app_env.lower() in ("prod", "production")
+        if is_prod and self.asr_test_hooks:
+            raise ValueError("ASR_TEST_HOOKS is forbidden in production environments")
         if self.asr_provider == "deepgram" and (
             not self.deepgram_api_key or not self.deepgram_api_key.get_secret_value().strip()
         ):

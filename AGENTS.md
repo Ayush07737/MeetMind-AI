@@ -89,9 +89,11 @@ Every service that will eventually need tenant isolation **must** route through 
 - **Package**: `backend/asr/meetmind_asr` (run with `uv run python -m meetmind_asr`).
 - **Contract Isolation**: Never import from `meetmind_gateway`. All shared schemas live in `meetmind_schemas`.
 - **Provider Switching**: Swapping providers is controlled strictly by `ASR_PROVIDER` (`deepgram|stub`) and touches only `config.py` and `providers/`.
-- **Deepgram**: Nova-3 streaming WebSocket, `mip_opt_out=true` by default, repeated `keyterm` query parameters (max 100).
+- **Deepgram**: Nova-3 streaming WebSocket, `mip_opt_out=true` by default, repeated `keyterm` query parameters (max 100). Verified live against Deepgram Cloud (Session D2).
+- **Audio Channels**: Supports `channels=1` (mono diarized) and `channels=2` (channel 0 = local mic mapped to `local_user_name`, channel 1 = remote audio). Monotonicity enforced per `(channel, speaker)`.
 - **v1 Codec**: Supports `codec=1` (PCM16 LE) only. `codec=2` (Opus) frames are acked and dropped with a single `transcript_service_degraded` event per meeting.
 - **Delivery & Dedupe**: At-least-once audio to provider (delayed ack replay window), effectively-once transcripts (deterministic `utterance_id` + time overlap window).
+- **Latency SLO**: Service-added pipeline overhead P50 < 10ms, P95 < 25ms. Transient WebSocket reconnect < 2.0s.
 - **Audit**: Writes `asr_session_started` and `asr_session_summary` to Neon via `meetmind_security` non-blocking queue. Raw audio and transcript text are NEVER included in audit payloads.
 
 ## Code Style

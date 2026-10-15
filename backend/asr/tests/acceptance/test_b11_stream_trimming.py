@@ -88,28 +88,31 @@ async def test_b11_audio_stream_trimming_near_replay_window(
         )
         assert (await recv_ack())["status"] == "accepted"
 
-        # Stream 60 seconds of audio: 600 chunks (100ms each)
+        # Stream 20 seconds of audio: 200 chunks (100ms each) with drift-corrected pacing
         t_base = 5_000_000
-        for seq in range(1, 601):
+        t_stream_start = asyncio.get_running_loop().time()
+        for seq in range(1, 201):
+            target_time = t_stream_start + (seq * 0.1)
+            sleep_dur = target_time - asyncio.get_running_loop().time()
+            if sleep_dur > 0:
+                await asyncio.sleep(sleep_dur)
+
             frame = make_pcm16_chunk(seq=seq, ts_ms=t_base + seq * 100)
             await ws.send(frame)
             ack = await recv_ack()
             assert ack.get("status") in ("accepted", "acked")
-            # Small pacing so chunks span real time allowing the 2000ms replay window to elapse
-            if seq % 20 == 0:
-                await asyncio.sleep(0.12)
 
         # Allow ack flush loop (runs every 200ms) to drain and trim older chunks
-        stream_len = 600
+        stream_len = 200
         for _ in range(25):
             await asyncio.sleep(0.3)
             stream_len = await real_redis.xlen(stream_key)
-            if stream_len < 60:
+            if stream_len < 50:
                 break
 
-        # 2. Assert stream length is bounded near the replay window, NOT 600 chunks
-        assert stream_len < 60, (
-            f"Expected audio stream to be trimmed near replay window (< 60), but got {stream_len}"
+        # 2. Assert stream length is bounded near the replay window, NOT 200 chunks
+        assert stream_len < 50, (
+            f"Expected audio stream to be trimmed near replay window (< 50), but got {stream_len}"
         )
 
         mem_steady_raw = await real_redis.info("memory")
@@ -132,6 +135,6 @@ async def test_b11_audio_stream_trimming_near_replay_window(
     print(f"\n[REDIS MEMORY STATS for meeting {meeting_id}]")
     print(f"  Initial Used Memory: {used_mem_initial} bytes")
     print(
-        f"  Steady Used Memory (600 chunks sent, trimmed to {stream_len}): {used_mem_steady} bytes"
+        f"  Steady Used Memory (200 chunks sent, trimmed to {stream_len}): {used_mem_steady} bytes"
     )
     print(f"  Final Used Memory (after drain): {used_mem_final} bytes")

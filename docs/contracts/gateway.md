@@ -27,12 +27,14 @@ Creates a server-issued unguessable meeting identifier bound to the caller's ten
   - `meeting_id`: Optional unguessable string. If omitted or empty, the server generates a 32-character cryptographically random unguessable ID (`uuid4().hex`).
   - `local_user_name`: Optional string, at most 100 characters.
   - `attendees`: Optional list of strings, at most 50 items, each at most 100 characters.
+  - `trace_id`: Optional 16-byte hex trace identifier. Generated automatically if omitted.
 - **Response** (`201 Created`):
   ```json
   {
     "meeting_id": "9f8b7a6c5d4e3f2a1b0c9d8e7f6a5b4c",
     "tenant_id": "tenant_abc123",
     "owner_id": "user_2xYz9...",
+    "trace_id": "0123456789abcdef0123456789abcdef",
     "status": "pending_consent",
     "created_at": "2026-10-11T09:00:00Z",
     "local_user_name": "Alice Smith",
@@ -147,6 +149,11 @@ Audio chunks must be framed with the 18-byte big-endian binary header:
 | 16     | `uint8`  | `channels`      | Channel count (1 = Mono, 2 = Stereo)                           |
 | 17     | `uint8`  | `codec`         | Audio codec (1 = PCM 16-bit LE, 2 = Opus)                      |
 | 18..N  | `bytes`  | `payload`       | Raw audio bytes (e.g. 3,200 bytes for 100ms 16kHz 16-bit mono) |
+
+#### Channel Convention & Codec Support (P0-8 / §3 Note)
+
+- **2-Channel Convention**: When `channels = 2`, Channel 0 is designated as the **local microphone** (local user audio); Channel 1 is designated as **remote/tab audio** (remote meeting participants).
+- **Codec Support**: Component #2 / v1 requires `codec = 1` (PCM 16-bit LE). `codec = 2` (Opus) frames are acknowledged and dropped with a single `transcript_service_degraded` event per meeting.
 
 ### 2.4 Server Acknowledgements
 

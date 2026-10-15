@@ -119,6 +119,7 @@ class ConnectionContext:
         self.last_acked_client_seq = 0
         self.gap_count = 0
         self.is_closed = False
+        self.trace_id: str | None = None
 
         # Idle watchdog task
         self.idle_task: asyncio.Task[None] | None = None
@@ -289,7 +290,10 @@ async def _handle_control_frame(
         )
         with contextlib.suppress(Exception):
             await ctx.stream_producer.publish_lifecycle(
-                "meeting_active", ctx.session.tenant_id, ctx.meeting_id
+                "meeting_active",
+                ctx.session.tenant_id,
+                ctx.meeting_id,
+                trace_id=ctx.trace_id,
             )
 
         # Cancel idle watchdog now that consent is active
@@ -319,7 +323,10 @@ async def _handle_control_frame(
         )
         with contextlib.suppress(Exception):
             await ctx.stream_producer.publish_lifecycle(
-                "meeting_ended", ctx.session.tenant_id, ctx.meeting_id
+                "meeting_ended",
+                ctx.session.tenant_id,
+                ctx.meeting_id,
+                trace_id=ctx.trace_id,
             )
 
         with contextlib.suppress(Exception):
@@ -424,6 +431,7 @@ async def _handle_audio_chunk(
             capture_ts_ms=capture_ts_ms,
             recv_ns=t_recv,
             gap_size=gap_size,
+            trace_id=ctx.trace_id,
         )
         t_pub = time.perf_counter_ns()
         ctx.gateway_latencies_ms.append((t_pub - t_recv) / 1_000_000.0)
@@ -893,10 +901,14 @@ async def websocket_ingest(
     await consent_gate.check_existing_consent()
 
     event_subscriber = EventSubscriber(redis_client, tenant_id=user.tenant_id)
+    existing_meeting = await session_manager.get_meeting(user.tenant_id, meeting_id)
+    trace_id = existing_meeting.get("trace_id") if existing_meeting else None
     if consent_gate.is_open:
         await session_manager.update_status(meeting_id, MeetingStatus.ACTIVE, user.tenant_id)
         with contextlib.suppress(Exception):
-            await stream_producer.publish_lifecycle("meeting_active", user.tenant_id, meeting_id)
+            await stream_producer.publish_lifecycle(
+                "meeting_active", user.tenant_id, meeting_id, trace_id=trace_id
+            )
         await event_subscriber.subscribe(
             meeting_id,
             lambda data: _forward_event(ws, data, meeting_id),
@@ -916,6 +928,7 @@ async def websocket_ingest(
         settings=settings,
         redis_client=redis_client,
     )
+    ctx.trace_id = trace_id
     if session.status == MeetingStatus.ENDED:
         ctx.state = ProtocolState.ENDED
     elif consent_gate.is_open:

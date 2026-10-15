@@ -151,6 +151,7 @@ class TestSchemaContracts:
         tf_data = raw["transcript_final"]
         tf_env = EventEnvelope.model_validate(tf_data)
         assert tf_env.event_type == "transcript_final"
+        assert tf_env.trace_id == "0123456789abcdef0123456789abcdef"
         tf_payload = TranscriptFinalPayload.model_validate(tf_env.payload)
         assert tf_payload.utterance_id == u_case["expected_utterance_id"]
         assert tf_payload.channel == 0

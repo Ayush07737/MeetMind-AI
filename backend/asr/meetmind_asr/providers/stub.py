@@ -52,6 +52,9 @@ class StubProvider(ASRProvider):
     ) -> None:
         self._fault_config = fault_config or StubFaultConfig()
         self._redis_client = redis_client
+        self._replay_jitter_ms = int(
+            kwargs.get("replay_jitter_ms", 0) or os.environ.get("ASR_STUB_REPLAY_JITTER_MS", "0")
+        )
         self._load_env_faults()
 
         self._scripted_phrases = scripted_phrases or [
@@ -197,6 +200,18 @@ class StubProvider(ASRProvider):
             end_offset = self._chunk_count * 100
             final_text = phrase
             final_ch = (self._current_text_idx % 2) if is_two_channel else 0
+
+            if self._replay_jitter_ms > 0:
+                jitter = (
+                    (self._chunk_count * 31) % (2 * self._replay_jitter_ms + 1)
+                ) - self._replay_jitter_ms
+                start_offset = max(0, start_offset + jitter)
+                end_offset = max(start_offset + 50, end_offset + jitter)
+                if (self._chunk_count // 5) % 2 == 1:
+                    w = final_text.split()
+                    if len(w) > 2:
+                        final_text = " ".join(w[1:] + [w[0]])
+
             self._current_text_idx += 1
             self._chunk_buffer.clear()
 

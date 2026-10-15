@@ -61,13 +61,36 @@ class Deduplicator:
             return False
 
         for existing in self._recent_finals_by_channel[ch]:
-            if existing.normalized_text == norm_candidate:
-                # Check for time interval overlap:
-                # [start_ms, end_ms] intersects [existing.start_ms, existing.end_ms]
-                overlap_start = max(start_ms, existing.start_ms)
-                overlap_end = min(end_ms, existing.end_ms)
-                if overlap_start < overlap_end:
+            # Time interval overlap check: candidate overlaps with existing final
+            overlap_start = max(start_ms, existing.start_ms)
+            overlap_end = min(end_ms, existing.end_ms)
+            if overlap_start < overlap_end:
+                # 1. Exact normalized text match
+                if existing.normalized_text == norm_candidate:
                     return True
+
+                # 2. Substring match or high token overlap if substantial temporal overlap
+                overlap_dur = overlap_end - overlap_start
+                cand_dur = max(1, end_ms - start_ms)
+                exist_dur = max(1, existing.end_ms - existing.start_ms)
+                if (
+                    norm_candidate in existing.normalized_text
+                    or existing.normalized_text in norm_candidate
+                ) and (
+                    overlap_dur >= 0.5 * min(cand_dur, exist_dur) or overlap_dur >= 500
+                ):
+                    return True
+
+                w_cand = set(norm_candidate.split())
+                w_exist = set(existing.normalized_text.split())
+                if w_cand and w_exist:
+                    common = w_cand & w_exist
+                    if (
+                        len(common) / len(w_cand) >= 0.75
+                        and len(common) / len(w_exist) >= 0.75
+                        and overlap_dur >= 0.5 * min(cand_dur, exist_dur)
+                    ):
+                        return True
 
         return False
 
@@ -97,6 +120,6 @@ class Deduplicator:
                 end_ms=end_ms,
             )
         )
-        # Keep recent history bounded (last 50 finals per channel)
-        if len(history) > 50:
+        # Keep recent history bounded (last 200 finals per channel for P0-3 takeover)
+        if len(history) > 200:
             history.pop(0)

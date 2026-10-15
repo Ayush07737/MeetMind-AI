@@ -417,6 +417,7 @@ export const EventEnvelopeSchema = z.object({
   meeting_id: z.string(),
   tenant_id: z.string(),
   ts_ms: z.number().int(),
+  trace_id: z.string().optional(),
   payload: z.record(z.unknown()),
 });
 export type EventEnvelope = z.infer<typeof EventEnvelopeSchema>;
