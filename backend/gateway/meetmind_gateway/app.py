@@ -186,6 +186,7 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
         except Exception as exc:
             logger.warning("Could not verify registered tenant schemas at startup: %s", exc)
         app.state.verified_schemas = verified_schemas
+        app.state.negative_schema_cache = {}
     except RuntimeError as exc:
         if "Security violation" in str(exc) or "holds illegal privilege" in str(exc):
             logger.critical("Startup refused due to database privilege violation: %s", exc)
@@ -257,10 +258,61 @@ def create_app(settings: GatewaySettings | None = None) -> FastAPI:
     async def health_check() -> dict[str, str]:
         return {"status": "ok", "service": "gateway"}
 
-    # ── System Metrics & Phase Transitions (Item 3) ──────────────────────
+    # ── System Metrics & Phase Transitions (P0-1) ────────────────────────
+    async def _check_bench_access(req: Request) -> None:
+        """P0-1: Enforce security on system benchmark endpoints.
+
+        Disabled unless GATEWAY_BENCH_ENDPOINTS=true AND environment is not production.
+        Requires admin credentials (shared secret header or Clerk admin role).
+        """
+        is_prod = settings.app_env.lower() in ("prod", "production")
+        if not settings.gateway_bench_endpoints or is_prod:
+            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Not Found")
+
+        # 1. Check shared-secret header X-Admin-Key
+        admin_header = req.headers.get("x-admin-key")
+        if (
+            settings.gateway_admin_key
+            and admin_header
+            and secrets.compare_digest(admin_header, settings.gateway_admin_key)
+        ):
+            return
+
+        # 2. Check Clerk Bearer token with admin role
+        auth_header = req.headers.get("Authorization", "")
+        if auth_header.startswith("Bearer "):
+            token = auth_header[7:].strip()
+            try:
+                user = await app.state.authenticator.authenticate(token)
+                admin_roles = set(settings.elevated_listen_roles) | {"admin", "org:admin"}
+                user_role = (
+                    getattr(user, "role", "")
+                    or getattr(user, "org_role", "")
+                    or user.claims.get("o", {}).get("rol", "")
+                )
+                if user_role and user_role in admin_roles:
+                    return
+                raise HTTPException(
+                    status_code=status.HTTP_403_FORBIDDEN,
+                    detail="Admin role required for system benchmark endpoints",
+                )
+            except HTTPException:
+                raise
+            except Exception as exc:
+                raise HTTPException(
+                    status_code=status.HTTP_401_UNAUTHORIZED,
+                    detail=f"Invalid admin credentials: {exc}",
+                ) from exc
+
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Admin credentials required for system benchmark endpoints",
+        )
+
     @app.post("/v1/system/mark-steady")
-    async def mark_steady() -> dict[str, str]:
+    async def mark_steady(request: Request) -> dict[str, str]:
         """Mark steady-state streaming phase across all gateway workers."""
+        await _check_bench_access(request)
         if hasattr(app.state, "lag_monitor"):
             app.state.lag_monitor.mark_steady()
         if hasattr(app.state, "redis"):
@@ -269,18 +321,25 @@ def create_app(settings: GatewaySettings | None = None) -> FastAPI:
         return {"status": "ok", "state": "steady"}
 
     @app.get("/v1/system/metrics")
-    async def get_system_metrics() -> dict[str, Any]:
+    async def get_system_metrics(request: Request) -> dict[str, Any]:
         """Aggregate event-loop lag, JWKS hit rate, JWT verify, and Redis times."""
+        await _check_bench_access(request)
         from .lag_monitor import compute_percentiles
 
         pid = os.getpid()
         lag_stats = app.state.lag_monitor.get_stats() if hasattr(app.state, "lag_monitor") else {}
+        import inspect
+
         auth_stats = (
             app.state.authenticator.get_stats() if hasattr(app.state, "authenticator") else {}
         )
+        if inspect.isawaitable(auth_stats):
+            auth_stats = await auth_stats
         session_stats = (
             app.state.session_manager.get_stats() if hasattr(app.state, "session_manager") else {}
         )
+        if inspect.isawaitable(session_stats):
+            session_stats = await session_stats
 
         cur_data = {
             "pid": pid,
@@ -392,9 +451,11 @@ def create_app(settings: GatewaySettings | None = None) -> FastAPI:
         t0 = time.perf_counter()
         tenant_id = user.tenant_id
 
-        # Verify tenant schema is provisioned (Item 2)
+        # Verify tenant schema is provisioned (Item 2 & P0-2)
         verified = getattr(app.state, "verified_schemas", set())
-        if verified:
+        negative_cache = getattr(app.state, "negative_schema_cache", {})
+        pool = getattr(app.state, "db_pool", None)
+        if pool:
             from meetmind_security.tenant import get_tenant_router
 
             try:
@@ -404,24 +465,36 @@ def create_app(settings: GatewaySettings | None = None) -> FastAPI:
                 schema_name = f"tenant_{tenant_id}"
 
             if schema_name not in verified:
-                pool = getattr(app.state, "db_pool", None)
-                if pool:
-                    check_sql = (
-                        "SELECT EXISTS (SELECT 1 FROM information_schema.schemata "
-                        "WHERE schema_name = $1)"
+                now_mono = time.monotonic()
+                last_failed = negative_cache.get(schema_name, 0.0)
+                if now_mono - last_failed < 10.0:
+                    err_msg = (
+                        f"Tenant schema '{schema_name}' is not provisioned. "
+                        "Provision tenant schema before creating meetings."
                     )
-                    exists = await pool.fetchval(check_sql, schema_name)
-                    if exists:
-                        verified.add(schema_name)
-                    else:
-                        err_msg = (
-                            f"Tenant schema '{schema_name}' is not provisioned. "
-                            "Provision tenant schema before creating meetings."
-                        )
-                        raise HTTPException(
-                            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
-                            detail=err_msg,
-                        )
+                    raise HTTPException(
+                        status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+                        detail=err_msg,
+                    )
+
+                check_sql = (
+                    "SELECT EXISTS (SELECT 1 FROM information_schema.schemata "
+                    "WHERE schema_name = $1)"
+                )
+                exists = await pool.fetchval(check_sql, schema_name)
+                if exists:
+                    verified.add(schema_name)
+                    negative_cache.pop(schema_name, None)
+                else:
+                    negative_cache[schema_name] = now_mono
+                    err_msg = (
+                        f"Tenant schema '{schema_name}' is not provisioned. "
+                        "Provision tenant schema before creating meetings."
+                    )
+                    raise HTTPException(
+                        status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+                        detail=err_msg,
+                    )
         t_tenant = (time.perf_counter() - t0) * 1000
 
         body: dict[str, Any] = {}
@@ -437,6 +510,7 @@ def create_app(settings: GatewaySettings | None = None) -> FastAPI:
 
         raw_mid = str(body.get("meeting_id") or "").strip()
         meeting_id = raw_mid or uuid.uuid4().hex  # 32 characters (>= 22)
+        trace_id = str(body.get("trace_id") or "").strip() or None
 
         local_user_name = body.get("local_user_name")
         if local_user_name is not None:
@@ -482,6 +556,7 @@ def create_app(settings: GatewaySettings | None = None) -> FastAPI:
             meeting_id=meeting_id,
             local_user_name=local_user_name,
             attendees=attendees,
+            trace_id=trace_id,
         )
         t_redis = (time.perf_counter() - t0) * 1000
         t_total = (time.perf_counter() - t_req_start) * 1000

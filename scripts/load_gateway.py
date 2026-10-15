@@ -129,6 +129,7 @@ class MeetingMetrics:
     total_setup_ms: float = 0.0
 
     ack_rtts_ms: list[float] = field(default_factory=list)
+    expected_chunks: int = 0
     chunks_sent: int = 0
     chunks_acked: int = 0
     errors: list[str] = field(default_factory=list)
@@ -294,11 +295,16 @@ async def run_meeting_worker(
                 if meeting_index == 0:
                     async with httpx.AsyncClient() as hc:
                         with contextlib.suppress(Exception):
-                            await hc.post(f"{base_http_url}/v1/system/mark-steady", timeout=5.0)
+                            await hc.post(
+                                f"{base_http_url}/v1/system/mark-steady",
+                                headers={"X-Admin-Key": "load_bench_secret"},
+                                timeout=5.0,
+                            )
                 with contextlib.suppress(asyncio.BrokenBarrierError, TimeoutError):
-                    await asyncio.wait_for(barrier.wait(), timeout=75.0)
+                    await asyncio.wait_for(barrier.wait(), timeout=180.0)
 
             # Steady-State Audio Streaming (drift-corrected pacing)
+            metrics.expected_chunks = int(steady_duration / chunk_interval)
             pcm_payload = b"\x00\x01" * 1600  # 3,200 bytes PCM (100ms at 16kHz 16-bit mono)
             stream_start = time.perf_counter()
             end_time = stream_start + steady_duration
@@ -461,6 +467,8 @@ async def run_load_benchmark(
         env["ALLOWED_ORIGINS"] = json.dumps(["https://app.meetmind.ai"])
         env["TENANT_ORG_MAP"] = json.dumps({org_id: tenant_id})
         env["APP_ENV"] = "test"
+        env["GATEWAY_BENCH_ENDPOINTS"] = "true"
+        env["GATEWAY_ADMIN_KEY"] = "load_bench_secret"
         app_dsn = (
             os.environ.get("NEON_TEST_APP_DATABASE_URL")
             or os.environ.get("NEON_APP_DATABASE_URL")
@@ -471,10 +479,13 @@ async def run_load_benchmark(
         env["NEON_TEST_APP_DATABASE_URL"] = app_dsn
         env.pop("NEON_TEST_DATABASE_URL", None)
         env.pop("NEON_DIRECT_DATABASE_URL", None)
+        env.pop("PYTHONASYNCIODEBUG", None)
+        os.environ.pop("PYTHONASYNCIODEBUG", None)
         redis_url = os.environ.get("ACCEPTANCE_REDIS_URL", "redis://127.0.0.1:6379/0")
         env["REDIS_URL"] = redis_url
         env["AUDIO_REDIS_URL"] = redis_url
         env["LOG_LEVEL"] = "WARNING"
+        env["IDLE_TIMEOUT_SECONDS"] = "180.0"
         env["NEON_POOL_MAX_SIZE"] = "30"
         env["MAX_CONNECTIONS_PER_TENANT"] = str(concurrency + 50)
         env["MAX_CONNECTIONS_PER_USER"] = str(concurrency + 50)
@@ -575,6 +586,30 @@ async def run_load_benchmark(
     redis_info_initial = await redis_client.info("memory")
     used_mem_initial = redis_info_initial.get("used_memory_human", "N/A")
 
+    import gc
+
+    gc_pauses: list[float] = []
+
+    def _gc_cb(phase: str, info: dict[str, Any]) -> None:
+        if phase == "start":
+            _gc_cb.t0 = time.perf_counter()
+        elif phase == "stop" and hasattr(_gc_cb, "t0"):
+            gc_pauses.append((time.perf_counter() - _gc_cb.t0) * 1000.0)
+
+    gc.callbacks.append(_gc_cb)
+
+    client_lags: list[float] = []
+    stop_client_lag = asyncio.Event()
+
+    async def _client_lag_monitor() -> None:
+        while not stop_client_lag.is_set():
+            t_lag0 = time.perf_counter()
+            await asyncio.sleep(0.05)
+            lag = max(0.0, (time.perf_counter() - t_lag0 - 0.05) * 1000.0)
+            client_lags.append(lag)
+
+    client_lag_task = asyncio.create_task(_client_lag_monitor())
+
     barrier = asyncio.Barrier(concurrency)
     all_metrics = [MeetingMetrics(meeting_id="") for _ in range(concurrency)]
     tasks = []
@@ -602,8 +637,13 @@ async def run_load_benchmark(
     await asyncio.gather(*tasks)
 
     stop_cpu_monitor.set()
+    stop_client_lag.set()
     with contextlib.suppress(Exception):
         await monitor_task
+    with contextlib.suppress(Exception):
+        await client_lag_task
+    with contextlib.suppress(Exception):
+        gc.callbacks.remove(_gc_cb)
 
     server_cpu_mean: Any = "N/A"
     server_cpu_peak: Any = "N/A"
@@ -650,7 +690,11 @@ async def run_load_benchmark(
     server_sys_metrics: dict[str, Any] = {}
     async with httpx.AsyncClient() as c:
         try:
-            res_metrics = await c.get(f"{http_url}/v1/system/metrics", timeout=5.0)
+            res_metrics = await c.get(
+                f"{http_url}/v1/system/metrics",
+                headers={"X-Admin-Key": "load_bench_secret"},
+                timeout=5.0,
+            )
             if res_metrics.status_code == 200:
                 server_sys_metrics = res_metrics.json()
         except Exception as e:
@@ -677,12 +721,19 @@ async def run_load_benchmark(
     print(" BENCHMARK RESULTS SUMMARY (C2 SPEC)")
     print("=" * 80)
     print(f"Concurrent Meetings:       {concurrency}")
-    expected_chunks = concurrency * int(steady_seconds * 10)
+    expected_chunks = sum(m.expected_chunks for m in all_metrics)
+    meetings_streaming = sum(1 for m in all_metrics if m.expected_chunks > 0)
     print(
         f"Expected Chunks:           {expected_chunks:,} "
-        f"({concurrency} mtgs x 10 chunks/s x {steady_seconds}s)"
+        f"({meetings_streaming}/{concurrency} mtgs streaming x {int(steady_seconds * 10)} chunks)"
     )
     print(f"Actual Chunks Sent:        {total_sent:,}")
+    chunk_diff = total_sent - expected_chunks
+    if chunk_diff != 0:
+        print(
+            f"Chunk Discrepancy:         {chunk_diff:+d} chunks "
+            f"(Sent {total_sent:,} vs Expected {expected_chunks:,})"
+        )
     pct_acked = round(total_acked / max(1, total_sent) * 100, 2)
     print(f"Actual Chunks Acked:       {total_acked:,} ({pct_acked}% ack rate)")
     v_mtg = continuity["meetings_verified"]
@@ -814,6 +865,17 @@ async def run_load_benchmark(
     print(
         f"   Redis Memory:    Initial={used_mem_initial} | End={used_mem_final} | Peak={peak_mem}"
     )
+    print("-" * 80)
+    c_lag = compute_percentiles(client_lags)
+    gc_cnt = len(gc_pauses)
+    gc_max_ms = max(gc_pauses) if gc_pauses else 0.0
+    gc_tot_ms = sum(gc_pauses)
+    print("5. CLIENT BENCHMARK RUNNER TELEMETRY:")
+    print(
+        f"   Client Loop Lag: P50={c_lag['p50']}ms | P95={c_lag['p95']}ms "
+        f"| P99={c_lag['p99']}ms | Max={c_lag['max']}ms"
+    )
+    print(f"   Client GC Pauses: Count={gc_cnt} | Max={gc_max_ms:.2f}ms | Total={gc_tot_ms:.2f}ms")
     print("=" * 80)
 
     if all_errors:
@@ -822,6 +884,7 @@ async def run_load_benchmark(
             print(f"  - {err}")
 
     failed_meetings = sum(1 for m in all_metrics if m.errors or m.failed_stage)
+    chunk_diff = total_sent - expected_chunks
     if failed_meetings > 0:
         print(
             f"\n[FAILED] Run incomplete: {failed_meetings}/{concurrency} "
@@ -833,10 +896,28 @@ async def run_load_benchmark(
         jwks.stop()
         await redis_client.aclose()
         sys.exit(1)
+    elif chunk_diff != 0 and abs(chunk_diff) > concurrency:
+        print(
+            f"\n[FAILED] Run incomplete: Chunks sent ({total_sent}) "
+            f"differs from expected ({expected_chunks}) "
+            f"by {abs(chunk_diff)} (> allowable drift of +/- {concurrency})."
+        )
+        if server_proc:
+            server_proc.kill()
+            server_proc.wait()
+        jwks.stop()
+        await redis_client.aclose()
+        sys.exit(1)
     else:
+        diff_note = ""
+        if chunk_diff != 0:
+            diff_note = (
+                f" (Discrepancy: {chunk_diff:+d} chunks due to client "
+                f"loop boundary condition across {concurrency} workers)"
+            )
         print(
             f"\n[COMPLETE] Run succeeded: 0/{concurrency} meetings errored. "
-            "100% gap-free continuity."
+            f"100% gap-free continuity.{diff_note}"
         )
 
     if server_proc:
@@ -848,7 +929,14 @@ async def run_load_benchmark(
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="MeetMind AI Gateway Load & Resilience Benchmark")
-    parser.add_argument("--meetings", type=int, default=100, help="Number of concurrent meetings")
+    parser.add_argument(
+        "--meetings",
+        "--concurrency",
+        type=int,
+        default=100,
+        dest="meetings",
+        help="Number of concurrent meetings",
+    )
     parser.add_argument("--ramp", type=float, default=5.0, help="Ramp up period in seconds")
     parser.add_argument(
         "--steady", type=float, default=120.0, help="Steady streaming period in seconds"

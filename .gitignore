@@ -62,3 +62,6 @@ appendonlydir/
 # ---------- Scratch / Temporary ----------
 scratch/
 logs/
+tests/fixtures/audio/generated/
+ml/asr_eval/recordings/
+.scratch_py313/

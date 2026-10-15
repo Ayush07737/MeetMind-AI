@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import json
 import logging
+import secrets
 import time
 import uuid
 from datetime import UTC, datetime
@@ -85,9 +86,11 @@ class SessionManager:
         meeting_id: str | None = None,
         local_user_name: str | None = None,
         attendees: list[str] | None = None,
+        trace_id: str | None = None,
     ) -> dict[str, Any]:
         """Create a server-issued meeting bound to tenant and owner (K6)."""
         mid = meeting_id or uuid.uuid4().hex
+        tid = trace_id or secrets.token_hex(16)
         skey = meeting_session_key(tenant_id, mid)
         now_iso = datetime.now(UTC).isoformat()
         mapping: dict[str, Any] = {
@@ -95,6 +98,7 @@ class SessionManager:
             "tenant_id": tenant_id,
             "owner_id": owner_id,
             "user_id": owner_id,
+            "trace_id": tid,
             "status": MeetingStatus.PENDING_CONSENT.value,
             "created_at": now_iso,
         }
@@ -115,6 +119,7 @@ class SessionManager:
             "meeting_id": mid,
             "tenant_id": tenant_id,
             "owner_id": owner_id,
+            "trace_id": tid,
             "status": MeetingStatus.PENDING_CONSENT.value,
             "created_at": now_iso,
         }

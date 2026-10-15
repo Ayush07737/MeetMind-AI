@@ -62,7 +62,7 @@ async def test_b2_worker_kill_and_failover(
     ingest_ticket = ingest_ticket_resp["ticket"]
     ingest_uri = f"{h.ws_url}/v1/meetings/{meeting_id}/stream?ticket={ingest_ticket}"
 
-    async with websockets.connect(ingest_uri) as ws_ingest:
+    async with websockets.connect(ingest_uri, ping_interval=None) as ws_ingest:
 
         async def recv_ack():
             while True:

@@ -45,8 +45,9 @@ async def publish_lifecycle_event(
     tenant_id: str,
     meeting_id: str,
     maxlen: int = 10_000,
+    trace_id: str | None = None,
 ) -> str:
-    """Publish a lifecycle event to mm:system:lifecycle (approximate maxlen 10,000) (P0-2).
+    """Publish a lifecycle event to mm:system:lifecycle (approximate maxlen 10,000) (P0-2, P0-6).
 
     Maintains mm:system:active_meetings set:
     - SADD on 'meeting_active' (including reconnects)
@@ -59,6 +60,8 @@ async def publish_lifecycle_event(
         "meeting_id": str(meeting_id),
         "ts_ms": ts_ms,
     }
+    if trace_id:
+        fields["trace_id"] = str(trace_id)
     entry_id = await redis_client.xadd(
         LIFECYCLE_STREAM_KEY,
         fields,
@@ -97,10 +100,11 @@ class StreamProducer:
         capture_ts_ms: int | None = None,
         recv_ns: int | None = None,
         gap_size: int = 0,
+        trace_id: str | None = None,
     ) -> str:
         """Publish an audio chunk to the meeting's audio stream.
 
-        Carries client_seq, capture_ts_ms, recv_ns, published_ns, and gap_size.
+        Carries client_seq, capture_ts_ms, recv_ns, published_ns, gap_size, and trace_id.
         """
         stream_key = audio_stream_key(tenant_id, meeting_id)
         recv_val = recv_ns if recv_ns is not None else time.perf_counter_ns()
@@ -118,6 +122,8 @@ class StreamProducer:
             "recv_ns": str(recv_val),
             "published_ns": str(published_val),
         }
+        if trace_id:
+            fields["trace_id"] = str(trace_id)
         if gap_size > 0:
             fields["gap_size"] = str(gap_size)
 
@@ -148,9 +154,12 @@ class StreamProducer:
         event: str,
         tenant_id: str,
         meeting_id: str,
+        trace_id: str | None = None,
     ) -> str:
-        """Publish a lifecycle event to mm:system:lifecycle (P0-2)."""
-        return await publish_lifecycle_event(self._redis, event, tenant_id, meeting_id)
+        """Publish a lifecycle event to mm:system:lifecycle (P0-2, P0-6)."""
+        return await publish_lifecycle_event(
+            self._redis, event, tenant_id, meeting_id, trace_id=trace_id
+        )
 
     async def publish_transcript(
         self,

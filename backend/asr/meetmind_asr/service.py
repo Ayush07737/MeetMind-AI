@@ -10,6 +10,7 @@ import asyncio
 import contextlib
 import logging
 import os
+import time
 import uuid
 from typing import Any
 
@@ -19,7 +20,7 @@ from meetmind_security.tenant import configure_tenant_router
 
 from .audit import AsrAuditor
 from .config import AsrSettings
-from .health import AsrMetrics, HealthServer
+from .health import AsrMetrics, HealthServer, init_gc_monitor
 from .pipeline import MeetingPipeline
 from .providers import get_provider
 from .tenant_config import FileTenantAsrConfigProvider
@@ -64,6 +65,7 @@ class AsrService:
         self._is_running = False
         self._discovery_task: asyncio.Task[None] | None = None
         self._reconcile_task: asyncio.Task[None] | None = None
+        self._control_task: asyncio.Task[None] | None = None
 
     async def start(self) -> None:
         """Start ASR worker daemon."""
@@ -79,11 +81,13 @@ class AsrService:
         )
 
         self.auditor.start()
+        init_gc_monitor(self.metrics)
 
         self.health_server = HealthServer(
             port=self.settings.asr_health_port,
             metrics=self.metrics,
             redis_client=self.redis,
+            service=self,
         )
         await self.health_server.start()
 
@@ -91,11 +95,14 @@ class AsrService:
 
         self._discovery_task = asyncio.create_task(self._lifecycle_discovery_loop())
         self._reconcile_task = asyncio.create_task(self._reconcile_loop())
+        if self.settings.asr_test_hooks:
+            self._control_task = asyncio.create_task(self._control_loop())
         logger.info("MeetMind ASR Service started with worker_id=%s", self.worker_id)
 
     async def _ensure_lifecycle_group(self) -> None:
         try:
             await self.redis.xgroup_create(LIFECYCLE_STREAM, "asr", id="0", mkstream=True)
+            logger.info("Created consumer group 'asr' on %s with MKSTREAM", LIFECYCLE_STREAM)
         except aioredis.ResponseError as exc:
             if "BUSYGROUP" not in str(exc):
                 logger.warning("Error creating asr group on %s: %s", LIFECYCLE_STREAM, exc)
@@ -146,10 +153,13 @@ class AsrService:
         tenant: str,
         meeting_id: str,
         lifecycle_entry_id: str | None = None,
+        started_via: str = "reconciler",
     ) -> None:
         """Instantiate and run MeetingPipeline."""
         if meeting_id in self._active_pipelines:
             return
+
+        self.metrics.record_started_via(meeting_id, started_via)
 
         t_cfg = await self.tenant_config_provider.get_config(tenant)
         provider_kwargs: dict[str, Any] = {
@@ -176,6 +186,7 @@ class AsrService:
             metrics=self.metrics,
             auditor=self.auditor,
         )
+        pipeline.started_via = started_via
         if lifecycle_entry_id:
             pipeline._lifecycle_entry_id = lifecycle_entry_id
 
@@ -194,7 +205,7 @@ class AsrService:
 
     async def _reconcile_loop(self) -> None:
         """Periodic reconciler checking mm:system:active_meetings for unowned meetings."""
-        interval = max(0.2, self.settings.asr_reconcile_interval_ms / 1000.0)
+        interval = max(0.005, self.settings.asr_reconcile_interval_ms / 1000.0)
         while self._is_running:
             try:
                 await asyncio.sleep(interval)
@@ -204,38 +215,67 @@ class AsrService:
                 if len(self._active_pipelines) >= self.settings.asr_max_meetings_per_worker:
                     continue
 
-                members = await self.redis.smembers(ACTIVE_MEETINGS_SET_KEY)
-                if not members:
-                    continue
-
-                for m_raw in members:
-                    if len(self._active_pipelines) >= self.settings.asr_max_meetings_per_worker:
-                        break
-
-                    m_str = m_raw.decode("utf-8") if isinstance(m_raw, bytes) else str(m_raw)
-                    if "|" not in m_str:
-                        continue
-                    tenant, meeting_id = m_str.split("|", 1)
-
-                    if meeting_id in self._active_pipelines:
-                        continue
-
-                    # Check if live lease exists in Redis
-                    l_key = asr_owner_key(tenant, meeting_id)
-                    current_owner = await self.redis.get(l_key)
-                    if current_owner is not None:
-                        continue
-
-                    # No live lease found -> attempt claim via Lua CAS
-                    acquired = await self._acquire_lease(tenant, meeting_id)
-                    if acquired:
-                        logger.info(
-                            "Reconciler: worker %s acquired unowned meeting %s/%s",
-                            self.worker_id,
-                            tenant,
-                            meeting_id,
+                cursor = "0"
+                while self._is_running:
+                    res = await self.redis.sscan(ACTIVE_MEETINGS_SET_KEY, cursor=cursor, count=100)
+                    if isinstance(res, (tuple, list)) and len(res) == 2:
+                        cursor_val, members = res
+                        cursor = (
+                            cursor_val.decode()
+                            if isinstance(cursor_val, bytes)
+                            else str(cursor_val)
                         )
-                        await self._start_pipeline(tenant, meeting_id)
+                    else:
+                        members = res
+                        cursor = "0"
+
+                    if not members:
+                        if cursor == "0":
+                            break
+                        continue
+
+                    candidates: list[tuple[str, str, str]] = []
+                    for m_raw in members:
+                        m_str = m_raw.decode("utf-8") if isinstance(m_raw, bytes) else str(m_raw)
+                        if "|" not in m_str:
+                            continue
+                        tenant, meeting_id = m_str.split("|", 1)
+                        if meeting_id in self._active_pipelines:
+                            continue
+                        l_key = asr_owner_key(tenant, meeting_id)
+                        candidates.append((tenant, meeting_id, l_key))
+
+                    if candidates:
+                        # Pipeline the lease GETs
+                        pipe = self.redis.pipeline(transaction=False)
+                        for _, _, l_key in candidates:
+                            pipe.get(l_key)
+                        owners = await pipe.execute()
+
+                        for (tenant, meeting_id, _), owner in zip(candidates, owners, strict=False):
+                            if (
+                                len(self._active_pipelines)
+                                >= self.settings.asr_max_meetings_per_worker
+                            ):
+                                break
+                            if owner is not None:
+                                continue
+
+                            # No live lease found -> attempt claim via Lua CAS
+                            acquired = await self._acquire_lease(tenant, meeting_id)
+                            if acquired:
+                                logger.info(
+                                    "Reconciler: worker %s acquired unowned meeting %s/%s",
+                                    self.worker_id,
+                                    tenant,
+                                    meeting_id,
+                                )
+                                await self._start_pipeline(
+                                    tenant, meeting_id, started_via="reconciler"
+                                )
+
+                    if cursor == "0":
+                        break
 
             except asyncio.CancelledError:
                 break
@@ -262,6 +302,18 @@ class AsrService:
 
             except asyncio.CancelledError:
                 break
+            except aioredis.ResponseError as exc:
+                if "NOGROUP" in str(exc):
+                    logger.warning(
+                        "NOGROUP on %s; recreating consumer group 'asr' (id '0') with retry",
+                        LIFECYCLE_STREAM,
+                    )
+                    await self._ensure_lifecycle_group()
+                    await asyncio.sleep(0.05)
+                else:
+                    if self._is_running:
+                        logger.warning("Lifecycle ResponseError: %s", exc)
+                        await asyncio.sleep(0.5)
             except Exception as exc:
                 if self._is_running:
                     logger.warning("Lifecycle discovery loop error: %s", exc)
@@ -301,7 +353,9 @@ class AsrService:
 
             # Ownership secured -> ack lifecycle entry and start pipeline
             await self.redis.xack(LIFECYCLE_STREAM, "asr", eid_str)
-            await self._start_pipeline(tenant, meeting_id, lifecycle_entry_id=eid_str)
+            await self._start_pipeline(
+                tenant, meeting_id, lifecycle_entry_id=eid_str, started_via="lifecycle"
+            )
 
         elif event in ("meeting_ended", "meeting_abandoned"):
             await self.redis.xack(LIFECYCLE_STREAM, "asr", eid_str)
@@ -318,6 +372,8 @@ class AsrService:
     async def stop(self) -> None:
         """Gracefully stop worker daemon on SIGTERM."""
         self._is_running = False
+        if self._control_task:
+            self._control_task.cancel()
         if self._discovery_task:
             self._discovery_task.cancel()
         if self._reconcile_task:
@@ -344,3 +400,57 @@ class AsrService:
         if self.redis:
             await self.redis.aclose()
         logger.info("ASR Service worker %s stopped", self.worker_id)
+
+    async def _control_loop(self) -> None:
+        """Test hook: listen on mm:system:asr_control for fault injection commands."""
+        control_stream = "mm:system:asr_control"
+        last_id = "$"
+        logger.info("ASR test hook control loop active on stream %s", control_stream)
+        while self._is_running:
+            try:
+                res = await self.redis.xread({control_stream: last_id}, count=10, block=500)
+                if not res:
+                    continue
+                for _, messages in res:
+                    for entry_id, fields in messages:
+                        last_id = (
+                            entry_id.decode() if isinstance(entry_id, bytes) else str(entry_id)
+                        )
+
+                        def dec(v: Any) -> str:
+                            return v.decode() if isinstance(v, bytes) else str(v)
+
+                        action = dec(fields.get(b"action") or fields.get("action") or "")
+                        cmd = dec(fields.get(b"command") or fields.get("command") or "")
+                        mid = dec(fields.get(b"meeting_id") or fields.get("meeting_id") or "")
+
+                        if not mid and cmd.startswith("drop_provider "):
+                            mid = cmd.split(" ", 1)[1].strip()
+                            action = "drop_provider"
+
+                        if action == "drop_provider" and mid:
+                            pipeline = self._active_pipelines.get(mid)
+                            if pipeline and hasattr(pipeline.provider, "_debug_drop_connection"):
+                                logger.warning(
+                                    "[TEST_HOOK] Dropping connection for meeting %s", mid
+                                )
+                                pipeline.provider._debug_drop_connection()
+                        elif action == "provider_outage" and mid:
+                            pipeline = self._active_pipelines.get(mid)
+                            if pipeline:
+                                raw_dur = fields.get(b"duration_s") or fields.get("duration_s")
+                                dur = float(dec(raw_dur or "5.0"))
+                                logger.warning(
+                                    "[TEST_HOOK] Simulating %.1fs provider outage for meeting %s",
+                                    dur,
+                                    mid,
+                                )
+                                pipeline._debug_block_reconnect_until = time.time() + dur
+                                if hasattr(pipeline.provider, "_debug_drop_connection"):
+                                    pipeline.provider._debug_drop_connection()
+            except asyncio.CancelledError:
+                break
+            except Exception as exc:
+                if self._is_running:
+                    logger.warning("Error in _control_loop: %s", exc)
+                    await asyncio.sleep(0.5)

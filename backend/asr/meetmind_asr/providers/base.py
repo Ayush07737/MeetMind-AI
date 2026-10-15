@@ -61,6 +61,7 @@ class ProviderEvent:
     is_stable: bool = False
     raw: dict[str, Any] = field(default_factory=dict)
     error: str | None = None
+    recv_perf: float = 0.0
 
 
 class ASRProvider(ABC):

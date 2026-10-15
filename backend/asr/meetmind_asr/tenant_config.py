@@ -7,10 +7,13 @@ Keyterms are strictly per tenant / per domain pack, never hardcoded.
 from __future__ import annotations
 
 import json
+import logging
 from abc import ABC, abstractmethod
 from pathlib import Path
 
 from pydantic import BaseModel, Field
+
+logger = logging.getLogger(__name__)
 
 
 class AsrTenantConfig(BaseModel):
@@ -55,10 +58,23 @@ class FileTenantAsrConfigProvider(TenantAsrConfigProvider):
                     language=tcfg.get("language", "en"),
                     keyterms=tcfg.get("keyterms", []),
                 )
-        except Exception:
-            pass
+            logger.info(
+                "FileTenantAsrConfigProvider loaded %d tenants from %s: %s",
+                len(self._configs),
+                self.config_path,
+                list(self._configs.keys()),
+            )
+        except Exception as exc:
+            logger.warning("Failed to load tenant config from %s: %s", self.config_path, exc)
 
     async def get_config(self, tenant_id: str) -> AsrTenantConfig:
         if tenant_id in self._configs:
-            return self._configs[tenant_id]
+            cfg = self._configs[tenant_id]
+            logger.info("get_config for '%s' found: %d keyterms", tenant_id, len(cfg.keyterms))
+            return cfg
+        logger.warning(
+            "get_config for '%s' NOT found in %s! Defaulting to empty keyterms",
+            tenant_id,
+            list(self._configs.keys()),
+        )
         return AsrTenantConfig(tenant_id=tenant_id, language="en", keyterms=[])

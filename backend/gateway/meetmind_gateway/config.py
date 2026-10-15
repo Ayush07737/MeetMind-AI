@@ -65,6 +65,8 @@ class GatewaySettings(BaseSettings):
     byte_rate_limit: int = 512 * 1024  # 512 KB per sec (sustained)
     burst_byte_limit: int = 1024 * 1024  # 1 MB burst capacity
     ticket_ttl_seconds: int = 30  # K9: ticket expiration TTL
+    gateway_bench_endpoints: bool = False  # P0-1: system benchmark endpoints disabled by default
+    gateway_admin_key: str = ""  # P0-1: shared secret admin key for benchmark endpoints
 
     @model_validator(mode="before")
     @classmethod

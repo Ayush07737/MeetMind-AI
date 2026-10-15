@@ -478,6 +478,7 @@ class EventEnvelope(BaseModel):
     meeting_id: str
     tenant_id: str
     ts_ms: int
+    trace_id: str | None = None
     payload: dict[str, Any]
 
 

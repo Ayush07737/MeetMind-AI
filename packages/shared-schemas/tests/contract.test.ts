@@ -148,6 +148,7 @@ describe("Contract Tests (Zod & Binary)", () => {
     const tfData = raw.transcript_final;
     const tfEnv = EventEnvelopeSchema.parse(tfData);
     expect(tfEnv.event_type).toBe("transcript_final");
+    expect(tfEnv.trace_id).toBe("0123456789abcdef0123456789abcdef");
     const tfPayload = TranscriptFinalPayloadSchema.parse(tfEnv.payload);
     expect(tfPayload.utterance_id).toBe(uCase.expected_utterance_id);
     expect(tfPayload.channel).toBe(0);

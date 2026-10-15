@@ -14,6 +14,8 @@ import asyncio
 import contextlib
 import json
 import logging
+import socket
+import time
 import urllib.parse
 from collections.abc import AsyncIterator
 from typing import Any
@@ -89,6 +91,15 @@ class DeepgramProvider(ASRProvider):
         self._event_queue: asyncio.Queue[ProviderEvent] = asyncio.Queue()
         self._read_task: asyncio.Task[None] | None = None
         self._keepalive_task: asyncio.Task[None] | None = None
+        self.accepted_client_seqs: set[int] = set()
+
+    @property
+    def session(self) -> ProviderSession | None:
+        return self._session
+
+    @session.setter
+    def session(self, value: ProviderSession | None) -> None:
+        self._session = value
 
     @property
     def capabilities(self) -> ProviderCapabilities:
@@ -114,7 +125,11 @@ class DeepgramProvider(ASRProvider):
         }
 
         try:
-            self._ws = await websockets.connect(url, additional_headers=headers)
+            self._ws = await websockets.connect(
+                url,
+                additional_headers=headers,
+                family=socket.AF_INET,
+            )
             self._is_open = True
         except Exception as exc:
             # Strictly do not include headers or secrets in error messages
@@ -130,6 +145,7 @@ class DeepgramProvider(ASRProvider):
 
         try:
             await self._ws.send(chunk.data)
+            self.accepted_client_seqs.add(chunk.client_seq)
         except Exception as exc:
             logger.warning("Error sending audio frame to Deepgram: %s", type(exc).__name__)
             self._is_open = False
@@ -149,10 +165,11 @@ class DeepgramProvider(ASRProvider):
         """Continuously receive and decode Deepgram JSON messages."""
         try:
             async for raw_msg in self._ws:
+                t_recv = time.perf_counter()
                 if isinstance(raw_msg, str):
                     try:
                         msg = json.loads(raw_msg)
-                        await self._handle_message(msg)
+                        await self._handle_message(msg, recv_perf=t_recv)
                     except json.JSONDecodeError:
                         logger.warning("Received invalid JSON from Deepgram")
         except asyncio.CancelledError:
@@ -166,7 +183,7 @@ class DeepgramProvider(ASRProvider):
             self._is_open = False
             await self._event_queue.put(ProviderEvent(event_type="closed"))
 
-    async def _handle_message(self, msg: dict[str, Any]) -> None:
+    async def _handle_message(self, msg: dict[str, Any], recv_perf: float = 0.0) -> None:
         msg_type = msg.get("type", "")
 
         if msg_type == "Results":
@@ -211,10 +228,29 @@ class DeepgramProvider(ASRProvider):
                     is_final=is_final,
                     is_stable=speech_final or is_final,
                     raw=msg,
+                    recv_perf=recv_perf,
                 )
             )
 
         elif msg_type == "UtteranceEnd":
+            await self._event_queue.put(
+                ProviderEvent(
+                    event_type="utterance_end",
+                    raw=msg,
+                    recv_perf=recv_perf,
+                )
+            )
+
+        elif msg_type == "Error":
+            err_msg = msg.get("message") or msg.get("err_msg") or "Deepgram provider error"
+            await self._event_queue.put(
+                ProviderEvent(
+                    event_type="error",
+                    error=str(err_msg),
+                    raw=msg,
+                    recv_perf=recv_perf,
+                )
+            )
             await self._event_queue.put(
                 ProviderEvent(
                     event_type="utterance_end",
@@ -265,4 +301,8 @@ class DeepgramProvider(ASRProvider):
         """Testing hook for Session D2 fault injection."""
         if self._ws:
             self._is_open = False
-            asyncio.create_task(self._ws.close(1006, "Debug drop connection"))
+            with contextlib.suppress(Exception):
+                if hasattr(self._ws, "transport") and self._ws.transport:
+                    self._ws.transport.close()
+                else:
+                    asyncio.create_task(self._ws.close(1000, "Debug drop connection"))

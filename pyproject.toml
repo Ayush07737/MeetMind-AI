@@ -42,6 +42,7 @@ pythonpath = [
 ]
 markers = [
     "integration: marks tests as integration tests requiring live services",
+    "deepgram: marks tests that connect to the real Deepgram API (requires RUN_DEEPGRAM_TESTS=1)",
 ]
 testpaths = [
     "packages/shared-schemas/schemas_py/tests",
