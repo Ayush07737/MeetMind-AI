@@ -108,6 +108,11 @@ class MeetingPipeline:
         # Replay window: keep last sent chunks within replay window for resending on crash/reconnect
         self._sent_replay_history: collections.deque[tuple[float, AudioChunk]] = collections.deque()
 
+        # Chunk history: [start_ms, end_ms, t_recv_wall, t_recv_perf, t_send_perf]
+        self._chunk_history: collections.deque[list[Any]] = collections.deque(maxlen=3000)
+        self._seen_interim_words: set[tuple[str, int]] = set()
+        self._standby_provider: ASRProvider | None = None
+
         # Audit stats
         self._chunks_sent = 0
         self._bytes_sent = 0
@@ -134,6 +139,10 @@ class MeetingPipeline:
                 exc,
             )
             asyncio.create_task(self._handle_reconnect())
+
+        # Pre-warm standby connection if warm standby enabled
+        if self.settings.asr_warm_standby:
+            asyncio.create_task(self._init_standby())
 
         # Record audit start
         self.auditor.record_session_started(
@@ -244,6 +253,60 @@ class MeetingPipeline:
         with contextlib.suppress(Exception):
             await self.redis.set(session_key, session_data, ex=86400)
 
+    async def _init_standby(self) -> None:
+        """Pre-warm idle standby provider connection if warm standby is enabled."""
+        if not self.settings.asr_warm_standby or not self._is_running or self._meeting_ended:
+            return
+        if self._standby_provider and getattr(self._standby_provider, "_is_open", False):
+            return
+        try:
+            from .providers import get_provider
+
+            provider_kwargs: dict[str, Any] = {"redis_client": self.redis}
+            if self.settings.asr_provider == "deepgram" and self.settings.deepgram_api_key:
+                provider_kwargs.update(
+                    {
+                        "api_key": self.settings.deepgram_api_key,
+                        "base_url": self.settings.deepgram_base_url,
+                        "mip_opt_out": True,
+                    }
+                )
+            standby = get_provider(self.settings.asr_provider, **provider_kwargs)
+            session = ProviderSession(
+                tenant_id=self.tenant_id,
+                meeting_id=self.meeting_id,
+                sample_rate=self._sample_rate,
+                channels=self._channels,
+                language=self.tenant_config.language,
+                keyterms=self.tenant_config.keyterms,
+            )
+            await standby.open(session)
+            self._standby_provider = standby
+            logger.info("Warm standby provider connection pre-warmed for %s", self.meeting_id)
+        except Exception as exc:
+            logger.warning(
+                "Failed to initialize warm standby provider for %s: %s",
+                self.meeting_id,
+                exc,
+            )
+
+    def _find_chunk_for_end_ms(self, end_ms: int) -> tuple[float, float, float] | None:
+        """Find (t_recv_wall, t_recv_perf, t_send_perf) for chunk containing end_ms."""
+        if not self._chunk_history:
+            return None
+        best_match = None
+        min_distance = float("inf")
+        for c_start, c_end, t_r_wall, t_r_perf, t_s_perf in reversed(self._chunk_history):
+            if c_start <= end_ms <= c_end:
+                return t_r_wall, t_r_perf, t_s_perf
+            dist = abs(c_end - end_ms)
+            if dist < min_distance:
+                min_distance = dist
+                best_match = (t_r_wall, t_r_perf, t_s_perf)
+            if dist > 8000:
+                break
+        return best_match
+
     async def _audio_read_loop(self) -> None:
         """Read audio frames from Redis stream mm:{tenant}:audio:{meeting}."""
         while self._is_running:
@@ -277,6 +340,16 @@ class MeetingPipeline:
 
             except asyncio.CancelledError:
                 break
+            except aioredis.ResponseError as exc:
+                if "NOGROUP" in str(exc):
+                    logger.warning(
+                        "NOGROUP on %s; recreating consumer group 'asr'", self._audio_key
+                    )
+                    await self._ensure_consumer_group()
+                    await asyncio.sleep(0.05)
+                elif self._is_running:
+                    logger.warning("Audio read loop ResponseError on %s: %s", self.meeting_id, exc)
+                    await asyncio.sleep(0.1)
             except Exception as exc:
                 if self._is_running:
                     logger.warning("Audio read loop error on %s: %s", self.meeting_id, exc)
@@ -352,11 +425,20 @@ class MeetingPipeline:
             recv_ns=time.perf_counter_ns(),
         )
 
+        # Track chunk in precision history
+        origin = self._timeline.meeting_origin_capture_ts or hdr.capture_ts_ms
+        chunk_start_ms = max(0, hdr.capture_ts_ms - origin)
+        chunk_end_ms = chunk_start_ms + 100
+        hist_entry = [chunk_start_ms, chunk_end_ms, time.time(), time.perf_counter(), 0.0]
+        self._chunk_history.append(hist_entry)
+
         # Enqueue chunk
         self._all_dispatched_client_seqs.add(chunk.client_seq)
-        await self._dispatch_chunk(eid_str, chunk)
+        await self._dispatch_chunk(eid_str, chunk, hist_entry)
 
-    async def _dispatch_chunk(self, entry_id: str, chunk: AudioChunk) -> None:
+    async def _dispatch_chunk(
+        self, entry_id: str, chunk: AudioChunk, hist_entry: list[Any] | None = None
+    ) -> None:
         """Deliver chunk to provider or buffer during provider outage."""
         # Check buffer capacity
         max_buffered_chunks = self.settings.asr_buffer_max_seconds * 10  # 10 chunks/sec
@@ -377,6 +459,8 @@ class MeetingPipeline:
                 # Direct send
                 await self.provider.send_audio(chunk)
                 t_send = time.perf_counter()
+                if hist_entry is not None:
+                    hist_entry[4] = t_send
                 self._pending_acks.append((t_send, entry_id))
                 self._sent_replay_history.append((t_send, chunk))
                 self._timeline.register_chunk(chunk.capture_ts_ms)
@@ -406,6 +490,71 @@ class MeetingPipeline:
         self.metrics.reconnects += 1
         t_disconnect = time.time()
         self._degraded_since_ms = int(t_disconnect * 1000)
+
+        # 1. Warm Standby Swap Fast Path
+        if (
+            self.settings.asr_warm_standby
+            and self._standby_provider
+            and getattr(self._standby_provider, "_is_open", False)
+        ):
+            logger.info("Warm standby swap engaged for meeting %s", self.meeting_id)
+            old_prov = self.provider
+            self.provider = self._standby_provider
+            self._standby_provider = None
+            with contextlib.suppress(Exception):
+                asyncio.create_task(old_prov.close())
+            asyncio.create_task(self._init_standby())
+
+            self._timeline.reset_session()
+            reaccept_time: float | None = None
+            replay_chunks = list(self._sent_replay_history)
+
+            for _, chunk in replay_chunks:
+                await self.provider.send_audio(chunk)
+                if reaccept_time is None:
+                    reaccept_time = time.time()
+                self._timeline.register_chunk(chunk.capture_ts_ms)
+                self.metrics.replayed_chunks += 1
+
+            while self._reconnect_buffer:
+                eid, chunk = self._reconnect_buffer.popleft()
+                await self.provider.send_audio(chunk)
+                if reaccept_time is None:
+                    reaccept_time = time.time()
+                t_send = time.perf_counter()
+                self._pending_acks.append((t_send, eid))
+                self._sent_replay_history.append((t_send, chunk))
+                self._timeline.register_chunk(chunk.capture_ts_ms)
+                self._chunks_sent += 1
+                self._bytes_sent += len(chunk.data)
+
+            recovery_time = reaccept_time if reaccept_time is not None else time.time()
+            dur_s = recovery_time - t_disconnect
+            self._total_degraded_s += dur_s
+            self.metrics.degraded_seconds += dur_s
+            self.metrics.record_reconnect_duration(dur_s * 1000.0)
+            self._degraded_active = False
+
+            logger.info(
+                "[RECONNECT_EVENT] meeting=%s (WARM_STANDBY_SWAP) "
+                "drop_to_reaccept_ms=%.2f accepted_seqs=%d",
+                self.meeting_id,
+                dur_s * 1000.0,
+                len(getattr(self.provider, "accepted_client_seqs", set())),
+            )
+            with contextlib.suppress(Exception):
+                await self.redis.rpush(
+                    f"mm:{self.tenant_id}:asr_reconnects:{self.meeting_id}",
+                    json.dumps(
+                        {
+                            "reaccept_ms": dur_s * 1000.0,
+                            "t_disconnect": t_disconnect,
+                            "t_recovery": recovery_time,
+                            "warm_standby": True,
+                        }
+                    ),
+                )
+            return
 
         backoffs = [0.0, 0.25, 0.5, 1.0, 2.0]
         backoff_idx = 0
@@ -440,10 +589,14 @@ class MeetingPipeline:
 
                 # Reconnect successful: reset timeline session and resend replay window
                 self._timeline.reset_session()
+                reaccept_time: float | None = None
+                replay_chunks = list(self._sent_replay_history)
 
                 # Resend replay window audio
-                for _, chunk in self._sent_replay_history:
+                for _, chunk in replay_chunks:
                     await self.provider.send_audio(chunk)
+                    if reaccept_time is None:
+                        reaccept_time = time.time()
                     self._timeline.register_chunk(chunk.capture_ts_ms)
                     self.metrics.replayed_chunks += 1
 
@@ -451,6 +604,8 @@ class MeetingPipeline:
                 while self._reconnect_buffer:
                     eid, chunk = self._reconnect_buffer.popleft()
                     await self.provider.send_audio(chunk)
+                    if reaccept_time is None:
+                        reaccept_time = time.time()
                     t_send = time.perf_counter()
                     self._pending_acks.append((t_send, eid))
                     self._sent_replay_history.append((t_send, chunk))
@@ -459,7 +614,7 @@ class MeetingPipeline:
                     self._bytes_sent += len(chunk.data)
 
                 # Recovery complete
-                recovery_time = time.time()
+                recovery_time = reaccept_time if reaccept_time is not None else time.time()
                 dur_s = recovery_time - t_disconnect
                 self._total_degraded_s += dur_s
                 self.metrics.degraded_seconds += dur_s
@@ -531,7 +686,8 @@ class MeetingPipeline:
         """Receive provider events and publish them to appropriate streams."""
         while True:
             try:
-                async for event in self.provider.events():
+                curr_prov = self.provider
+                async for event in curr_prov.events():
                     if event.event_type in ("final", "interim"):
                         await self._handle_transcript_event(event)
                     elif event.event_type == "error":
@@ -544,6 +700,8 @@ class MeetingPipeline:
                         if self._is_running and not self._meeting_ended:
                             asyncio.create_task(self._handle_reconnect())
                         break
+                    if self.provider is not curr_prov:
+                        break
             except asyncio.CancelledError:
                 break
             except Exception as exc:
@@ -552,16 +710,23 @@ class MeetingPipeline:
 
             if not self._is_running or self._meeting_ended:
                 break
-            await asyncio.sleep(0.1)
+            await asyncio.sleep(0.02)
 
     async def _handle_transcript_event(self, event: ProviderEvent) -> None:
         if not event.text or not event.text.strip():
             return
 
-        # Map timeline
-        start_ms, end_ms, start_epoch_ms = self._timeline.map_range(event.start_ms, event.end_ms)
+        if getattr(event, "recv_perf", 0.0) > 0 and event.is_final:
+            parse_ms = max(0.001, (time.perf_counter() - event.recv_perf) * 1000.0)
+            self.metrics.record_stage_timing("parse", parse_ms)
 
-        # Speaker name resolution
+        # Stage 1: Timeline mapping
+        t_tl_0 = time.perf_counter()
+        start_ms, end_ms, start_epoch_ms = self._timeline.map_range(event.start_ms, event.end_ms)
+        self.metrics.record_stage_timing("timeline", (time.perf_counter() - t_tl_0) * 1000.0)
+
+        # Stage 2: Speaker resolution
+        t_spk_0 = time.perf_counter()
         spk_name = None
         if self._speaker_resolver:
             spk_name = self._speaker_resolver.resolve(
@@ -569,6 +734,7 @@ class MeetingPipeline:
                 channel=event.channel,
                 speaker=event.speaker,
             )
+        self.metrics.record_stage_timing("speaker", (time.perf_counter() - t_spk_0) * 1000.0)
 
         spk_id = f"spk_{event.speaker}"
         now_ms = int(time.time() * 1000)
@@ -588,7 +754,8 @@ class MeetingPipeline:
 
             uid = compute_utterance_id(self.meeting_id, event.channel, spk_id, start_ms)
 
-            # Dedupe check
+            # Stage 3: Dedupe check
+            t_dd_0 = time.perf_counter()
             if self._dedupe.is_duplicate(uid, event.channel, event.text, start_ms, end_ms):
                 logger.debug("Dropping duplicate utterance on %s: %s", self.meeting_id, uid)
                 return
@@ -597,7 +764,10 @@ class MeetingPipeline:
             self._highest_published_start_ms[spk_key] = max(
                 self._highest_published_start_ms[spk_key], start_ms
             )
+            self.metrics.record_stage_timing("dedupe", (time.perf_counter() - t_dd_0) * 1000.0)
 
+            # Stage 4: Serialization
+            t_ser_0 = time.perf_counter()
             payload = {
                 "utterance_id": uid,
                 "speaker_id": spk_id,
@@ -620,25 +790,66 @@ class MeetingPipeline:
                 "ts_ms": now_ms,
                 "payload": payload,
             }
+            raw_env = json.dumps(envelope)
+            self.metrics.record_stage_timing("serialize", (time.perf_counter() - t_ser_0) * 1000.0)
 
-            # Published to INTERNAL bus only
-            t0 = time.perf_counter()
+            # Stage 5: Redis XADD
+            t_xadd_0 = time.perf_counter()
             pipe = self.redis.pipeline(transaction=False)
             pipe.xadd(
                 self._events_key,
-                {"payload": json.dumps(envelope)},
+                {"payload": raw_env},
                 maxlen=5000,
                 approximate=True,
             )
             pipe.expire(self._events_key, 86400)
             await pipe.execute()
-            self.metrics.record_publish_latency((time.perf_counter() - t0) * 1000)
+            t_pub_perf = time.perf_counter()
+            t_pub_wall = time.time()
+            xadd_ms = (t_pub_perf - t_xadd_0) * 1000.0
+            self.metrics.record_stage_timing("xadd", xadd_ms)
+            self.metrics.record_publish_latency(xadd_ms)
+
+            # Service-added latency: Deepgram message receipt to internal bus publish
             if getattr(event, "recv_perf", 0.0) > 0:
-                svc_ms = (time.perf_counter() - event.recv_perf) * 1000.0
+                svc_ms = max(0.01, (t_pub_perf - event.recv_perf) * 1000.0)
                 self.metrics.record_service_added_latency(svc_ms)
+
+            # End-to-end and Provider latency:
+            chunk_match = self._find_chunk_for_end_ms(end_ms)
+            if chunk_match:
+                c_recv_wall, c_recv_perf, c_send_perf = chunk_match
+                e2e_ms = max(0.1, (t_pub_wall - c_recv_wall) * 1000.0)
+                self.metrics.record_e2e_latency(e2e_ms)
+                if c_send_perf > 0 and getattr(event, "recv_perf", 0.0) > 0:
+                    prov_ms = max(0.1, (event.recv_perf - c_send_perf) * 1000.0)
+                    self.metrics.record_provider_latency(prov_ms)
 
         else:
             # Interim result -> published to OUT stream only
+            raw_msg = getattr(event, "raw", {})
+            alts = raw_msg.get("channel", {}).get("alternatives", [])
+            if alts:
+                words = alts[0].get("words", [])
+                t_interim_now = time.perf_counter()
+                for w in words:
+                    w_text = w.get("word", "").strip().lower()
+                    if not w_text:
+                        continue
+                    w_end_s = float(w.get("end", 0.0))
+                    w_end_prov_ms = int(w_end_s * 1000)
+                    _, w_end_mtg_ms, _ = self._timeline.map_range(w_end_prov_ms, w_end_prov_ms)
+                    w_key = (w_text, w_end_mtg_ms)
+                    if w_key not in self._seen_interim_words:
+                        self._seen_interim_words.add(w_key)
+                        if len(self._seen_interim_words) > 5000:
+                            self._seen_interim_words.clear()
+                        c_match = self._find_chunk_for_end_ms(w_end_mtg_ms)
+                        if c_match:
+                            _, c_recv_perf, _ = c_match
+                            i_lat = max(0.1, (t_interim_now - c_recv_perf) * 1000.0)
+                            self.metrics.record_interim_latency(i_lat)
+
             payload = {
                 "speaker_id": spk_id,
                 "speaker_name": spk_name,
@@ -750,17 +961,23 @@ class MeetingPipeline:
         except Exception:
             pass
 
-        # 2. Finish provider and flush finals (up to 5s timeout)
+        # 2. Finish provider and flush finals (up to 8s timeout)
         try:
             with contextlib.suppress(Exception):
-                await asyncio.wait_for(self.provider.finish(), timeout=5.0)
+                await asyncio.wait_for(self.provider.finish(), timeout=8.0)
         except Exception:
             pass
+
+        # Close warm standby provider if present
+        if self._standby_provider:
+            with contextlib.suppress(Exception):
+                await self._standby_provider.close()
+            self._standby_provider = None
 
         # 3. Wait briefly for events loop to complete processing flushed events
         if self._events_task and not self._events_task.done():
             with contextlib.suppress(Exception):
-                await asyncio.wait_for(asyncio.shield(self._events_task), timeout=2.0)
+                await asyncio.wait_for(asyncio.shield(self._events_task), timeout=3.0)
 
         # 4. Cancel tasks
         for t in self._tasks:

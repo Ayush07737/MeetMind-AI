@@ -11,9 +11,21 @@ import contextlib
 import gc
 import json
 import logging
+import sys
 import time
+import tracemalloc
 from dataclasses import dataclass, field
 from typing import Any
+
+if not tracemalloc.is_tracing():
+    tracemalloc.start()
+_tracemalloc_base = tracemalloc.take_snapshot()
+
+if sys.platform == "win32":
+    with contextlib.suppress(Exception):
+        import ctypes
+
+        ctypes.windll.winmm.timeBeginPeriod(1)
 
 logger = logging.getLogger(__name__)
 
@@ -30,8 +42,18 @@ class AsrMetrics:
     degraded_seconds: float = 0.0
     publish_latencies_ms: list[float] = field(default_factory=list)
     service_added_latencies_ms: list[float] = field(default_factory=list)
+    e2e_latencies_ms: list[float] = field(default_factory=list)
+    interim_latencies_ms: list[float] = field(default_factory=list)
+    provider_latencies_ms: list[float] = field(default_factory=list)
+    stage_parse_ms: list[float] = field(default_factory=list)
+    stage_timeline_ms: list[float] = field(default_factory=list)
+    stage_speaker_ms: list[float] = field(default_factory=list)
+    stage_dedupe_ms: list[float] = field(default_factory=list)
+    stage_serialize_ms: list[float] = field(default_factory=list)
+    stage_xadd_ms: list[float] = field(default_factory=list)
     loop_lag_ms: float = 0.0
     max_loop_lag_ms: float = 0.0
+    loop_lag_samples_ms: list[float] = field(default_factory=list)
     gc_pauses_ms: list[float] = field(default_factory=list)
     reconnect_durations_ms: list[float] = field(default_factory=list)
     started_via: str = ""
@@ -50,22 +72,45 @@ class AsrMetrics:
 
     def record_publish_latency(self, latency_ms: float) -> None:
         self.publish_latencies_ms.append(latency_ms)
-        if len(self.publish_latencies_ms) > 1000:
+        if len(self.publish_latencies_ms) > 5000:
             self.publish_latencies_ms.pop(0)
 
     def record_service_added_latency(self, latency_ms: float) -> None:
         self.service_added_latencies_ms.append(latency_ms)
-        if len(self.service_added_latencies_ms) > 1000:
+        if len(self.service_added_latencies_ms) > 5000:
             self.service_added_latencies_ms.pop(0)
+
+    def record_e2e_latency(self, latency_ms: float) -> None:
+        self.e2e_latencies_ms.append(latency_ms)
+        if len(self.e2e_latencies_ms) > 5000:
+            self.e2e_latencies_ms.pop(0)
+
+    def record_interim_latency(self, latency_ms: float) -> None:
+        self.interim_latencies_ms.append(latency_ms)
+        if len(self.interim_latencies_ms) > 5000:
+            self.interim_latencies_ms.pop(0)
+
+    def record_provider_latency(self, latency_ms: float) -> None:
+        self.provider_latencies_ms.append(latency_ms)
+        if len(self.provider_latencies_ms) > 5000:
+            self.provider_latencies_ms.pop(0)
+
+    def record_stage_timing(self, stage: str, timing_ms: float) -> None:
+        attr = f"stage_{stage}_ms"
+        lst = getattr(self, attr, None)
+        if lst is not None and isinstance(lst, list):
+            lst.append(timing_ms)
+            if len(lst) > 5000:
+                lst.pop(0)
 
     def record_gc_pause(self, pause_ms: float) -> None:
         self.gc_pauses_ms.append(pause_ms)
         if len(self.gc_pauses_ms) > 1000:
             self.gc_pauses_ms.pop(0)
 
-    def _calc_percentiles(self, vals: list[float]) -> dict[str, float]:
+    def _calc_percentiles(self, vals: list[float]) -> dict[str, Any]:
         if not vals:
-            return {"p50": 0.0, "p95": 0.0, "p99": 0.0, "max": 0.0}
+            return {"p50": 0.0, "p95": 0.0, "p99": 0.0, "max": 0.0, "mean": 0.0, "n": 0}
         s = sorted(vals)
         n = len(s)
 
@@ -74,17 +119,36 @@ class AsrMetrics:
             return s[min(idx, n - 1)]
 
         return {
-            "p50": round(p(50), 2),
-            "p95": round(p(95), 2),
-            "p99": round(p(99), 2),
-            "max": round(max(s), 2),
+            "p50": round(p(50), 3),
+            "p95": round(p(95), 3),
+            "p99": round(p(99), 3),
+            "max": round(max(s), 3),
+            "mean": round(sum(s) / n, 3),
+            "n": n,
         }
 
-    def get_latency_percentiles(self) -> dict[str, float]:
+    def get_latency_percentiles(self) -> dict[str, Any]:
         return self._calc_percentiles(self.publish_latencies_ms)
 
-    def get_service_added_percentiles(self) -> dict[str, float]:
+    def get_service_added_percentiles(self) -> dict[str, Any]:
         return self._calc_percentiles(self.service_added_latencies_ms)
+
+    def get_e2e_percentiles(self) -> dict[str, Any]:
+        return self._calc_percentiles(self.e2e_latencies_ms)
+
+    def get_interim_percentiles(self) -> dict[str, Any]:
+        return self._calc_percentiles(self.interim_latencies_ms)
+
+    def get_provider_percentiles(self) -> dict[str, Any]:
+        return self._calc_percentiles(self.provider_latencies_ms)
+
+    def get_stage_percentiles(self, stage: str) -> dict[str, Any]:
+        attr = f"stage_{stage}_ms"
+        lst = getattr(self, attr, [])
+        return self._calc_percentiles(lst)
+
+    def get_loop_lag_percentiles(self) -> dict[str, Any]:
+        return self._calc_percentiles(self.loop_lag_samples_ms)
 
 
 def init_gc_monitor(metrics: AsrMetrics) -> None:
@@ -99,7 +163,8 @@ def init_gc_monitor(metrics: AsrMetrics) -> None:
             pause_ms = (time.perf_counter() - _gc_start) * 1000.0
             metrics.record_gc_pause(pause_ms)
 
-    gc.callbacks.append(_cb)
+    if _cb not in gc.callbacks:
+        gc.callbacks.append(_cb)
 
 
 class HealthServer:
@@ -129,6 +194,9 @@ class HealthServer:
                 await asyncio.sleep(interval)
                 lag = max(0.0, (time.perf_counter() - t0 - interval) * 1000.0)
                 self.metrics.loop_lag_ms = round(lag, 2)
+                self.metrics.loop_lag_samples_ms.append(lag)
+                if len(self.metrics.loop_lag_samples_ms) > 10000:
+                    self.metrics.loop_lag_samples_ms.pop(0)
                 if lag > self.metrics.max_loop_lag_ms:
                     self.metrics.max_loop_lag_ms = round(lag, 2)
             except asyncio.CancelledError:
@@ -189,15 +257,38 @@ class HealthServer:
                             "degraded_seconds": round(self.metrics.degraded_seconds, 2),
                             "publish_latencies": self.metrics.get_latency_percentiles(),
                             "service_added_latencies": self.metrics.get_service_added_percentiles(),
+                            "e2e_latencies": self.metrics.get_e2e_percentiles(),
+                            "interim_latencies": self.metrics.get_interim_percentiles(),
+                            "provider_latencies": self.metrics.get_provider_percentiles(),
+                            "stage_timings": {
+                                "parse": self.metrics.get_stage_percentiles("parse"),
+                                "timeline": self.metrics.get_stage_percentiles("timeline"),
+                                "speaker": self.metrics.get_stage_percentiles("speaker"),
+                                "dedupe": self.metrics.get_stage_percentiles("dedupe"),
+                                "serialize": self.metrics.get_stage_percentiles("serialize"),
+                                "xadd": self.metrics.get_stage_percentiles("xadd"),
+                            },
                             "loop_lag_ms": self.metrics.loop_lag_ms,
                             "max_loop_lag_ms": self.metrics.max_loop_lag_ms,
+                            "loop_lag_stats": self.metrics.get_loop_lag_percentiles(),
                             "gc": {
                                 "count": len(gc_pauses),
                                 "max_ms": round(max(gc_pauses), 2) if gc_pauses else 0.0,
                                 "total_ms": round(sum(gc_pauses), 2),
+                                "collections": [s.get("collections", 0) for s in gc.get_stats()],
+                                "stats": gc.get_stats(),
                             },
                             "started_via": self.metrics.started_via,
                             "started_via_counts": self.metrics.started_via_counts,
+                        }
+
+                        curr_alloc, peak_alloc = tracemalloc.get_traced_memory()
+                        curr_snap = tracemalloc.take_snapshot()
+                        diff_stats = curr_snap.compare_to(_tracemalloc_base, "lineno")
+                        resp_data["metrics"]["tracemalloc"] = {
+                            "current_mb": round(curr_alloc / (1024 * 1024), 3),
+                            "peak_mb": round(peak_alloc / (1024 * 1024), 3),
+                            "top_diff": [str(s) for s in diff_stats[:5]],
                         }
 
                         if self.service and hasattr(self.service, "_active_pipelines"):

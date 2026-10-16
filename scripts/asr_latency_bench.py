@@ -85,39 +85,90 @@ def compute_percentiles(vals: list[float]) -> dict[str, str]:
     }
 
 
-async def measure_deepgram_network_rtt(api_key: str, samples: int = 5) -> dict[str, Any]:
-    """Measure TCP connect time and WebSocket ping/pong RTT to api.deepgram.com."""
-    rtts_ms: list[float] = []
-    connect_times_ms: list[float] = []
+async def measure_deepgram_network_phases(api_key: str, samples: int = 5) -> dict[str, Any]:
+    """Measure per-phase DNS, TCP, TLS 1.3, HTTP 101 upgrade, and WS Ping/Pong RTT."""
+    import ssl
+
+    host = "api.deepgram.com"
+    port = 443
+    ssl_context = ssl.create_default_context()
+
+    dns_times: list[float] = []
+    tcp_times: list[float] = []
+    tls_times: list[float] = []
+    upgrade_times: list[float] = []
+    ping_rtts: list[float] = []
 
     for _ in range(samples):
+        # 1. DNS IPv4 resolution
+        t0 = time.perf_counter()
+        ip = host
+        try:
+            addr_info = socket.getaddrinfo(
+                host, port, family=socket.AF_INET, type=socket.SOCK_STREAM
+            )
+            ip = addr_info[0][4][0]
+            dns_times.append((time.perf_counter() - t0) * 1000.0)
+        except Exception:
+            pass
+
+        # 2. TCP Connect (forced IPv4)
+        t0 = time.perf_counter()
+        try:
+            reader, writer = await asyncio.wait_for(
+                asyncio.open_connection(ip, port, family=socket.AF_INET),
+                timeout=10.0,
+            )
+            tcp_times.append((time.perf_counter() - t0) * 1000.0)
+
+            # 3. TLS 1.3 Handshake
+            t0 = time.perf_counter()
+            loop = asyncio.get_running_loop()
+            transport = writer.transport
+            protocol = transport.get_protocol()
+            new_transport = await asyncio.wait_for(
+                loop.start_tls(
+                    transport, protocol, ssl_context, server_side=False, server_hostname=host
+                ),
+                timeout=10.0,
+            )
+            tls_times.append((time.perf_counter() - t0) * 1000.0)
+            new_transport.close()
+        except Exception:
+            pass
+
+        # 4. HTTP 101 WebSocket Upgrade & Ping/Pong RTT
         t0 = time.perf_counter()
         headers = {"Authorization": f"Token {api_key}"}
+        url = "wss://api.deepgram.com/v1/listen?model=nova-3&encoding=linear16&sample_rate=16000"
         try:
             async with websockets.connect(
-                "wss://api.deepgram.com/v1/listen?model=nova-3&encoding=linear16&sample_rate=16000",
+                url,
                 additional_headers=headers,
-                open_timeout=10.0,
+                family=socket.AF_INET,
+                open_timeout=15.0,
             ) as ws:
-                t_conn = (time.perf_counter() - t0) * 1000
-                connect_times_ms.append(t_conn)
+                t_up = (time.perf_counter() - t0) * 1000.0
+                upgrade_times.append(t_up)
 
-                # Ping / Pong
                 t_ping0 = time.perf_counter()
                 pong_waiter = await ws.ping()
                 await asyncio.wait_for(pong_waiter, timeout=5.0)
-                rtts_ms.append((time.perf_counter() - t_ping0) * 1000)
+                ping_rtts.append((time.perf_counter() - t_ping0) * 1000.0)
 
                 with contextlib.suppress(Exception):
                     await ws.send(json.dumps({"type": "CloseStream"}))
         except Exception:
             pass
 
-        await asyncio.sleep(0.5)
+        await asyncio.sleep(0.3)
 
     return {
-        "connect_ms": compute_percentiles(connect_times_ms),
-        "ping_rtt_ms": compute_percentiles(rtts_ms),
+        "dns_ms": compute_percentiles(dns_times),
+        "tcp_ms": compute_percentiles(tcp_times),
+        "tls_ms": compute_percentiles(tls_times),
+        "upgrade_ms": compute_percentiles(upgrade_times),
+        "ping_rtt_ms": compute_percentiles(ping_rtts),
     }
 
 
@@ -146,13 +197,19 @@ async def run_benchmark(
         print("[ABORT] Live Deepgram run requires --yes flag or RUN_DEEPGRAM_TESTS=1.")
         sys.exit(1)
 
-    # 1. Measure Network Baseline RTT
-    print("Measuring network baseline RTT to api.deepgram.com (5 samples)...")
-    net_stats = await measure_deepgram_network_rtt(api_key, samples=3)
-    conn_p = net_stats["connect_ms"]
+    # 1. Measure Network Baseline RTT (Per-Phase Breakdown)
+    print("Measuring network baseline per-phase timings to api.deepgram.com (5 samples)...")
+    net_stats = await measure_deepgram_network_phases(api_key, samples=5)
+    dns_p = net_stats["dns_ms"]
+    tcp_p = net_stats["tcp_ms"]
+    tls_p = net_stats["tls_ms"]
+    upg_p = net_stats["upgrade_ms"]
     ping_p = net_stats["ping_rtt_ms"]
-    print(f"  TCP Connect Time: P50={conn_p['p50']}ms | P95={conn_p['p95']}ms")
-    print(f"  WS Ping/Pong RTT: P50={ping_p['p50']}ms | P95={ping_p['p95']}ms")
+    print(f"  DNS Resolution (IPv4):   P50={dns_p['p50']}ms | P95={dns_p['p95']}ms")
+    print(f"  TCP Connect (IPv4):      P50={tcp_p['p50']}ms | P95={tcp_p['p95']}ms")
+    print(f"  TLS 1.3 Handshake:       P50={tls_p['p50']}ms | P95={tls_p['p95']}ms")
+    print(f"  HTTP 101 WS Upgrade:     P50={upg_p['p50']}ms | P95={upg_p['p95']}ms")
+    print(f"  WS Ping/Pong RTT:        P50={ping_p['p50']}ms | P95={ping_p['p95']}ms")
     print("-" * 80)
 
     # 2. Setup throwaway tenant on Neon
@@ -405,6 +462,7 @@ async def run_benchmark(
                 "pid",
                 "cmdline",
                 "rss_mb",
+                "uss_mb",
                 "event_loop_lag_ms",
                 "queue_depth_reconnect",
                 "queue_depth_pending_acks",
@@ -461,6 +519,10 @@ async def run_benchmark(
                 rss_mb = (
                     round(asr_psutil.memory_info().rss / (1024 * 1024), 2) if asr_psutil else 0.0
                 )
+                uss_mb = 0.0
+                if asr_psutil:
+                    with contextlib.suppress(Exception):
+                        uss_mb = round(asr_psutil.memory_full_info().uss / (1024 * 1024), 2)
 
                 # Query health endpoint for internal ASR metrics
                 loop_lag_ms = 0.0
@@ -510,6 +572,7 @@ async def run_benchmark(
                             real_pid,
                             real_cmd,
                             rss_mb,
+                            uss_mb,
                             loop_lag_ms,
                             rec_depth,
                             ack_depth,
@@ -523,6 +586,7 @@ async def run_benchmark(
                     "chunks_sent": chunk_idx,
                     "finals_count": len(finals_collected),
                     "asr_rss_mb": rss_mb,
+                    "asr_uss_mb": uss_mb,
                     "loop_lag_ms": loop_lag_ms,
                     "rec_depth": rec_depth,
                     "ack_depth": ack_depth,
@@ -533,7 +597,7 @@ async def run_benchmark(
                 print(
                     f"  [T+{time_s:3d}s] Chunks: {chunk_idx:4d} | "
                     f"Finals: {len(finals_collected):2d} | "
-                    f"ASR RSS: {rss_mb:.1f} MB | "
+                    f"ASR RSS: {rss_mb:.1f} MB | USS: {uss_mb:.1f} MB | "
                     f"Lag: {loop_lag_ms:.1f} ms | "
                     f"Queues: buf={rec_depth}, acks={ack_depth}, dedupe={dedupe_size} | "
                     f"Redis Mtg Mem: {redis_mem_bytes / 1024:.1f} KB"
@@ -548,22 +612,27 @@ async def run_benchmark(
 
         # End meeting
         await ws.send(json.dumps({"type": "control", "action": "meeting_end"}))
-        await asyncio.sleep(4.0)
+        await asyncio.sleep(6.0)
 
     stop_bench.set()
     await collector_task
 
     # Query final in-process telemetry before shutdown
-    final_worker_metrics = {}
+    final_worker_metrics: dict[str, Any] = {}
     async with httpx.AsyncClient() as h_client:
         try:
             h_res = await h_client.get(
-                f"http://127.0.0.1:{asr_health_port}/healthz?verbose=1", timeout=2.0
+                f"http://127.0.0.1:{asr_health_port}/healthz?verbose=1", timeout=3.0
             )
             if h_res.status_code == 200:
                 final_worker_metrics = h_res.json().get("metrics", {})
         except Exception:
             pass
+
+    # Query Redis slowlog before closing
+    redis_slowlog = []
+    with contextlib.suppress(Exception):
+        redis_slowlog = await redis_client.execute_command("SLOWLOG", "GET", "20")
 
     # Shutdown subprocesses
     gw_proc.kill()
@@ -573,100 +642,116 @@ async def run_benchmark(
     jwks.stop()
     await redis_client.aclose()
 
-    # Calculate statistics
-    n_finals = len(finals_collected)
+    # Extract headline metrics from authoritative worker telemetry
+    e2e_stats = final_worker_metrics.get("e2e_latencies", {})
+    interim_stats = final_worker_metrics.get("interim_latencies", {})
+    prov_stats = final_worker_metrics.get("provider_latencies", {})
+    svc_stats = final_worker_metrics.get("service_added_latencies", {})
+    stage_timings = final_worker_metrics.get("stage_timings", {})
+    loop_lag_stats = final_worker_metrics.get("loop_lag_stats", {})
+    gc_data = final_worker_metrics.get("gc", {})
+    tracemalloc_data = final_worker_metrics.get("tracemalloc", {})
+
     print("\n" + "=" * 80)
-    print(" LATENCY BENCHMARK RESULTS")
+    print(" LATENCY BENCHMARK RESULTS (Session D2c)")
     print("=" * 80)
     print(f"Total Audio Chunks Sent:    {total_target_chunks} ({minutes:.1f} minutes)")
-    print(f"Total Final Utterances (N): {n_finals}")
+    print(f"Total Final Utterances (N): {e2e_stats.get('n', len(finals_collected))}")
+    print(f"Total Interim Words (N):    {interim_stats.get('n', 0)}")
     print("-" * 80)
 
-    if n_finals < 30:
-        print("1. LATENCY BREAKDOWN:")
-        print("   End-to-End Latency:      insufficient samples")
-        print("   Service-Added Latency:   insufficient samples")
-        print(
-            f"   [DEVIATION / RULE] Refusing to print P95/P99 when N < 30 "
-            f"(got N={n_finals} finals; threshold is 30)."
-        )
-        if finals_collected:
-            e2e_vals = [x for x in e2e_latencies_ms if x > 0]
-            svc_vals = [x for x in service_added_latencies_ms if x > 0]
-            if e2e_vals:
-                m_e2e = statistics.mean(e2e_vals)
-                m_svc = statistics.mean(svc_vals)
-                print(
-                    f"   (Informational only: N={len(e2e_vals)}, Mean E2E={m_e2e:.1f}ms, "
-                    f"Mean Svc-Added={m_svc:.1f}ms)"
-                )
-    else:
-        e2e_p = compute_percentiles(e2e_latencies_ms)
-        svc_p = compute_percentiles(service_added_latencies_ms)
-        print("1. LATENCY BREAKDOWN:")
-        print(
-            f"   End-to-End Latency:      P50={e2e_p['p50']}ms | P95={e2e_p['p95']}ms | "
-            f"P99={e2e_p['p99']}ms | Max={e2e_p['max']}ms"
-        )
-        print(
-            f"   Service-Added Latency:   P50={svc_p['p50']}ms | P95={svc_p['p95']}ms | "
-            f"P99={svc_p['p99']}ms | Max={svc_p['max']}ms"
-        )
-        print(
-            f"   Deepgram WebSocket RTT:  P50={net_stats['ping_rtt_ms']['p50']}ms | "
-            f"P95={net_stats['ping_rtt_ms']['p95']}ms"
-        )
-        print("-" * 80)
-        print("2. DOMINATING COMPONENT ANALYSIS:")
-        print("   - Spec Target: End-to-End P95 < 400ms. Service-Added P95 < 20ms.")
-        is_target_met = float(svc_p["p95"]) < 20.0
-        print(f"   - Service-Added P95: {svc_p['p95']}ms (Target met: {is_target_met})")
-        print(
-            f"   - Network RTT to Deepgram (India -> US/EU): "
-            f"~{net_stats['ping_rtt_ms']['p50']}ms dominates the overall latency budget."
-        )
+    # RULE ENFORCEMENT: Fail the run if any headline metric is empty
+    headline_metrics = {
+        "End-to-End Latency": e2e_stats,
+        "Interim Latency": interim_stats,
+        "Provider Latency": prov_stats,
+        "Service-Added Latency": svc_stats,
+    }
 
-    if final_worker_metrics:
-        svc_worker = final_worker_metrics.get("service_added_latencies", {})
-        pub_worker = final_worker_metrics.get("publish_latencies", {})
-        print("-" * 80)
-        print("2. WORKER IN-PROCESS TELEMETRY:")
-        print(
-            f"   Service-Added In-Process: P50={svc_worker.get('p50', 0)}ms | "
-            f"P95={svc_worker.get('p95', 0)}ms | P99={svc_worker.get('p99', 0)}ms | "
-            f"Max={svc_worker.get('max', 0)}ms"
-        )
-        print(
-            f"   Redis Publish Latency:    P50={pub_worker.get('p50', 0)}ms | "
-            f"P95={pub_worker.get('p95', 0)}ms | Max={pub_worker.get('max', 0)}ms"
-        )
-        print(
-            f"   Event-Loop Lag:           "
-            f"Current={final_worker_metrics.get('loop_lag_ms', 0)}ms | "
-            f"Max={final_worker_metrics.get('max_loop_lag_ms', 0)}ms"
-        )
-        gc_data = final_worker_metrics.get("gc", {})
-        print(
-            f"   Garbage Collection Pauses: Count={gc_data.get('count', 0)} | "
-            f"Max={gc_data.get('max_ms', 0)}ms | Total={gc_data.get('total_ms', 0)}ms"
-        )
+    for name, stats in headline_metrics.items():
+        n_samples = stats.get("n", 0)
+        if n_samples == 0:
+            print(f"[FAIL] Headline metric '{name}' is empty (N=0). Failing run per D2c rule.")
+            sys.exit(1)
+
+    print("1. HEADLINE LATENCY BREAKDOWN (5-Minute Run):")
+    for name, stats in headline_metrics.items():
+        n_samples = stats.get("n", 0)
+        p50 = stats.get("p50", 0.0)
+        p95 = stats.get("p95", 0.0)
+        p99 = stats.get("p99", 0.0)
+        s_max = stats.get("max", 0.0)
+        s_mean = stats.get("mean", 0.0)
+
+        # RULE: Never print a percentile from fewer than 30 samples or from an all-zero array
+        all_zero = p50 == 0.0 and p95 == 0.0 and p99 == 0.0 and s_max == 0.0
+        if n_samples < 30 or all_zero:
+            print(f"   {name:<24}: insufficient samples (N={n_samples} < 30 or all-zero)")
+        else:
+            print(
+                f"   {name:<24}: P50={p50:6.2f}ms | P95={p95:6.2f}ms | "
+                f"P99={p99:6.2f}ms | Max={s_max:6.2f}ms | Mean={s_mean:6.2f}ms (N={n_samples})"
+            )
 
     print("-" * 80)
-    print("3. MEMORY ANALYSIS & EARLIER 3.15 MB RSS EXPLANATION:")
-    print(f"   - Real ASR Process PID:   {real_pid}")
-    print(f"   - Real Command Line:      {real_cmd}")
+    print("2. PER-FINAL IN-PROCESS STAGE TIMINGS:")
+    for stage_name, s_stats in stage_timings.items():
+        n_s = s_stats.get("n", 0)
+        if n_s >= 30:
+            print(
+                f"   Stage {stage_name:<10}: P50={s_stats.get('p50', 0):.3f}ms | "
+                f"P95={s_stats.get('p95', 0):.3f}ms | P99={s_stats.get('p99', 0):.3f}ms | "
+                f"Max={s_stats.get('max', 0):.3f}ms (N={n_s})"
+            )
+        else:
+            print(f"   Stage {stage_name:<10}: N={n_s} (insufficient samples for percentiles)")
+
+    print("-" * 80)
+    print("3. EVENT-LOOP LAG & GC OBSERVABILITY:")
+    if loop_lag_stats.get("n", 0) >= 30:
+        print(
+            f"   Event-Loop Lag:    P50={loop_lag_stats.get('p50', 0):.2f}ms | "
+            f"P95={loop_lag_stats.get('p95', 0):.2f}ms | "
+            f"P99={loop_lag_stats.get('p99', 0):.2f}ms | "
+            f"Max={loop_lag_stats.get('max', 0):.2f}ms"
+        )
+    print(
+        f"   GC Pauses (STW):   Count={gc_data.get('count', 0)} | "
+        f"Max={gc_data.get('max_ms', 0):.2f}ms | Total={gc_data.get('total_ms', 0):.2f}ms"
+    )
+    print(f"   GC Collections:    Gen0/Gen1/Gen2={gc_data.get('collections', [])}")
+
+    print("-" * 80)
+    print("4. REDIS SLOWLOG & EVENTS STREAM BOUNDING:")
+    print(f"   Redis SLOWLOG Entries Recorded: {len(redis_slowlog)}")
+    for s_entry in redis_slowlog[:5]:
+        print(f"     - {s_entry}")
+    print("   Events Stream Bounding Policy: MAXLEN ~5000 (approximate=True), TTL=86400s (24h)")
+
+    print("-" * 80)
+    print("5. MEMORY OBSERVABILITY (RSS, USS & TRACEMALLOC):")
+    print(f"   Real ASR Worker PID: {real_pid}")
     if stability_samples:
-        rss_list = [s["asr_rss_mb"] for s in stability_samples]
-        print(
-            f"   - Real Sampled RSS:       min={min(rss_list):.1f} MB | "
-            f"max={max(rss_list):.1f} MB | final={rss_list[-1]:.1f} MB"
-        )
-    print("   - Earlier 3.15 MB RSS Explanation:")
-    print("     In earlier runs, `psutil.Process(asr_proc.pid)` sampled the `uv.exe`")
-    print("     launcher binary stub instead of the child Python runtime executing `meetmind_asr`.")
-    print("     The `uv.exe` wrapper process exited or idled with only ~3.15 MB RSS,")
-    print("     whereas the actual Python runtime with its dependencies (FastAPI, Redis, etc.)")
-    print("     operates in the 45-65 MB RSS range.")
+        rss_vals = [s["asr_rss_mb"] for s in stability_samples if s["asr_rss_mb"] > 0]
+        uss_vals = [s["asr_uss_mb"] for s in stability_samples if s["asr_uss_mb"] > 0]
+        if rss_vals:
+            print(
+                f"   Sampled RSS: min={min(rss_vals):.1f} MB | max={max(rss_vals):.1f} MB | "
+                f"final={rss_vals[-1]:.1f} MB"
+            )
+        if uss_vals:
+            print(
+                f"   Sampled USS: min={min(uss_vals):.1f} MB | max={max(uss_vals):.1f} MB | "
+                f"final={uss_vals[-1]:.1f} MB"
+            )
+    print(
+        f"   Tracemalloc: current={tracemalloc_data.get('current_mb', 0)} MB | "
+        f"peak={tracemalloc_data.get('peak_mb', 0)} MB"
+    )
+    if tracemalloc_data.get("top_diff"):
+        print("   Tracemalloc Top Snapshot Diffs:")
+        for diff_line in tracemalloc_data["top_diff"][:3]:
+            print(f"     - {diff_line}")
     print("=" * 80)
 
 

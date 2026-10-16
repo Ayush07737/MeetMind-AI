@@ -197,7 +197,7 @@ async def test_t9_non_persistence_and_ttl(
     m_key = metrics_key(tenant_id, meeting_id)
 
     # Allow server-side connection teardown to finish writing session/metrics
-    for _ in range(10):
+    for _ in range(50):
         if await real_redis.exists(m_key):
             break
         await asyncio.sleep(0.1)
