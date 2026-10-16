@@ -12,12 +12,14 @@ Security:
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import json
 import os
 import socket
 import statistics
 import subprocess
 import sys
+import threading
 import time
 import uuid
 import wave
@@ -66,14 +68,19 @@ def compute_percentiles(vals: list[float]) -> dict[str, str]:
     }
 
 
-async def run_5_drop_measurement() -> None:
+async def run_5_drop_measurement(warm_standby: bool = False) -> None:
     api_key = os.environ.get("DEEPGRAM_API_KEY", "").strip()
     if not api_key:
         print("[ERROR] DEEPGRAM_API_KEY is not set.")
         sys.exit(1)
 
     print("=" * 80)
-    print(" MeetMind AI — 5-Drop Reconnect Latency Measurement (Target <= 2000ms)")
+    mode_str = (
+        "WARM STANDBY (Instant Pointer Swap)"
+        if warm_standby
+        else "COLD RECONNECT (Fresh TLS/WS Handshake)"
+    )
+    print(f" MeetMind AI — 5-Drop Reconnect Latency Measurement [{mode_str}] (Target <= 2000ms)")
     print("=" * 80)
 
     # 1. Tenant setup
@@ -131,6 +138,17 @@ async def run_5_drop_measurement() -> None:
         + str(REPO_ROOT / "packages" / "shared-schemas" / "schemas_py")
     )
 
+    gw_logs: list[str] = []
+
+    def _drain_gw(stream: Any) -> None:
+        try:
+            for line in iter(stream.readline, b""):
+                dec = line.decode("utf-8", errors="replace").strip()
+                if dec:
+                    gw_logs.append(dec)
+        except Exception:
+            pass
+
     gw_proc = subprocess.Popen(
         [
             sys.executable,
@@ -143,12 +161,14 @@ async def run_5_drop_measurement() -> None:
             "--port",
             str(gw_port),
             "--log-level",
-            "warning",
+            "info",
         ],
         env=env,
-        stdout=subprocess.DEVNULL,
-        stderr=subprocess.DEVNULL,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
     )
+    threading.Thread(target=_drain_gw, args=(gw_proc.stdout,), daemon=True).start()
+    threading.Thread(target=_drain_gw, args=(gw_proc.stderr,), daemon=True).start()
 
     asr_health_port = get_free_port()
     asr_env = os.environ.copy()
@@ -158,6 +178,7 @@ async def run_5_drop_measurement() -> None:
     asr_env["ASR_HEALTH_PORT"] = str(asr_health_port)
     asr_env["ASR_WORKER_ID"] = f"reconn_worker_{uuid.uuid4().hex[:6]}"
     asr_env["ASR_TEST_HOOKS"] = "true"
+    asr_env["ASR_WARM_STANDBY"] = "true" if warm_standby else "false"
     asr_env["REDIS_URL"] = redis_url
     asr_env["APP_ENV"] = "development"
     asr_env["PYTHONPATH"] = (
@@ -168,12 +189,25 @@ async def run_5_drop_measurement() -> None:
         + str(REPO_ROOT / "packages" / "shared-schemas" / "schemas_py")
     )
 
+    asr_logs: list[str] = []
+
+    def _drain_stream(stream: Any) -> None:
+        try:
+            for line in iter(stream.readline, b""):
+                dec = line.decode("utf-8", errors="replace").strip()
+                if dec:
+                    asr_logs.append(dec)
+        except Exception:
+            pass
+
     asr_proc = subprocess.Popen(
         [sys.executable, "-m", "meetmind_asr"],
         env=asr_env,
-        stdout=subprocess.DEVNULL,
-        stderr=subprocess.DEVNULL,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
     )
+    threading.Thread(target=_drain_stream, args=(asr_proc.stdout,), daemon=True).start()
+    threading.Thread(target=_drain_stream, args=(asr_proc.stderr,), daemon=True).start()
 
     async with httpx.AsyncClient() as client:
         for _ in range(150):
@@ -225,9 +259,9 @@ async def run_5_drop_measurement() -> None:
             if m.get("type") == "ack":
                 return m
 
-    # Drops scheduled at sequence numbers corresponding to ~4s, 8s, 12s, 16s, 20s
-    drop_seqs = [40, 80, 120, 160, 200]
-    total_chunks = 250
+    # Drops scheduled at sequence numbers corresponding to ~5s, 9s, 13s, 17s, 21s
+    drop_seqs = [50, 90, 130, 170, 210]
+    total_chunks = 260
 
     async with websockets.connect(ingest_ws_url) as ws:
         await ws.send(
@@ -239,7 +273,8 @@ async def run_5_drop_measurement() -> None:
                 }
             )
         )
-        await ws.recv()
+        m1 = await ws.recv()
+        print("DEBUG meeting_start ack:", m1)
         await ws.send(
             json.dumps(
                 {
@@ -253,7 +288,8 @@ async def run_5_drop_measurement() -> None:
                 }
             )
         )
-        await ws.recv()
+        m2 = await ws.recv()
+        print("DEBUG consent_confirmed ack:", m2)
 
         t_start = time.perf_counter()
 
@@ -266,47 +302,11 @@ async def run_5_drop_measurement() -> None:
 
             if chunk_idx in drop_seqs:
                 drop_num = drop_seqs.index(chunk_idx) + 1
-                print(f"\n[DROP #{drop_num}] Injecting drop at seq={chunk_idx}...")
-                t_drop = time.perf_counter()
-
-                # Trigger drop
+                print(f"[DROP #{drop_num}] Injected drop at seq={chunk_idx}")
+                # Trigger drop via test hook control stream
                 await redis_client.xadd(
                     "mm:system:asr_control",
                     {"action": "drop_provider", "meeting_id": meeting_id},
-                )
-
-                # Poll healthz endpoint until reconnect count increments
-                reconn_dur_ms = 0.0
-                for _ in range(100):  # Up to 5s polling
-                    await asyncio.sleep(0.05)
-                    try:
-                        async with httpx.AsyncClient() as h_client:
-                            h_res = await h_client.get(
-                                f"http://127.0.0.1:{asr_health_port}/healthz?verbose=1",
-                                timeout=0.5,
-                            )
-                            if h_res.status_code == 200:
-                                h_data = h_res.json().get("metrics", {})
-                                recs = h_data.get("reconnect_durations_ms", [])
-                                if len(recs) >= drop_num:
-                                    reconn_dur_ms = recs[-1]
-                                    break
-                    except Exception:
-                        pass
-
-                measured_drop_to_accept_ms = (time.perf_counter() - t_drop) * 1000.0
-                final_ms = reconn_dur_ms if reconn_dur_ms > 0 else measured_drop_to_accept_ms
-                reconnect_results.append(
-                    {
-                        "drop_num": drop_num,
-                        "seq": chunk_idx,
-                        "drop_to_reaccept_ms": final_ms,
-                        "target_met": final_ms <= 2000.0,
-                    }
-                )
-                print(
-                    f"  [DROP #{drop_num} RESULT] Drop-to-reaccept: {final_ms:.1f}ms "
-                    f"(Target <= 2000ms: {final_ms <= 2000.0})"
                 )
 
             # Pacing: 100ms
@@ -315,8 +315,31 @@ async def run_5_drop_measurement() -> None:
             if to_sleep > 0:
                 await asyncio.sleep(to_sleep)
 
+        # Allow final audio to flush before ending meeting
+        await asyncio.sleep(2.0)
         await ws.send(json.dumps({"type": "control", "action": "meeting_end"}))
-        await asyncio.sleep(3.0)
+        await asyncio.sleep(4.0)
+
+    # Collect reconnect measurements from Redis list and healthz
+    rec_key = f"mm:{tenant_id}:asr_reconnects:{meeting_id}"
+    redis_reconnects = []
+    while True:
+        entry = await redis_client.lpop(rec_key)
+        if not entry:
+            break
+        with contextlib.suppress(Exception):
+            redis_reconnects.append(json.loads(entry))
+
+    worker_reconnects_ms = []
+    health_metrics = {}
+    with contextlib.suppress(Exception):
+        async with httpx.AsyncClient() as h_client:
+            h_res = await h_client.get(
+                f"http://127.0.0.1:{asr_health_port}/healthz?verbose=1", timeout=2.0
+            )
+            if h_res.status_code == 200:
+                health_metrics = h_res.json().get("metrics", {})
+                worker_reconnects_ms = health_metrics.get("reconnect_durations_ms", [])
 
     gw_proc.kill()
     gw_proc.wait()
@@ -325,9 +348,38 @@ async def run_5_drop_measurement() -> None:
     jwks.stop()
     await redis_client.aclose()
 
+    # Match 5 drops
+    for d_idx, seq in enumerate(drop_seqs):
+        drop_num = d_idx + 1
+        dur_ms = 0.0
+        if d_idx < len(redis_reconnects):
+            dur_ms = float(redis_reconnects[d_idx].get("reaccept_ms", 0.0))
+        elif d_idx < len(worker_reconnects_ms):
+            dur_ms = float(worker_reconnects_ms[d_idx])
+
+        reconnect_results.append(
+            {
+                "drop_num": drop_num,
+                "seq": seq,
+                "drop_to_reaccept_ms": dur_ms,
+                "target_met": 0 < dur_ms <= 2000.0,
+            }
+        )
+
     # Results summary
     durations = [r["drop_to_reaccept_ms"] for r in reconnect_results]
     p_stats = compute_percentiles(durations)
+
+    if not all(r["target_met"] for r in reconnect_results):
+        print("\n[DIAGNOSTIC] Not all targets met. Inspecting internals:")
+        print(f"  Redis reconnects list count: {len(redis_reconnects)}")
+        print(f"  Worker healthz reconnects: {worker_reconnects_ms}")
+        print("  Recent Gateway Logs:")
+        for line_entry in gw_logs[-25:]:
+            print(f"    [GW] {line_entry}")
+        print("  Recent ASR Worker Logs:")
+        for line_entry in asr_logs[-25:]:
+            print(f"    [ASR] {line_entry}")
 
     print("\n" + "=" * 80)
     print(" 5-DROP RECONNECT SUMMARY TABLE")
@@ -362,4 +414,13 @@ async def run_5_drop_measurement() -> None:
 
 
 if __name__ == "__main__":
-    asyncio.run(run_5_drop_measurement())
+    import argparse
+
+    parser = argparse.ArgumentParser(description="5-Drop Reconnect Latency Measurement")
+    parser.add_argument(
+        "--warm-standby",
+        action="store_true",
+        help="Enable warm standby pre-opened WebSocket connection",
+    )
+    args = parser.parse_args()
+    asyncio.run(run_5_drop_measurement(warm_standby=args.warm_standby))

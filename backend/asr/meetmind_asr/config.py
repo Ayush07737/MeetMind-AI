@@ -41,6 +41,7 @@ class AsrSettings(BaseSettings):
     asr_audio_idle_ms: int = Field(default=5000, alias="ASR_AUDIO_IDLE_MS")
     asr_stub_replay_jitter_ms: int = Field(default=0, alias="ASR_STUB_REPLAY_JITTER_MS")
     asr_test_hooks: bool = Field(default=False, alias="ASR_TEST_HOOKS")
+    asr_warm_standby: bool = Field(default=False, alias="ASR_WARM_STANDBY")
 
     @model_validator(mode="after")
     def validate_provider_requirements(self) -> AsrSettings:

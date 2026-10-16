@@ -280,10 +280,10 @@ class DeepgramProvider(ASRProvider):
         if self._ws and self._is_open:
             with contextlib.suppress(Exception):
                 await self._ws.send(json.dumps({"type": "CloseStream"}))
-            # Give reader loop up to 3 seconds to receive final messages
+            # Give reader loop up to 8 seconds to receive final messages
             if self._read_task:
                 with contextlib.suppress(TimeoutError, asyncio.CancelledError):
-                    await asyncio.wait_for(asyncio.shield(self._read_task), timeout=3.0)
+                    await asyncio.wait_for(asyncio.shield(self._read_task), timeout=8.0)
         await self.close()
 
     async def close(self) -> None:
@@ -299,10 +299,15 @@ class DeepgramProvider(ASRProvider):
 
     def _debug_drop_connection(self) -> None:
         """Testing hook for Session D2 fault injection."""
+        self._is_open = False
         if self._ws:
-            self._is_open = False
             with contextlib.suppress(Exception):
-                if hasattr(self._ws, "transport") and self._ws.transport:
+                if hasattr(self._ws, "close_transport"):
+                    self._ws.close_transport()
+                elif hasattr(self._ws, "transport") and self._ws.transport:
+                    if hasattr(self._ws.transport, "abort"):
+                        self._ws.transport.abort()
                     self._ws.transport.close()
-                else:
-                    asyncio.create_task(self._ws.close(1000, "Debug drop connection"))
+                asyncio.create_task(self._ws.close())
+        with contextlib.suppress(Exception):
+            self._event_queue.put_nowait(ProviderEvent(event_type="closed"))

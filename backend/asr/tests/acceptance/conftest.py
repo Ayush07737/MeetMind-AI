@@ -109,11 +109,14 @@ class LocalJWKSServer:
                     self.send_response(200)
                     self.send_header("Content-Type", "application/json")
                     self.send_header("Content-Length", str(len(payload)))
+                    self.send_header("Connection", "close")
                     self.end_headers()
                     self.wfile.write(payload)
                 else:
                     self.send_response(404)
+                    self.send_header("Connection", "close")
                     self.end_headers()
+                self.close_connection = True
 
             def log_message(self, format: str, *args: Any) -> None:
                 pass
@@ -124,8 +127,11 @@ class LocalJWKSServer:
 
     def stop(self) -> None:
         if self._server:
-            self._server.shutdown()
-            self._server.server_close()
+            shut_thread = threading.Thread(target=self._server.shutdown, daemon=True)
+            shut_thread.start()
+            shut_thread.join(timeout=2.0)
+            with contextlib.suppress(Exception):
+                self._server.server_close()
         if self._thread:
             self._thread.join(timeout=2.0)
 
