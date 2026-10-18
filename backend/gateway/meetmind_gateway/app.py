@@ -376,11 +376,19 @@ def create_app(settings: GatewaySettings | None = None) -> FastAPI:
         all_workers: list[dict[str, Any]] = []
         if hasattr(app.state, "redis"):
             try:
-                keys = await app.state.redis.keys("mm:system:worker_metrics:*")
-                for k in keys:
-                    raw = await app.state.redis.get(k)
-                    if raw:
-                        all_workers.append(json.loads(raw))
+                if hasattr(app.state.redis, "scan_iter"):
+                    async for k in app.state.redis.scan_iter(
+                        "mm:system:worker_metrics:*", count=50
+                    ):
+                        raw = await app.state.redis.get(k)
+                        if raw:
+                            all_workers.append(json.loads(raw))
+                elif hasattr(app.state.redis, "keys"):
+                    keys = await app.state.redis.keys("mm:system:worker_metrics:*")
+                    for k in keys:
+                        raw = await app.state.redis.get(k)
+                        if raw:
+                            all_workers.append(json.loads(raw))
             except Exception as e:
                 logger.warning("Error fetching worker metrics from Redis: %s", e)
 

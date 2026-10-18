@@ -1,18 +1,23 @@
-"""MeetMind AI — Deepgram Connection Phases Diagnostic (Session D2b).
+"""MeetMind AI — Deepgram Connection Phases Diagnostic (Session D2b/D2d).
 
 Instruments:
 1. DNS Resolution (IPv4 vs IPv6 vs AF_UNSPEC)
 2. TCP Connect (forced IPv4 vs IPv6 vs Happy Eyeballs)
 3. TLS 1.3 Handshake
 4. WebSocket HTTP 101 Upgrade
-5. Reconnect time (drop to first chunk accepted) over 5 drops
+5. Reconnect time (drop to first chunk accepted)
 
-Security:
+Compares:
+- api.in.deepgram.com (India endpoint)
+- api.deepgram.com (Global endpoint)
+
+Security Invariants:
 - Never prints or logs DEEPGRAM_API_KEY.
 """
 
 from __future__ import annotations
 
+import argparse
 import asyncio
 import contextlib
 import os
@@ -28,7 +33,6 @@ from dotenv import load_dotenv
 REPO_ROOT = Path(__file__).resolve().parents[1]
 load_dotenv(REPO_ROOT / ".env")
 
-HOST = "api.deepgram.com"
 PORT = 443
 
 
@@ -45,9 +49,9 @@ def compute_percentiles(vals: list[float]) -> dict[str, str]:
     }
 
 
-def test_dns_resolution(samples: int = 5) -> dict[str, Any]:
+def test_dns_resolution(host: str, samples: int = 20) -> dict[str, Any]:
     print("=" * 80)
-    print(" 1. DNS RESOLUTION PHASES")
+    print(f" 1. DNS RESOLUTION PHASES — {host}")
     print("=" * 80)
     unspec_times: list[float] = []
     v4_times: list[float] = []
@@ -61,7 +65,7 @@ def test_dns_resolution(samples: int = 5) -> dict[str, Any]:
         t0 = time.perf_counter()
         try:
             res_unspec = socket.getaddrinfo(
-                HOST, PORT, family=socket.AF_UNSPEC, type=socket.SOCK_STREAM
+                host, PORT, family=socket.AF_UNSPEC, type=socket.SOCK_STREAM
             )
             unspec_times.append((time.perf_counter() - t0) * 1000.0)
             for item in res_unspec:
@@ -76,7 +80,7 @@ def test_dns_resolution(samples: int = 5) -> dict[str, Any]:
         # Forced AF_INET (IPv4)
         t0 = time.perf_counter()
         try:
-            socket.getaddrinfo(HOST, PORT, family=socket.AF_INET, type=socket.SOCK_STREAM)
+            socket.getaddrinfo(host, PORT, family=socket.AF_INET, type=socket.SOCK_STREAM)
             v4_times.append((time.perf_counter() - t0) * 1000.0)
         except Exception:
             pass
@@ -84,7 +88,7 @@ def test_dns_resolution(samples: int = 5) -> dict[str, Any]:
         # Forced AF_INET6 (IPv6)
         t0 = time.perf_counter()
         try:
-            socket.getaddrinfo(HOST, PORT, family=socket.AF_INET6, type=socket.SOCK_STREAM)
+            socket.getaddrinfo(host, PORT, family=socket.AF_INET6, type=socket.SOCK_STREAM)
             v6_times.append((time.perf_counter() - t0) * 1000.0)
         except Exception:
             pass
@@ -93,18 +97,29 @@ def test_dns_resolution(samples: int = 5) -> dict[str, Any]:
     v4_p = compute_percentiles(v4_times)
     v6_p = compute_percentiles(v6_times)
 
+    print(f"Host:                     {host}")
     print(f"Resolved IPv4 Addresses: {v4_addrs}")
     print(f"Resolved IPv6 Addresses: {v6_addrs}")
-    print(f"DNS AF_UNSPEC (default):  P50={u_p['p50']}ms | P95={u_p['p95']}ms")
-    print(f"DNS Forced AF_INET (v4):  P50={v4_p['p50']}ms | P95={v4_p['p95']}ms")
-    print(f"DNS Forced AF_INET6 (v6): P50={v6_p['p50']}ms | P95={v6_p['p95']}ms")
+    print(
+        f"DNS AF_UNSPEC (default):  P50={u_p['p50']}ms | P95={u_p['p95']}ms | Mean={u_p['mean']}ms"
+    )
+    print(
+        f"DNS Forced AF_INET (v4):  P50={v4_p['p50']}ms | P95={v4_p['p95']}ms | "
+        f"Mean={v4_p['mean']}ms"
+    )
+    print(
+        f"DNS Forced AF_INET6 (v6): P50={v6_p['p50']}ms | P95={v6_p['p95']}ms | "
+        f"Mean={v6_p['mean']}ms"
+    )
     print("-" * 80)
     return {"v4_addrs": v4_addrs, "v6_addrs": v6_addrs}
 
 
-def test_tcp_connect_modes(v4_addrs: list[str], v6_addrs: list[str], samples: int = 5) -> None:
+def test_tcp_connect_modes(
+    host: str, v4_addrs: list[str], v6_addrs: list[str], samples: int = 20
+) -> None:
     print("=" * 80)
-    print(" 2. TCP CONNECT LATENCY BY PROTOCOL FAMILY")
+    print(f" 2. TCP CONNECT LATENCY BY PROTOCOL FAMILY — {host}")
     print("=" * 80)
 
     # 1. Default hostname connect
@@ -112,7 +127,7 @@ def test_tcp_connect_modes(v4_addrs: list[str], v6_addrs: list[str], samples: in
     for _ in range(samples):
         t0 = time.perf_counter()
         try:
-            with socket.create_connection((HOST, PORT), timeout=10.0):
+            with socket.create_connection((host, PORT), timeout=10.0):
                 default_times.append((time.perf_counter() - t0) * 1000.0)
         except Exception as e:
             default_times.append(9999.0)
@@ -120,7 +135,7 @@ def test_tcp_connect_modes(v4_addrs: list[str], v6_addrs: list[str], samples: in
 
     # 2. Forced IPv4 connect
     v4_times: list[float] = []
-    target_v4 = v4_addrs[0] if v4_addrs else HOST
+    target_v4 = v4_addrs[0] if v4_addrs else host
     for _ in range(samples):
         t0 = time.perf_counter()
         try:
@@ -150,17 +165,26 @@ def test_tcp_connect_modes(v4_addrs: list[str], v6_addrs: list[str], samples: in
 
     def_p = compute_percentiles(default_times)
     v4_p = compute_percentiles(v4_times)
-    print(f"Default Hostname Connect: P50={def_p['p50']}ms | P95={def_p['p95']}ms")
-    print(f"Forced AF_INET (IPv4):    P50={v4_p['p50']}ms | P95={v4_p['p95']}ms")
+    print(
+        f"Default Hostname Connect: P50={def_p['p50']}ms | P95={def_p['p95']}ms | "
+        f"Mean={def_p['mean']}ms"
+    )
+    print(
+        f"Forced AF_INET (IPv4):    P50={v4_p['p50']}ms | P95={v4_p['p95']}ms | "
+        f"Mean={v4_p['mean']}ms"
+    )
     if v6_times:
         v6_p = compute_percentiles(v6_times)
-        print(f"Forced AF_INET6 (IPv6):   P50={v6_p['p50']}ms | P95={v6_p['p95']}ms")
+        print(
+            f"Forced AF_INET6 (IPv6):   P50={v6_p['p50']}ms | P95={v6_p['p95']}ms | "
+            f"Mean={v6_p['mean']}ms"
+        )
     print("-" * 80)
 
 
-async def test_asyncio_happy_eyeballs(samples: int = 5) -> None:
+async def test_asyncio_happy_eyeballs(host: str, samples: int = 20) -> None:
     print("=" * 80)
-    print(" 3. ASYNCIO HAPPY EYEBALLS (RFC 6555 / RFC 8305)")
+    print(f" 3. ASYNCIO HAPPY EYEBALLS (RFC 6555 / RFC 8305) — {host}")
     print("=" * 80)
 
     # Standard asyncio.open_connection
@@ -168,7 +192,7 @@ async def test_asyncio_happy_eyeballs(samples: int = 5) -> None:
     for _ in range(samples):
         t0 = time.perf_counter()
         try:
-            r, w = await asyncio.open_connection(HOST, PORT, happy_eyeballs_delay=0.25)
+            r, w = await asyncio.open_connection(host, PORT, happy_eyeballs_delay=0.25)
             he_times.append((time.perf_counter() - t0) * 1000.0)
             w.close()
             await w.wait_closed()
@@ -180,7 +204,7 @@ async def test_asyncio_happy_eyeballs(samples: int = 5) -> None:
     for _ in range(samples):
         t0 = time.perf_counter()
         try:
-            r, w = await asyncio.open_connection(HOST, PORT, family=socket.AF_INET)
+            r, w = await asyncio.open_connection(host, PORT, family=socket.AF_INET)
             v4_async_times.append((time.perf_counter() - t0) * 1000.0)
             w.close()
             await w.wait_closed()
@@ -189,14 +213,20 @@ async def test_asyncio_happy_eyeballs(samples: int = 5) -> None:
 
     he_p = compute_percentiles(he_times)
     v4_p = compute_percentiles(v4_async_times)
-    print(f"Asyncio Happy Eyeballs: P50={he_p['p50']}ms | P95={he_p['p95']}ms")
-    print(f"Asyncio Forced AF_INET: P50={v4_p['p50']}ms | P95={v4_p['p95']}ms")
+    print(
+        f"Asyncio Happy Eyeballs: P50={he_p['p50']}ms | P95={he_p['p95']}ms | Mean={he_p['mean']}ms"
+    )
+    print(
+        f"Asyncio Forced AF_INET: P50={v4_p['p50']}ms | P95={v4_p['p95']}ms | Mean={v4_p['mean']}ms"
+    )
     print("-" * 80)
 
 
-async def test_complete_connection_phases(api_key: str, samples: int = 5) -> None:
+async def test_complete_connection_phases(
+    host: str, api_key: str, samples: int = 20
+) -> dict[str, dict[str, str]]:
     print("=" * 80)
-    print(" 4. DETAILED BREAKDOWN PER PHASE (DNS, TCP, TLS, WS CONNECT)")
+    print(f" 4. DETAILED BREAKDOWN PER PHASE (DNS, TCP, TLS, WS CONNECT) — {host}")
     print("=" * 80)
     import websockets
 
@@ -213,7 +243,7 @@ async def test_complete_connection_phases(api_key: str, samples: int = 5) -> Non
 
         # Phase 1: DNS
         t0 = time.perf_counter()
-        addr_info = socket.getaddrinfo(HOST, PORT, family=socket.AF_INET, type=socket.SOCK_STREAM)
+        addr_info = socket.getaddrinfo(host, PORT, family=socket.AF_INET, type=socket.SOCK_STREAM)
         ip = addr_info[0][4][0]
         t_dns = (time.perf_counter() - t0) * 1000.0
         dns_times.append(t_dns)
@@ -234,7 +264,7 @@ async def test_complete_connection_phases(api_key: str, samples: int = 5) -> Non
         protocol = transport.get_protocol()
         new_transport = await asyncio.wait_for(
             loop.start_tls(
-                transport, protocol, ssl_context, server_side=False, server_hostname=HOST
+                transport, protocol, ssl_context, server_side=False, server_hostname=host
             ),
             timeout=15.0,
         )
@@ -245,7 +275,7 @@ async def test_complete_connection_phases(api_key: str, samples: int = 5) -> Non
         # Phase 4: Full WebSocket connect (over websockets library with IPv4)
         t0 = time.perf_counter()
         headers = {"Authorization": f"Token {api_key}"}
-        url = "wss://api.deepgram.com/v1/listen?model=nova-3&encoding=linear16&sample_rate=16000"
+        url = f"wss://{host}/v1/listen?model=nova-3&encoding=linear16&sample_rate=16000"
         async with websockets.connect(
             url,
             additional_headers=headers,
@@ -261,13 +291,14 @@ async def test_complete_connection_phases(api_key: str, samples: int = 5) -> Non
         total_times.append(t_total)
 
         print(
-            f"  [Sample {idx + 1}] DNS: {t_dns:6.2f}ms | TCP: {t_tcp:6.2f}ms | "
-            f"TLS: {t_tls:6.2f}ms | WS Connect: {t_ws:6.2f}ms | Total: {t_total:6.2f}ms"
+            f"  [{host} Sample {idx + 1:2d}/{samples}] DNS: {t_dns:6.2f}ms | TCP: {t_tcp:6.2f}ms | "
+            f"TLS: {t_tls:6.2f}ms | WS Upgrade: {t_ws:6.2f}ms | Total: {t_total:6.2f}ms"
         )
-        await asyncio.sleep(0.5)
+        await asyncio.sleep(0.2)
 
     print("-" * 80)
-    print("PHASE SUMMARY (PERCENTILES):")
+    print(f"PHASE SUMMARY (PERCENTILES) — {host} (N={samples}):")
+    summary: dict[str, dict[str, str]] = {}
     for name, data in [
         ("DNS (IPv4)", dns_times),
         ("TCP Connect (IPv4)", tcp_times),
@@ -276,23 +307,62 @@ async def test_complete_connection_phases(api_key: str, samples: int = 5) -> Non
         ("Total Session Setup", total_times),
     ]:
         p = compute_percentiles(data)
+        summary[name] = p
         print(
             f"  {name:22s}: P50={p['p50']:>7s}ms | P95={p['p95']:>7s}ms | "
             f"Max={p['max']:>7s}ms | Mean={p['mean']:>7s}ms"
         )
     print("=" * 80)
+    return summary
+
+
+async def run_diagnostics_for_host(host: str, api_key: str, samples: int = 20) -> dict[str, Any]:
+    print("\n" + "#" * 80)
+    print(f"# RUNNING CONNECTION PHASE DIAGNOSTICS FOR: {host} ({samples} SAMPLES)")
+    print("#" * 80)
+    addrs = test_dns_resolution(host, samples=samples)
+    test_tcp_connect_modes(host, addrs["v4_addrs"], addrs["v6_addrs"], samples=samples)
+    await test_asyncio_happy_eyeballs(host, samples=samples)
+    summary = await test_complete_connection_phases(host, api_key, samples=samples)
+    return {"host": host, "summary": summary}
 
 
 async def main() -> None:
+    parser = argparse.ArgumentParser(description="Deepgram Connection Phases Diagnostic")
+    parser.add_argument("--samples", type=int, default=20, help="Number of samples (default: 20)")
+    parser.add_argument(
+        "--host",
+        type=str,
+        default=None,
+        help="Specific host to test (e.g. api.in.deepgram.com or api.deepgram.com)",
+    )
+    args = parser.parse_args()
+
     api_key = os.environ.get("DEEPGRAM_API_KEY", "").strip()
     if not api_key:
         print("[ERROR] DEEPGRAM_API_KEY is not set.")
         return
 
-    addrs = test_dns_resolution(samples=3)
-    test_tcp_connect_modes(addrs["v4_addrs"], addrs["v6_addrs"], samples=3)
-    await test_asyncio_happy_eyeballs(samples=3)
-    await test_complete_connection_phases(api_key, samples=5)
+    hosts = [args.host] if args.host else ["api.in.deepgram.com", "api.deepgram.com"]
+
+    results = []
+    for h in hosts:
+        res = await run_diagnostics_for_host(h, api_key, samples=args.samples)
+        results.append(res)
+
+    if len(results) > 1:
+        print("\n" + "=" * 80)
+        print(" COMPARATIVE SUMMARY (P50 / P95):")
+        print("=" * 80)
+        print(f"{'Metric':<24} | {'api.in.deepgram.com':<24} | {'api.deepgram.com':<24}")
+        print("-" * 80)
+        s_in = results[0]["summary"]
+        s_gl = results[1]["summary"]
+        for metric in s_in:
+            in_str = f"P50={s_in[metric]['p50']} P95={s_in[metric]['p95']}"
+            gl_str = f"P50={s_gl[metric]['p50']} P95={s_gl[metric]['p95']}"
+            print(f"{metric:<24} | {in_str:<24} | {gl_str:<24}")
+        print("=" * 80)
 
 
 if __name__ == "__main__":

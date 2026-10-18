@@ -304,7 +304,7 @@ BINARY_HEADER_FORMAT = CANONICAL_BINARY_HEADER_FORMAT
 BINARY_HEADER_SIZE = 18
 
 
-@dataclass(frozen=True)
+@dataclass(frozen=True, slots=True)
 class AudioHeader:
     """Header prepended to all binary audio chunks (18 bytes)."""
 
@@ -429,6 +429,7 @@ class TranscriptFinalPayload(BaseModel):
     utterance_id: str = Field(..., min_length=24, max_length=24)
     speaker_id: str
     speaker_name: str | None = None
+    speaker_epoch: int = 0
     channel: int | None = None
     text: str
     start_ms: int
@@ -438,6 +439,11 @@ class TranscriptFinalPayload(BaseModel):
     language: str
     provider: str
     model: str
+    chunk_seq: int | None = None
+    chunk_recv_wall: float | None = None
+    final_recv_perf: float | None = None
+    publish_wall: float | None = None
+    e2e_ms: float | None = None
 
 
 class TranscriptInterimPayload(BaseModel):

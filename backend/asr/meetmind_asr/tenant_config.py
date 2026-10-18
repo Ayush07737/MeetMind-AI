@@ -10,6 +10,7 @@ import json
 import logging
 from abc import ABC, abstractmethod
 from pathlib import Path
+from typing import Literal
 
 from pydantic import BaseModel, Field
 
@@ -22,6 +23,7 @@ class AsrTenantConfig(BaseModel):
     tenant_id: str
     language: str = "en"
     keyterms: list[str] = Field(default_factory=list)
+    asr_region: Literal["global", "in", "eu"] = "global"
 
 
 class TenantAsrConfigProvider(ABC):
@@ -57,6 +59,7 @@ class FileTenantAsrConfigProvider(TenantAsrConfigProvider):
                     tenant_id=tid,
                     language=tcfg.get("language", "en"),
                     keyterms=tcfg.get("keyterms", []),
+                    asr_region=tcfg.get("asr_region", "global"),
                 )
             logger.info(
                 "FileTenantAsrConfigProvider loaded %d tenants from %s: %s",
@@ -70,11 +73,24 @@ class FileTenantAsrConfigProvider(TenantAsrConfigProvider):
     async def get_config(self, tenant_id: str) -> AsrTenantConfig:
         if tenant_id in self._configs:
             cfg = self._configs[tenant_id]
-            logger.info("get_config for '%s' found: %d keyterms", tenant_id, len(cfg.keyterms))
+            logger.info(
+                "get_config for '%s' found: %d keyterms, region=%s",
+                tenant_id,
+                len(cfg.keyterms),
+                cfg.asr_region,
+            )
             return cfg
-        logger.warning(
-            "get_config for '%s' NOT found in %s! Defaulting to empty keyterms",
-            tenant_id,
-            list(self._configs.keys()),
-        )
-        return AsrTenantConfig(tenant_id=tenant_id, language="en", keyterms=[])
+        # Fallback to TenantRouter if available
+        try:
+            from meetmind_security import db
+
+            sec_cfg = db._router.resolve(tenant_id)
+            return AsrTenantConfig(
+                tenant_id=tenant_id,
+                language="en",
+                keyterms=[],
+                asr_region=getattr(sec_cfg, "asr_region", "global"),
+            )
+        except Exception:
+            pass
+        return AsrTenantConfig(tenant_id=tenant_id, language="en", keyterms=[], asr_region="global")

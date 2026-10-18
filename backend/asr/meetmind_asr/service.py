@@ -19,7 +19,7 @@ from meetmind_schemas.keys import ACTIVE_MEETINGS_SET_KEY, asr_owner_key
 from meetmind_security.tenant import configure_tenant_router
 
 from .audit import AsrAuditor
-from .config import AsrSettings
+from .config import AsrSettings, resolve_asr_base_url
 from .health import AsrMetrics, HealthServer, init_gc_monitor
 from .pipeline import MeetingPipeline
 from .providers import get_provider
@@ -79,6 +79,16 @@ class AsrService:
             app_env=app_env,
             allow_dynamic=(app_env in ("development", "dev", "test")),
         )
+
+        # Performance, loop monitoring & GC optimizations (Requirement 4)
+        loop = asyncio.get_running_loop()
+        loop.slow_callback_duration = 0.050  # 50 ms slow callback threshold
+        import gc
+
+        gc.collect()
+        if hasattr(gc, "freeze"):
+            gc.freeze()
+        gc.set_threshold(70000, 10, 10)
 
         self.auditor.start()
         init_gc_monitor(self.metrics)
@@ -166,10 +176,14 @@ class AsrService:
             "redis_client": self.redis,
         }
         if self.settings.asr_provider == "deepgram" and self.settings.deepgram_api_key:
+            effective_region = (
+                t_cfg.asr_region if t_cfg.asr_region != "global" else self.settings.asr_region
+            )
+            base_url = resolve_asr_base_url(self.settings, effective_region)
             provider_kwargs.update(
                 {
                     "api_key": self.settings.deepgram_api_key,
-                    "base_url": self.settings.deepgram_base_url,
+                    "base_url": base_url,
                     "mip_opt_out": True,
                 }
             )
