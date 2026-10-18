@@ -47,15 +47,33 @@ async def run_janitor_sweep(
 
     abandoned_count = 0
     try:
-        keys = await redis_client.keys("mm:*:meeting:*")
-        now = time.time()
-        for k in keys:
-            k_str = k.decode("utf-8") if isinstance(k, bytes) else str(k)
-            parts = k_str.split(":")
-            if len(parts) != 4:
-                continue
-            tenant_id, meeting_id = parts[1], parts[3]
+        # Collect target meeting keys using active_meetings set + scan_iter, eliminating KEYS
+        meeting_targets: list[tuple[str, str, str]] = []
+        seen_keys: set[str] = set()
 
+        with contextlib.suppress(Exception):
+            from .keys import active_meetings_set_key
+
+            active_members = await redis_client.smembers(active_meetings_set_key())
+            for m in active_members:
+                m_str = m.decode("utf-8") if isinstance(m, bytes) else str(m)
+                if "|" in m_str:
+                    tid, mid = m_str.split("|", 1)
+                    k_str = f"mm:{tid}:meeting:{mid}"
+                    if k_str not in seen_keys:
+                        seen_keys.add(k_str)
+                        meeting_targets.append((tid, mid, k_str))
+
+        async for k in redis_client.scan_iter("mm:*:meeting:*", count=100):
+            k_str = k.decode("utf-8") if isinstance(k, bytes) else str(k)
+            if k_str not in seen_keys:
+                parts = k_str.split(":")
+                if len(parts) == 4:
+                    seen_keys.add(k_str)
+                    meeting_targets.append((parts[1], parts[3], k_str))
+
+        now = time.time()
+        for tenant_id, meeting_id, k_str in meeting_targets:
             data = await session_manager.get_session_data(meeting_id, tenant_id)
             if not data:
                 continue

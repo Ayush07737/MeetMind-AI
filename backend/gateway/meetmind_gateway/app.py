@@ -376,8 +376,7 @@ def create_app(settings: GatewaySettings | None = None) -> FastAPI:
         all_workers: list[dict[str, Any]] = []
         if hasattr(app.state, "redis"):
             try:
-                keys = await app.state.redis.keys("mm:system:worker_metrics:*")
-                for k in keys:
+                async for k in app.state.redis.scan_iter("mm:system:worker_metrics:*", count=50):
                     raw = await app.state.redis.get(k)
                     if raw:
                         all_workers.append(json.loads(raw))

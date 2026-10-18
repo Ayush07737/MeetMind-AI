@@ -153,9 +153,8 @@ class SessionManager:
     async def find_meeting_tenant(self, meeting_id: str) -> str | None:
         """Probe for which tenant holds this meeting (for audit logging only)."""
         try:
-            keys = await self._redis.keys(f"mm:*:meeting:{meeting_id}")
-            if keys:
-                k_str = keys[0].decode("utf-8") if isinstance(keys[0], bytes) else str(keys[0])
+            async for k in self._redis.scan_iter(f"mm:*:meeting:{meeting_id}", count=50):
+                k_str = k.decode("utf-8") if isinstance(k, bytes) else str(k)
                 parts = k_str.split(":")
                 if len(parts) >= 2:
                     return parts[1]

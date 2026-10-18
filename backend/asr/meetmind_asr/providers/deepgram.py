@@ -94,6 +94,10 @@ class DeepgramProvider(ASRProvider):
         self.accepted_client_seqs: set[int] = set()
 
     @property
+    def base_url(self) -> str:
+        return self._base_url
+
+    @property
     def session(self) -> ProviderSession | None:
         return self._session
 

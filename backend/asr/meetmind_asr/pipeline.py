@@ -81,6 +81,7 @@ class MeetingPipeline:
 
         self._timeline = TimelineMapper()
         self._dedupe = Deduplicator()
+        self._speaker_resolver: SpeakerNameResolver | None = None
         self._highest_published_start_ms: dict[tuple[int, str], int] = collections.defaultdict(
             lambda: -1
         )
@@ -108,8 +109,15 @@ class MeetingPipeline:
         # Replay window: keep last sent chunks within replay window for resending on crash/reconnect
         self._sent_replay_history: collections.deque[tuple[float, AudioChunk]] = collections.deque()
 
-        # Chunk history: [start_ms, end_ms, t_recv_wall, t_recv_perf, t_send_perf]
-        self._chunk_history: collections.deque[list[Any]] = collections.deque(maxlen=3000)
+        # Speaker alignment & session tracking
+        self._speaker_epoch: int = 0
+        self._speaker_mapping: dict[int, str] = {}
+        self._published_utterances_for_alignment: collections.deque[
+            tuple[int, int, str, str]
+        ] = collections.deque(maxlen=200)
+
+        # Chunk history: [client_seq, start_ms, end_ms, t_recv_wall, t_recv_perf, t_send_perf]
+        self._chunk_history: collections.deque[list[Any]] = collections.deque(maxlen=1200)
         self._seen_interim_words: set[tuple[str, int]] = set()
         self._standby_provider: ASRProvider | None = None
 
@@ -144,13 +152,23 @@ class MeetingPipeline:
         if self.settings.asr_warm_standby:
             asyncio.create_task(self._init_standby())
 
-        # Record audit start
+        # Record audit start with dynamic endpoint host
+        import urllib.parse
+
+        endpoint_url = (
+            getattr(self.provider, "base_url", None)
+            or getattr(self.provider, "_base_url", None)
+            or self.settings.deepgram_base_url
+        )
+        parsed_endpoint = urllib.parse.urlparse(endpoint_url)
+        endpoint_host = parsed_endpoint.netloc or parsed_endpoint.path or endpoint_url
+
         self.auditor.record_session_started(
             tenant_id=self.tenant_id,
             user_id="system_asr",
             meeting_id=self.meeting_id,
             provider=self.settings.asr_provider,
-            endpoint_host=self.settings.deepgram_base_url,
+            endpoint_host=endpoint_host,
             language=self.tenant_config.language,
             mip_opt_out=True,
         )
@@ -264,10 +282,11 @@ class MeetingPipeline:
 
             provider_kwargs: dict[str, Any] = {"redis_client": self.redis}
             if self.settings.asr_provider == "deepgram" and self.settings.deepgram_api_key:
+                prov_base_url = getattr(self.provider, "base_url", self.settings.deepgram_base_url)
                 provider_kwargs.update(
                     {
                         "api_key": self.settings.deepgram_api_key,
-                        "base_url": self.settings.deepgram_base_url,
+                        "base_url": prov_base_url,
                         "mip_opt_out": True,
                     }
                 )
@@ -290,21 +309,28 @@ class MeetingPipeline:
                 exc,
             )
 
-    def _find_chunk_for_end_ms(self, end_ms: int) -> tuple[float, float, float] | None:
-        """Find (t_recv_wall, t_recv_perf, t_send_perf) for chunk containing end_ms."""
+    def _find_chunk_for_end_ms(
+        self, end_ms: int
+    ) -> tuple[int, float, float, float] | None:
+        """Find (client_seq, t_recv_wall, t_recv_perf, t_send_perf) for chunk containing end_ms."""
         if not self._chunk_history:
             return None
         best_match = None
         min_distance = float("inf")
-        for c_start, c_end, t_r_wall, t_r_perf, t_s_perf in reversed(self._chunk_history):
+        for (
+            client_seq,
+            c_start,
+            c_end,
+            t_r_wall,
+            t_r_perf,
+            t_s_perf,
+        ) in reversed(self._chunk_history):
             if c_start <= end_ms <= c_end:
-                return t_r_wall, t_r_perf, t_s_perf
+                return client_seq, t_r_wall, t_r_perf, t_s_perf
             dist = abs(c_end - end_ms)
             if dist < min_distance:
                 min_distance = dist
-                best_match = (t_r_wall, t_r_perf, t_s_perf)
-            if dist > 8000:
-                break
+                best_match = (client_seq, t_r_wall, t_r_perf, t_s_perf)
         return best_match
 
     async def _audio_read_loop(self) -> None:
@@ -429,7 +455,14 @@ class MeetingPipeline:
         origin = self._timeline.meeting_origin_capture_ts or hdr.capture_ts_ms
         chunk_start_ms = max(0, hdr.capture_ts_ms - origin)
         chunk_end_ms = chunk_start_ms + 100
-        hist_entry = [chunk_start_ms, chunk_end_ms, time.time(), time.perf_counter(), 0.0]
+        hist_entry = [
+            chunk.client_seq,
+            chunk_start_ms,
+            chunk_end_ms,
+            time.time(),
+            time.perf_counter(),
+            0.0,
+        ]
         self._chunk_history.append(hist_entry)
 
         # Enqueue chunk
@@ -460,7 +493,7 @@ class MeetingPipeline:
                 await self.provider.send_audio(chunk)
                 t_send = time.perf_counter()
                 if hist_entry is not None:
-                    hist_entry[4] = t_send
+                    hist_entry[5] = t_send
                 self._pending_acks.append((t_send, entry_id))
                 self._sent_replay_history.append((t_send, chunk))
                 self._timeline.register_chunk(chunk.capture_ts_ms)
@@ -498,6 +531,8 @@ class MeetingPipeline:
             and getattr(self._standby_provider, "_is_open", False)
         ):
             logger.info("Warm standby swap engaged for meeting %s", self.meeting_id)
+            self._speaker_epoch += 1
+            self._speaker_mapping.clear()
             old_prov = self.provider
             self.provider = self._standby_provider
             self._standby_provider = None
@@ -588,6 +623,8 @@ class MeetingPipeline:
                 await self._connect_provider()
 
                 # Reconnect successful: reset timeline session and resend replay window
+                self._speaker_epoch += 1
+                self._speaker_mapping.clear()
                 self._timeline.reset_session()
                 reaccept_time: float | None = None
                 replay_chunks = list(self._sent_replay_history)
@@ -725,18 +762,50 @@ class MeetingPipeline:
         start_ms, end_ms, start_epoch_ms = self._timeline.map_range(event.start_ms, event.end_ms)
         self.metrics.record_stage_timing("timeline", (time.perf_counter() - t_tl_0) * 1000.0)
 
-        # Stage 2: Speaker resolution
+        # Stage 2: Speaker resolution & alignment across epochs
         t_spk_0 = time.perf_counter()
+        raw_spk = event.speaker
+
+        if self._channels == 2:
+            if event.channel == 0:
+                spk_id = "spk_0"
+            else:
+                spk_id = f"spk_{raw_spk}" if raw_spk is not None else "spk_1"
+        else:
+            if self._speaker_epoch == 0:
+                spk_id = f"spk_{raw_spk}"
+            else:
+                if raw_spk in self._speaker_mapping:
+                    spk_id = self._speaker_mapping[raw_spk]
+                else:
+                    aligned = None
+                    clean_text = event.text.strip().lower()
+                    for prev_start, prev_end, prev_text, prev_spk in reversed(
+                        self._published_utterances_for_alignment
+                    ):
+                        time_overlap = max(start_ms, prev_start) <= min(end_ms, prev_end) + 1000
+                        if (
+                            time_overlap
+                            and clean_text
+                            and (clean_text in prev_text or prev_text in clean_text)
+                        ):
+                            aligned = prev_spk
+                            break
+                    if aligned:
+                        self._speaker_mapping[raw_spk] = aligned
+                        spk_id = aligned
+                    else:
+                        spk_id = "spk_unknown"
+
         spk_name = None
-        if self._speaker_resolver:
+        if self._speaker_resolver and spk_id != "spk_unknown":
             spk_name = self._speaker_resolver.resolve(
                 channels=self._channels,
                 channel=event.channel,
-                speaker=event.speaker,
+                speaker=raw_spk,
             )
         self.metrics.record_stage_timing("speaker", (time.perf_counter() - t_spk_0) * 1000.0)
 
-        spk_id = f"spk_{event.speaker}"
         now_ms = int(time.time() * 1000)
 
         if event.is_final:
@@ -761,10 +830,27 @@ class MeetingPipeline:
                 return
 
             self._dedupe.record_published(uid, event.channel, event.text, start_ms, end_ms)
+            self._published_utterances_for_alignment.append(
+                (start_ms, end_ms, event.text.strip().lower(), spk_id)
+            )
             self._highest_published_start_ms[spk_key] = max(
                 self._highest_published_start_ms[spk_key], start_ms
             )
             self.metrics.record_stage_timing("dedupe", (time.perf_counter() - t_dd_0) * 1000.0)
+
+            # End-to-end and Provider latency:
+            chunk_match = self._find_chunk_for_end_ms(end_ms)
+            chunk_seq = None
+            c_recv_wall = None
+            e2e_ms = None
+            if chunk_match:
+                chunk_seq, c_recv_wall, c_recv_perf, c_send_perf = chunk_match
+                t_pub_wall = time.time()
+                e2e_ms = max(0.1, (t_pub_wall - c_recv_wall) * 1000.0)
+                self.metrics.record_e2e_latency(e2e_ms)
+                if c_send_perf > 0 and getattr(event, "recv_perf", 0.0) > 0:
+                    prov_ms = max(0.1, (event.recv_perf - c_send_perf) * 1000.0)
+                    self.metrics.record_provider_latency(prov_ms)
 
             # Stage 4: Serialization
             t_ser_0 = time.perf_counter()
@@ -772,6 +858,7 @@ class MeetingPipeline:
                 "utterance_id": uid,
                 "speaker_id": spk_id,
                 "speaker_name": spk_name,
+                "speaker_epoch": self._speaker_epoch,
                 "channel": event.channel,
                 "text": event.text,
                 "start_ms": start_ms,
@@ -781,6 +868,11 @@ class MeetingPipeline:
                 "language": self.tenant_config.language,
                 "provider": self.settings.asr_provider,
                 "model": "nova-3",
+                "chunk_seq": chunk_seq,
+                "chunk_recv_wall": c_recv_wall,
+                "final_recv_perf": getattr(event, "recv_perf", 0.0),
+                "publish_wall": time.time(),
+                "e2e_ms": round(e2e_ms, 2) if e2e_ms is not None else None,
             }
 
             envelope = {
@@ -805,7 +897,6 @@ class MeetingPipeline:
             pipe.expire(self._events_key, 86400)
             await pipe.execute()
             t_pub_perf = time.perf_counter()
-            t_pub_wall = time.time()
             xadd_ms = (t_pub_perf - t_xadd_0) * 1000.0
             self.metrics.record_stage_timing("xadd", xadd_ms)
             self.metrics.record_publish_latency(xadd_ms)
@@ -814,16 +905,6 @@ class MeetingPipeline:
             if getattr(event, "recv_perf", 0.0) > 0:
                 svc_ms = max(0.01, (t_pub_perf - event.recv_perf) * 1000.0)
                 self.metrics.record_service_added_latency(svc_ms)
-
-            # End-to-end and Provider latency:
-            chunk_match = self._find_chunk_for_end_ms(end_ms)
-            if chunk_match:
-                c_recv_wall, c_recv_perf, c_send_perf = chunk_match
-                e2e_ms = max(0.1, (t_pub_wall - c_recv_wall) * 1000.0)
-                self.metrics.record_e2e_latency(e2e_ms)
-                if c_send_perf > 0 and getattr(event, "recv_perf", 0.0) > 0:
-                    prov_ms = max(0.1, (event.recv_perf - c_send_perf) * 1000.0)
-                    self.metrics.record_provider_latency(prov_ms)
 
         else:
             # Interim result -> published to OUT stream only
@@ -846,7 +927,7 @@ class MeetingPipeline:
                             self._seen_interim_words.clear()
                         c_match = self._find_chunk_for_end_ms(w_end_mtg_ms)
                         if c_match:
-                            _, c_recv_perf, _ = c_match
+                            _, _, c_recv_perf, _ = c_match
                             i_lat = max(0.1, (t_interim_now - c_recv_perf) * 1000.0)
                             self.metrics.record_interim_latency(i_lat)
 
@@ -958,6 +1039,15 @@ class MeetingPipeline:
                                 await self._process_raw_entry(entry_id, fields)
                     if not found_any:
                         break
+        except Exception:
+            pass
+
+        # Drain all remaining buffered audio chunks to provider
+        try:
+            while self._buffer and self.provider.is_open:
+                chunk = self._buffer.popleft()
+                await self.provider.send_audio(chunk)
+                await asyncio.sleep(0.002)
         except Exception:
             pass
 

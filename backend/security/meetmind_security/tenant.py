@@ -57,6 +57,9 @@ class TenantConfig:
     # Redis - key prefix
     redis_prefix: str
 
+    # ASR residency region ("global", "in", "eu")
+    asr_region: str = "global"
+
     def __post_init__(self) -> None:
         norm_id = normalize_tenant_id(self.tenant_id)
         if self.tenant_id != norm_id:
@@ -65,6 +68,13 @@ class TenantConfig:
             raise ValueError(
                 f"Invalid pg_schema '{self.pg_schema}': must match ^[a-z0-9_]{{1,48}}$"
             )
+        reg = self.asr_region.strip().lower()
+        if reg not in ("global", "in", "eu"):
+            raise ValueError(
+                f"Invalid asr_region '{self.asr_region}': must be one of ('global', 'in', 'eu')"
+            )
+        if self.asr_region != reg:
+            object.__setattr__(self, "asr_region", reg)
 
 
 class TenantNotFoundError(Exception):
@@ -160,10 +170,12 @@ class TenantRouter:
                 or existing.neo4j_namespace != config.neo4j_namespace
                 or existing.qdrant_prefix != config.qdrant_prefix
                 or existing.redis_prefix != config.redis_prefix
+                or existing.asr_region != config.asr_region
             ):
                 raise ValueError(
                     f"Tenant collision for '{norm_id}': existing schema '{existing.pg_schema}' "
-                    f"conflicts with new schema '{config.pg_schema}'"
+                    f"(region '{existing.asr_region}') conflicts with new schema "
+                    f"'{config.pg_schema}' (region '{config.asr_region}')"
                 )
         self._configs[norm_id] = config
 

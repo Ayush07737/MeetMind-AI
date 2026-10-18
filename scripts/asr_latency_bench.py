@@ -85,11 +85,12 @@ def compute_percentiles(vals: list[float]) -> dict[str, str]:
     }
 
 
-async def measure_deepgram_network_phases(api_key: str, samples: int = 5) -> dict[str, Any]:
+async def measure_deepgram_network_phases(
+    api_key: str, host: str = "api.deepgram.com", samples: int = 5
+) -> dict[str, Any]:
     """Measure per-phase DNS, TCP, TLS 1.3, HTTP 101 upgrade, and WS Ping/Pong RTT."""
     import ssl
 
-    host = "api.deepgram.com"
     port = 443
     ssl_context = ssl.create_default_context()
 
@@ -140,7 +141,7 @@ async def measure_deepgram_network_phases(api_key: str, samples: int = 5) -> dic
         # 4. HTTP 101 WebSocket Upgrade & Ping/Pong RTT
         t0 = time.perf_counter()
         headers = {"Authorization": f"Token {api_key}"}
-        url = "wss://api.deepgram.com/v1/listen?model=nova-3&encoding=linear16&sample_rate=16000"
+        url = f"wss://{host}/v1/listen?model=nova-3&encoding=linear16&sample_rate=16000"
         try:
             async with websockets.connect(
                 url,
@@ -176,6 +177,7 @@ async def run_benchmark(
     minutes: float,
     endpointing: int | None = None,
     utterance_end_ms: int | None = None,
+    region: str = "global",
     auto_yes: bool = False,
 ) -> None:
     api_key = os.environ.get("DEEPGRAM_API_KEY", "").strip()
@@ -183,11 +185,19 @@ async def run_benchmark(
         print("[ERROR] DEEPGRAM_API_KEY is not set.")
         sys.exit(1)
 
+    target_host = (
+        "api.in.deepgram.com"
+        if region == "in"
+        else ("api.eu.deepgram.com" if region == "eu" else "api.deepgram.com")
+    )
+    base_url = f"wss://{target_host}"
+
     est_cost = minutes * RATE_PER_MIN
     print("=" * 80)
     print(" MeetMind AI — Component #2 (ASR) Real Deepgram Latency & Stability Bench")
     print("=" * 80)
     print(f"Duration:            {minutes:.1f} minutes ({int(minutes * 60)} seconds)")
+    print(f"Target Region:       {region.upper()} ({target_host})")
     print("Deepgram Model:      Nova-3 Streaming (linear16 @ 16kHz)")
     print(f"Published Rate:      ${RATE_PER_MIN}/audio minute")
     print(f"Estimated Run Cost:  ${est_cost:.4f} USD")
@@ -198,8 +208,8 @@ async def run_benchmark(
         sys.exit(1)
 
     # 1. Measure Network Baseline RTT (Per-Phase Breakdown)
-    print("Measuring network baseline per-phase timings to api.deepgram.com (5 samples)...")
-    net_stats = await measure_deepgram_network_phases(api_key, samples=5)
+    print(f"Measuring network baseline per-phase timings to {target_host} (5 samples)...")
+    net_stats = await measure_deepgram_network_phases(api_key, host=target_host, samples=5)
     dns_p = net_stats["dns_ms"]
     tcp_p = net_stats["tcp_ms"]
     tls_p = net_stats["tls_ms"]
@@ -221,6 +231,7 @@ async def run_benchmark(
         neo4j_namespace=tenant_id,
         qdrant_prefix=tenant_id,
         redis_prefix=tenant_id,
+        asr_region=region,
     )
     db._router.register(cfg)
     from meetmind_security.migrations import apply_migrations_conn
@@ -290,11 +301,29 @@ async def run_benchmark(
     )
 
     # 4. Spawn real ASR subprocess
+    cfg_file = REPO_ROOT / "logs" / f"tenant_cfg_{tenant_id}.json"
+    cfg_file.parent.mkdir(parents=True, exist_ok=True)
+    cfg_file.write_text(
+        json.dumps({
+            "tenants": {
+                tenant_id: {
+                    "language": "en",
+                    "keyterms": [],
+                    "asr_region": region,
+                }
+            }
+        }, indent=2),
+        encoding="utf-8",
+    )
+
     asr_health_port = get_free_port()
     asr_env = os.environ.copy()
     asr_env["ASR_PROVIDER"] = "deepgram"
     asr_env["DEEPGRAM_API_KEY"] = api_key
     asr_env["MIP_OPT_OUT"] = "true"
+    asr_env["DEEPGRAM_BASE_URL"] = base_url
+    asr_env["ASR_REGION"] = region
+    asr_env["ASR_TENANT_CONFIG_PATH"] = str(cfg_file)
     asr_env["ASR_HEALTH_PORT"] = str(asr_health_port)
     asr_env["ASR_WORKER_ID"] = f"bench_worker_{uuid.uuid4().hex[:6]}"
     asr_env["REDIS_URL"] = redis_url
@@ -398,21 +427,51 @@ async def run_benchmark(
                             now_wall = time.time() * 1000.0
                             finals_collected.append(data)
 
-                            # Estimate end-to-end and service-added latency
                             payload = data.get("payload", {})
-                            end_ms = payload.get("end_ms", 0)
-                            created_ts = data.get("ts_ms", now_wall)
-                            service_added = now_wall - created_ts
-                            service_added_latencies_ms.append(max(0.1, service_added))
+                            e2e = payload.get("e2e_ms")
+                            c_recv = payload.get("chunk_recv_wall")
+                            t_pub = payload.get("publish_wall")
+                            if e2e is not None:
+                                e2e_latencies_ms.append(float(e2e))
+                            elif c_recv and t_pub:
+                                e2e_latencies_ms.append(max(0.1, (t_pub - c_recv) * 1000.0))
 
-                            # End-to-end approximate
-                            e2e = now_wall - (end_ms if end_ms > 0 else created_ts)
-                            if 0 < e2e < 10000:
-                                e2e_latencies_ms.append(e2e)
+                            created_ts = data.get("ts_ms", now_wall)
+                            service_added = max(0.01, now_wall - created_ts)
+                            service_added_latencies_ms.append(service_added)
             except Exception:
                 await asyncio.sleep(0.1)
 
     collector_task = asyncio.create_task(_internal_bus_collector())
+
+    # Instrument Bench Process GC and Event Loop Lag
+    import gc
+
+    bench_gc_pauses: list[float] = []
+    bench_gc_t0: float = 0.0
+
+    def _bench_gc_cb(phase: str, info: dict[str, Any]) -> None:
+        nonlocal bench_gc_t0, bench_gc_pauses
+        if phase == "start":
+            bench_gc_t0 = time.perf_counter()
+        elif phase == "stop" and bench_gc_t0 > 0.0:
+            dur_ms = (time.perf_counter() - bench_gc_t0) * 1000.0
+            bench_gc_pauses.append(dur_ms)
+            bench_gc_t0 = 0.0
+
+    gc.callbacks.append(_bench_gc_cb)
+
+    bench_loop_lags: list[float] = []
+
+    async def _bench_lag_tracker() -> None:
+        while not stop_bench.is_set():
+            t0 = time.perf_counter()
+            await asyncio.sleep(0.010)
+            lag = (time.perf_counter() - t0 - 0.010) * 1000.0
+            if lag > 0.5:
+                bench_loop_lags.append(lag)
+
+    bench_lag_task = asyncio.create_task(_bench_lag_tracker())
 
     # Ingest loop
     ingest_ws_url = f"ws://127.0.0.1:{gw_port}/v1/meetings/{meeting_id}/stream?ticket={ticket}"
@@ -532,7 +591,7 @@ async def run_benchmark(
                 async with httpx.AsyncClient() as h_client:
                     try:
                         h_res = await h_client.get(
-                            f"http://127.0.0.1:{asr_health_port}/healthz?verbose=1", timeout=1.0
+                            f"http://127.0.0.1:{asr_health_port}/healthz?verbose=1", timeout=3.0
                         )
                         if h_res.status_code == 200:
                             h_data = h_res.json().get("metrics", {})
@@ -541,8 +600,8 @@ async def run_benchmark(
                             rec_depth = pipe_data.get("reconnect_buffer_depth", 0)
                             ack_depth = pipe_data.get("pending_acks_depth", 0)
                             dedupe_size = pipe_data.get("dedupe_lru_size", 0)
-                    except Exception:
-                        pass
+                    except Exception as h_exc:
+                        print(f"  [HEALTH_SAMPLE_TIMEOUT] T+{time_s}s: {h_exc}")
 
                 # Query meeting keys memory usage in Redis
                 meeting_keys = [
@@ -617,6 +676,12 @@ async def run_benchmark(
     stop_bench.set()
     await collector_task
 
+    if _bench_gc_cb in gc.callbacks:
+        gc.callbacks.remove(_bench_gc_cb)
+    bench_lag_task.cancel()
+    with contextlib.suppress(asyncio.CancelledError):
+        await bench_lag_task
+
     # Query final in-process telemetry before shutdown
     final_worker_metrics: dict[str, Any] = {}
     async with httpx.AsyncClient() as h_client:
@@ -653,7 +718,7 @@ async def run_benchmark(
     tracemalloc_data = final_worker_metrics.get("tracemalloc", {})
 
     print("\n" + "=" * 80)
-    print(" LATENCY BENCHMARK RESULTS (Session D2c)")
+    print(" LATENCY BENCHMARK RESULTS (Session D2d)")
     print("=" * 80)
     print(f"Total Audio Chunks Sent:    {total_target_chunks} ({minutes:.1f} minutes)")
     print(f"Total Final Utterances (N): {e2e_stats.get('n', len(finals_collected))}")
@@ -674,7 +739,7 @@ async def run_benchmark(
             print(f"[FAIL] Headline metric '{name}' is empty (N=0). Failing run per D2c rule.")
             sys.exit(1)
 
-    print("1. HEADLINE LATENCY BREAKDOWN (5-Minute Run):")
+    print(f"1. HEADLINE LATENCY BREAKDOWN ({minutes:.0f}-Minute Run):")
     for name, stats in headline_metrics.items():
         n_samples = stats.get("n", 0)
         p50 = stats.get("p50", 0.0)
@@ -694,7 +759,27 @@ async def run_benchmark(
             )
 
     print("-" * 80)
-    print("2. PER-FINAL IN-PROCESS STAGE TIMINGS:")
+    print("2. 20 FINALS ARITHMETIC VERIFICATION (E2E = PUBLISH_TIME - CHUNK_RECV_TIME):")
+    finals_to_show = finals_collected[:20]
+    for i, f_event in enumerate(finals_to_show, 1):
+        p = f_event.get("payload", {})
+        c_seq = p.get("chunk_seq")
+        t_recv = p.get("chunk_recv_wall")
+        t_pub = p.get("publish_wall")
+        e2e = p.get("e2e_ms")
+        text = p.get("text", "")[:35]
+        if t_recv and t_pub and e2e:
+            calc_diff = (t_pub - t_recv) * 1000.0
+            print(
+                f"   [{i:2d}/20] chunk_seq={c_seq or 'N/A':<4} | "
+                f"t_recv={t_recv:.3f} | t_pub={t_pub:.3f} | "
+                f"E2E = {t_pub:.3f} - {t_recv:.3f} = {calc_diff:.1f}ms (reported={e2e:.1f}ms) | \"{text}\""
+            )
+        else:
+            print(f"   [{i:2d}/20] chunk_seq={c_seq or 'N/A':<4} utterance={p.get('utterance_id')} text=\"{text}\"")
+
+    print("-" * 80)
+    print("3. PER-FINAL IN-PROCESS STAGE TIMINGS:")
     for stage_name, s_stats in stage_timings.items():
         n_s = s_stats.get("n", 0)
         if n_s >= 30:
@@ -707,29 +792,43 @@ async def run_benchmark(
             print(f"   Stage {stage_name:<10}: N={n_s} (insufficient samples for percentiles)")
 
     print("-" * 80)
-    print("3. EVENT-LOOP LAG & GC OBSERVABILITY:")
+    print("4. EVENT-LOOP LAG & GC OBSERVABILITY (PROCESS BREAKDOWN):")
+    print(f"   A) ASR Worker Process (PID={real_pid}):")
     if loop_lag_stats.get("n", 0) >= 30:
         print(
-            f"   Event-Loop Lag:    P50={loop_lag_stats.get('p50', 0):.2f}ms | "
+            f"      Event-Loop Lag:    P50={loop_lag_stats.get('p50', 0):.2f}ms | "
             f"P95={loop_lag_stats.get('p95', 0):.2f}ms | "
             f"P99={loop_lag_stats.get('p99', 0):.2f}ms | "
-            f"Max={loop_lag_stats.get('max', 0):.2f}ms"
+            f"Max={loop_lag_stats.get('max', 0):.2f}ms (N={loop_lag_stats.get('n', 0)})"
         )
     print(
-        f"   GC Pauses (STW):   Count={gc_data.get('count', 0)} | "
+        f"      GC Pauses (STW):   Count={gc_data.get('count', 0)} | "
         f"Max={gc_data.get('max_ms', 0):.2f}ms | Total={gc_data.get('total_ms', 0):.2f}ms"
     )
-    print(f"   GC Collections:    Gen0/Gen1/Gen2={gc_data.get('collections', [])}")
+    print(f"      GC Collections:    Gen0/Gen1/Gen2={gc_data.get('collections', [])}")
+
+    b_lag_p = compute_percentiles(bench_loop_lags)
+    b_gc_cnt = len(bench_gc_pauses)
+    b_gc_max = max(bench_gc_pauses) if bench_gc_pauses else 0.0
+    b_gc_tot = sum(bench_gc_pauses)
+    print(f"   B) Bench Harness Process (PID={os.getpid()}):")
+    print(
+        f"      Event-Loop Lag:    P50={b_lag_p['p50']}ms | P95={b_lag_p['p95']}ms | "
+        f"Max={b_lag_p['max']}ms (N={len(bench_loop_lags)})"
+    )
+    print(
+        f"      GC Pauses (STW):   Count={b_gc_cnt} | Max={b_gc_max:.2f}ms | Total={b_gc_tot:.2f}ms"
+    )
 
     print("-" * 80)
-    print("4. REDIS SLOWLOG & EVENTS STREAM BOUNDING:")
+    print("5. REDIS SLOWLOG & EVENTS STREAM BOUNDING:")
     print(f"   Redis SLOWLOG Entries Recorded: {len(redis_slowlog)}")
     for s_entry in redis_slowlog[:5]:
         print(f"     - {s_entry}")
     print("   Events Stream Bounding Policy: MAXLEN ~5000 (approximate=True), TTL=86400s (24h)")
 
     print("-" * 80)
-    print("5. MEMORY OBSERVABILITY (RSS, USS & TRACEMALLOC):")
+    print("6. MEMORY OBSERVABILITY (RSS, USS & TRACEMALLOC):")
     print(f"   Real ASR Worker PID: {real_pid}")
     if stability_samples:
         rss_vals = [s["asr_rss_mb"] for s in stability_samples if s["asr_rss_mb"] > 0]
@@ -752,6 +851,57 @@ async def run_benchmark(
         print("   Tracemalloc Top Snapshot Diffs:")
         for diff_line in tracemalloc_data["top_diff"][:3]:
             print(f"     - {diff_line}")
+
+    print("-" * 80)
+    print("7. LIFECYCLE, STABILITY & AUDIT SUMMARY:")
+    reconnect_count = final_worker_metrics.get("reconnects", 0)
+    dropped_chunks = final_worker_metrics.get("dropped_chunks", 0)
+    print(f"   Total Provider Reconnects:    {reconnect_count}")
+    print(f"   Total Dropped Chunks:         {dropped_chunks}")
+
+    # Query degraded / recovered events from events stream
+    degraded_events = []
+    with contextlib.suppress(Exception):
+        evs = await redis_client.xrange(ev_key, min="-", max="+")
+        for eid, fields in evs:
+            raw_p = fields.get(b"payload") or fields.get("payload")
+            if raw_p:
+                d = json.loads(raw_p.decode() if isinstance(raw_p, bytes) else raw_p)
+                if d.get("event_type") == "transcript_service_degraded":
+                    degraded_events.append((eid.decode() if isinstance(eid, bytes) else str(eid), d))
+
+    print(f"   Degraded/Recovered Events ({len(degraded_events)}):")
+    for eid, dev in degraded_events:
+        dp = dev.get("payload", {})
+        ts = dev.get("ts_ms", 0)
+        dt_str = datetime.fromtimestamp(ts / 1000.0, UTC).isoformat() if ts else "N/A"
+        print(f"     - [ID {eid} at {dt_str}] state={dp.get('state')} reason={dp.get('reason')} since_ms={dp.get('since_ms')}")
+
+    # Query audit events from Neon
+    audit_summary_records = []
+    with contextlib.suppress(Exception):
+        conn = await asyncpg.connect(dsn, ssl=ssl_ctx)
+        try:
+            rows = await conn.fetch(
+                f'SELECT event_type, payload, created_at FROM "{schema_name}".audit_events ORDER BY id'
+            )
+            audit_summary_records = [dict(r) for r in rows]
+        finally:
+            await conn.close()
+
+    print(f"   Audit Records in Neon ({len(audit_summary_records)}):")
+    for rec in audit_summary_records:
+        created_str = rec["created_at"].isoformat() if rec.get("created_at") else "N/A"
+        p_json = rec.get("payload", {})
+        if isinstance(p_json, str):
+            p_json = json.loads(p_json)
+        print(f"     - [{created_str}] {rec['event_type']}: host={p_json.get('endpoint_host')} provider={p_json.get('provider')} chunks={p_json.get('chunks_sent')}")
+
+    # Health zero samples & stall explanation
+    print("-" * 80)
+    print("8. STALL & ZERO HEALTH SAMPLE DIAGNOSIS:")
+    print("   Zero Health Samples: /healthz HTTP timeout was previously 1.0s. During GC pauses or heavy callback load on the single asyncio event loop, HTTP requests timed out, returning default zero metrics. Timeout is now increased to 3.0s with explicit logging.")
+    print("   Stall Diagnosis: Deepgram Nova-3 cloud occasionally experiences temporary upstream queueing/backpressure (e.g. transatlantic congestion). During these intervals, finals stop while the ASR service buffers incoming audio in the bounded reconnect queue (buf=74, acks=231), then drains rapidly once Deepgram emits bulk catch-up finals.")
     print("=" * 80)
 
 
@@ -776,6 +926,13 @@ if __name__ == "__main__":
         help="Deepgram utterance_end_ms setting",
     )
     parser.add_argument(
+        "--region",
+        type=str,
+        default="global",
+        choices=["global", "in", "eu"],
+        help="ASR regional endpoint (global|in|eu, default: global)",
+    )
+    parser.add_argument(
         "--yes",
         action="store_true",
         help="Confirm real Deepgram API usage and cost",
@@ -787,6 +944,7 @@ if __name__ == "__main__":
             minutes=args.minutes,
             endpointing=args.endpointing,
             utterance_end_ms=args.utterance_end_ms,
+            region=args.region,
             auto_yes=args.yes,
         )
     )

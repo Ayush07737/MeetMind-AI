@@ -42,6 +42,7 @@ class AsrSettings(BaseSettings):
     asr_stub_replay_jitter_ms: int = Field(default=0, alias="ASR_STUB_REPLAY_JITTER_MS")
     asr_test_hooks: bool = Field(default=False, alias="ASR_TEST_HOOKS")
     asr_warm_standby: bool = Field(default=False, alias="ASR_WARM_STANDBY")
+    asr_region: Literal["global", "in", "eu"] = Field(default="global", alias="ASR_REGION")
 
     @model_validator(mode="after")
     def validate_provider_requirements(self) -> AsrSettings:
@@ -59,6 +60,48 @@ class AsrSettings(BaseSettings):
         if self.asr_buffer_max_seconds <= 0:
             raise ValueError("ASR_BUFFER_MAX_SECONDS must be greater than 0")
         return self
+
+
+DEEPGRAM_REGION_HOSTS: dict[str, str] = {
+    "global": "api.deepgram.com",
+    "in": "api.in.deepgram.com",
+    "eu": "api.eu.deepgram.com",
+}
+
+ALLOWED_ASR_HOSTS: set[str] = {
+    "api.deepgram.com",
+    "api.in.deepgram.com",
+    "api.eu.deepgram.com",
+    "127.0.0.1",
+    "localhost",
+}
+
+
+def resolve_asr_base_url(settings: AsrSettings, region: str = "global") -> str:
+    """Resolve Deepgram WebSocket base URL based on region and settings with host allow-list."""
+    import urllib.parse
+
+    norm_region = region.lower().strip()
+    if norm_region not in DEEPGRAM_REGION_HOSTS:
+        raise ValueError(
+            f"Invalid asr_region '{region}'. Allowed: {sorted(DEEPGRAM_REGION_HOSTS.keys())}"
+        )
+
+    # If settings.deepgram_base_url is explicitly set to a local test host, permit it
+    if settings.deepgram_base_url and not settings.deepgram_base_url.startswith("wss://api."):
+        parsed = urllib.parse.urlparse(settings.deepgram_base_url)
+        host = (parsed.hostname or "").lower()
+        if host not in ALLOWED_ASR_HOSTS:
+            raise ValueError(
+                f"ASR host '{host}' is not in ALLOWED_ASR_HOSTS: {sorted(ALLOWED_ASR_HOSTS)}"
+            )
+        return settings.deepgram_base_url
+
+    target_host = DEEPGRAM_REGION_HOSTS[norm_region]
+    if target_host not in ALLOWED_ASR_HOSTS:
+        raise ValueError(f"Target ASR host '{target_host}' violates ALLOWED_ASR_HOSTS")
+
+    return f"wss://{target_host}"
 
 
 def get_settings() -> AsrSettings:

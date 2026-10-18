@@ -375,6 +375,7 @@ export const TranscriptFinalPayloadSchema = z.object({
   utterance_id: z.string().length(24),
   speaker_id: z.string(),
   speaker_name: z.string().nullable().optional(),
+  speaker_epoch: z.number().int().default(0),
   channel: z.number().int().nullable().optional(),
   text: z.string(),
   start_ms: z.number().int(),
@@ -384,6 +385,11 @@ export const TranscriptFinalPayloadSchema = z.object({
   language: z.string(),
   provider: z.string(),
   model: z.string(),
+  chunk_seq: z.number().int().nullable().optional(),
+  chunk_recv_wall: z.number().nullable().optional(),
+  final_recv_perf: z.number().nullable().optional(),
+  publish_wall: z.number().nullable().optional(),
+  e2e_ms: z.number().nullable().optional(),
 });
 export type TranscriptFinalPayload = z.infer<typeof TranscriptFinalPayloadSchema>;
 
