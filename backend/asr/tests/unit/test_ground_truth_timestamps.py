@@ -62,8 +62,7 @@ def test_timeline_continuous_streaming_ground_truth() -> None:
     p95_start_err = s_sorted[int(len(s_sorted) * 0.95)]
 
     print(
-        f"\nContinuous Stream: Mean Error={mean_start_err:.2f}ms | "
-        f"P95 Error={p95_start_err:.2f}ms"
+        f"\nContinuous Stream: Mean Error={mean_start_err:.2f}ms | P95 Error={p95_start_err:.2f}ms"
     )
     assert mean_start_err <= 150.0, f"Mean error {mean_start_err}ms exceeds 150ms target"
     assert p95_start_err <= 150.0, f"P95 error {p95_start_err}ms exceeds 150ms target"

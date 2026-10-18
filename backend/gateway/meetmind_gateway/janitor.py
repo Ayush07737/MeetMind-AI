@@ -64,13 +64,22 @@ async def run_janitor_sweep(
                         seen_keys.add(k_str)
                         meeting_targets.append((tid, mid, k_str))
 
-        async for k in redis_client.scan_iter("mm:*:meeting:*", count=100):
-            k_str = k.decode("utf-8") if isinstance(k, bytes) else str(k)
-            if k_str not in seen_keys:
-                parts = k_str.split(":")
-                if len(parts) == 4:
-                    seen_keys.add(k_str)
-                    meeting_targets.append((parts[1], parts[3], k_str))
+        if hasattr(redis_client, "scan_iter"):
+            async for k in redis_client.scan_iter("mm:*:meeting:*", count=100):
+                k_str = k.decode("utf-8") if isinstance(k, bytes) else str(k)
+                if k_str not in seen_keys:
+                    parts = k_str.split(":")
+                    if len(parts) == 4:
+                        seen_keys.add(k_str)
+                        meeting_targets.append((parts[1], parts[3], k_str))
+        elif hasattr(redis_client, "keys"):
+            for k in await redis_client.keys("mm:*:meeting:*"):
+                k_str = k.decode("utf-8") if isinstance(k, bytes) else str(k)
+                if k_str not in seen_keys:
+                    parts = k_str.split(":")
+                    if len(parts) == 4:
+                        seen_keys.add(k_str)
+                        meeting_targets.append((parts[1], parts[3], k_str))
 
         now = time.time()
         for tenant_id, meeting_id, k_str in meeting_targets:

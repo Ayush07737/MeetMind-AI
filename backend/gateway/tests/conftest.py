@@ -99,6 +99,14 @@ class FakeRedis:
         all_keys = set(self._data.keys()) | set(self._streams.keys())
         return [k.encode("utf-8") for k in all_keys if fnmatch.fnmatch(k, pattern)]
 
+    async def scan_iter(self, match: str = "*", count: int | None = None):
+        import fnmatch
+
+        all_keys = sorted(set(self._data.keys()) | set(self._streams.keys()))
+        for k in all_keys:
+            if fnmatch.fnmatch(k, match):
+                yield k.encode("utf-8")
+
     async def pexpire(self, key: str, time: int) -> bool:
         return key in self._data
 

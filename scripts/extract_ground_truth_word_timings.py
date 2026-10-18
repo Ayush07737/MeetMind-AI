@@ -9,9 +9,8 @@ from __future__ import annotations
 
 import json
 import subprocess
-from pathlib import Path
 import wave
-import struct
+from pathlib import Path
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 OUTPUT_DIR = REPO_ROOT / "tests" / "fixtures" / "audio" / "generated"
@@ -58,7 +57,11 @@ def extract_turn_words(text: str, voice: str) -> list[dict]:
     $synth.Dispose()
     $words | ConvertTo-Json
     """
-    res = subprocess.run(["powershell", "-NoProfile", "-Command", ps_script], capture_output=True, text=True)
+    res = subprocess.run(
+        ["powershell", "-NoProfile", "-Command", ps_script],
+        capture_output=True,
+        text=True,
+    )
     if res.returncode != 0:
         raise RuntimeError(f"PowerShell failed: {res.stderr}")
     return json.loads(res.stdout)
@@ -82,7 +85,11 @@ def get_turn_durations() -> list[int]:
             f"$synth.Speak('{safe_text}'); "
             "$synth.Dispose();"
         )
-        subprocess.run(["powershell", "-NoProfile", "-Command", ps_cmd], check=True, capture_output=True)
+        subprocess.run(
+            ["powershell", "-NoProfile", "-Command", ps_cmd],
+            check=True,
+            capture_output=True,
+        )
         with wave.open(str(temp_wav), "rb") as wf:
             lengths.append(wf.getnframes())
     temp_wav.unlink(missing_ok=True)
@@ -112,19 +119,24 @@ def main() -> None:
             else:
                 word_end_ms = int(turn_st_ms + turn_len_ms)
 
-            all_words.append({
-                "word": w["text"].strip().lower().rstrip(".,?!"),
-                "speaker": spk,
-                "turn": turn_idx,
-                "start_ms": word_st_ms,
-                "end_ms": word_end_ms,
-            })
+            all_words.append(
+                {
+                    "word": w["text"].strip().lower().rstrip(".,?!"),
+                    "speaker": spk,
+                    "turn": turn_idx,
+                    "start_ms": word_st_ms,
+                    "end_ms": word_end_ms,
+                }
+            )
 
     out_file = OUTPUT_DIR / "30s_word_timings.json"
     out_file.write_text(json.dumps(all_words, indent=2), encoding="utf-8")
     print(f"Extracted {len(all_words)} ground-truth words to {out_file}")
     for sample in all_words[:10]:
-        print(f"  {sample['word']:<12} [{sample['speaker']}]: start_ms={sample['start_ms']:5d} end_ms={sample['end_ms']:5d}")
+        print(
+            f"  {sample['word']:<12} [{sample['speaker']}]: "
+            f"start_ms={sample['start_ms']:5d} end_ms={sample['end_ms']:5d}"
+        )
 
 
 if __name__ == "__main__":

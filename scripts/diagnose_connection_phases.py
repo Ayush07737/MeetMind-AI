@@ -100,14 +100,24 @@ def test_dns_resolution(host: str, samples: int = 20) -> dict[str, Any]:
     print(f"Host:                     {host}")
     print(f"Resolved IPv4 Addresses: {v4_addrs}")
     print(f"Resolved IPv6 Addresses: {v6_addrs}")
-    print(f"DNS AF_UNSPEC (default):  P50={u_p['p50']}ms | P95={u_p['p95']}ms | Mean={u_p['mean']}ms")
-    print(f"DNS Forced AF_INET (v4):  P50={v4_p['p50']}ms | P95={v4_p['p95']}ms | Mean={v4_p['mean']}ms")
-    print(f"DNS Forced AF_INET6 (v6): P50={v6_p['p50']}ms | P95={v6_p['p95']}ms | Mean={v6_p['mean']}ms")
+    print(
+        f"DNS AF_UNSPEC (default):  P50={u_p['p50']}ms | P95={u_p['p95']}ms | Mean={u_p['mean']}ms"
+    )
+    print(
+        f"DNS Forced AF_INET (v4):  P50={v4_p['p50']}ms | P95={v4_p['p95']}ms | "
+        f"Mean={v4_p['mean']}ms"
+    )
+    print(
+        f"DNS Forced AF_INET6 (v6): P50={v6_p['p50']}ms | P95={v6_p['p95']}ms | "
+        f"Mean={v6_p['mean']}ms"
+    )
     print("-" * 80)
     return {"v4_addrs": v4_addrs, "v6_addrs": v6_addrs}
 
 
-def test_tcp_connect_modes(host: str, v4_addrs: list[str], v6_addrs: list[str], samples: int = 20) -> None:
+def test_tcp_connect_modes(
+    host: str, v4_addrs: list[str], v6_addrs: list[str], samples: int = 20
+) -> None:
     print("=" * 80)
     print(f" 2. TCP CONNECT LATENCY BY PROTOCOL FAMILY — {host}")
     print("=" * 80)
@@ -155,11 +165,20 @@ def test_tcp_connect_modes(host: str, v4_addrs: list[str], v6_addrs: list[str], 
 
     def_p = compute_percentiles(default_times)
     v4_p = compute_percentiles(v4_times)
-    print(f"Default Hostname Connect: P50={def_p['p50']}ms | P95={def_p['p95']}ms | Mean={def_p['mean']}ms")
-    print(f"Forced AF_INET (IPv4):    P50={v4_p['p50']}ms | P95={v4_p['p95']}ms | Mean={v4_p['mean']}ms")
+    print(
+        f"Default Hostname Connect: P50={def_p['p50']}ms | P95={def_p['p95']}ms | "
+        f"Mean={def_p['mean']}ms"
+    )
+    print(
+        f"Forced AF_INET (IPv4):    P50={v4_p['p50']}ms | P95={v4_p['p95']}ms | "
+        f"Mean={v4_p['mean']}ms"
+    )
     if v6_times:
         v6_p = compute_percentiles(v6_times)
-        print(f"Forced AF_INET6 (IPv6):   P50={v6_p['p50']}ms | P95={v6_p['p95']}ms | Mean={v6_p['mean']}ms")
+        print(
+            f"Forced AF_INET6 (IPv6):   P50={v6_p['p50']}ms | P95={v6_p['p95']}ms | "
+            f"Mean={v6_p['mean']}ms"
+        )
     print("-" * 80)
 
 
@@ -194,12 +213,18 @@ async def test_asyncio_happy_eyeballs(host: str, samples: int = 20) -> None:
 
     he_p = compute_percentiles(he_times)
     v4_p = compute_percentiles(v4_async_times)
-    print(f"Asyncio Happy Eyeballs: P50={he_p['p50']}ms | P95={he_p['p95']}ms | Mean={he_p['mean']}ms")
-    print(f"Asyncio Forced AF_INET: P50={v4_p['p50']}ms | P95={v4_p['p95']}ms | Mean={v4_p['mean']}ms")
+    print(
+        f"Asyncio Happy Eyeballs: P50={he_p['p50']}ms | P95={he_p['p95']}ms | Mean={he_p['mean']}ms"
+    )
+    print(
+        f"Asyncio Forced AF_INET: P50={v4_p['p50']}ms | P95={v4_p['p95']}ms | Mean={v4_p['mean']}ms"
+    )
     print("-" * 80)
 
 
-async def test_complete_connection_phases(host: str, api_key: str, samples: int = 20) -> dict[str, dict[str, str]]:
+async def test_complete_connection_phases(
+    host: str, api_key: str, samples: int = 20
+) -> dict[str, dict[str, str]]:
     print("=" * 80)
     print(f" 4. DETAILED BREAKDOWN PER PHASE (DNS, TCP, TLS, WS CONNECT) — {host}")
     print("=" * 80)
@@ -318,10 +343,7 @@ async def main() -> None:
         print("[ERROR] DEEPGRAM_API_KEY is not set.")
         return
 
-    if args.host:
-        hosts = [args.host]
-    else:
-        hosts = ["api.in.deepgram.com", "api.deepgram.com"]
+    hosts = [args.host] if args.host else ["api.in.deepgram.com", "api.deepgram.com"]
 
     results = []
     for h in hosts:

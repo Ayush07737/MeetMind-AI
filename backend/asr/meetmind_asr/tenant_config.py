@@ -93,6 +93,4 @@ class FileTenantAsrConfigProvider(TenantAsrConfigProvider):
             )
         except Exception:
             pass
-        return AsrTenantConfig(
-            tenant_id=tenant_id, language="en", keyterms=[], asr_region="global"
-        )
+        return AsrTenantConfig(tenant_id=tenant_id, language="en", keyterms=[], asr_region="global")

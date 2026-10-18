@@ -26,9 +26,7 @@ from meetmind_asr.tenant_config import AsrTenantConfig
 @pytest.mark.asyncio
 async def test_speaker_identity_alignment_across_reconnect() -> None:
     settings = AsrSettings()
-    tenant_cfg = AsrTenantConfig(
-        tenant_id="test_spk_tenant", language="en-US", asr_region="global"
-    )
+    tenant_cfg = AsrTenantConfig(tenant_id="test_spk_tenant", language="en-US", asr_region="global")
     metrics = AsrMetrics()
     auditor = MagicMock()
     redis_client = AsyncMock()

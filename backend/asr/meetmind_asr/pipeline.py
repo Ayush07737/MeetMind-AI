@@ -112,9 +112,9 @@ class MeetingPipeline:
         # Speaker alignment & session tracking
         self._speaker_epoch: int = 0
         self._speaker_mapping: dict[int, str] = {}
-        self._published_utterances_for_alignment: collections.deque[
-            tuple[int, int, str, str]
-        ] = collections.deque(maxlen=200)
+        self._published_utterances_for_alignment: collections.deque[tuple[int, int, str, str]] = (
+            collections.deque(maxlen=200)
+        )
 
         # Chunk history: [client_seq, start_ms, end_ms, t_recv_wall, t_recv_perf, t_send_perf]
         self._chunk_history: collections.deque[list[Any]] = collections.deque(maxlen=1200)
@@ -309,9 +309,7 @@ class MeetingPipeline:
                 exc,
             )
 
-    def _find_chunk_for_end_ms(
-        self, end_ms: int
-    ) -> tuple[int, float, float, float] | None:
+    def _find_chunk_for_end_ms(self, end_ms: int) -> tuple[int, float, float, float] | None:
         """Find (client_seq, t_recv_wall, t_recv_perf, t_send_perf) for chunk containing end_ms."""
         if not self._chunk_history:
             return None

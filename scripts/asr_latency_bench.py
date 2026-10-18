@@ -304,15 +304,18 @@ async def run_benchmark(
     cfg_file = REPO_ROOT / "logs" / f"tenant_cfg_{tenant_id}.json"
     cfg_file.parent.mkdir(parents=True, exist_ok=True)
     cfg_file.write_text(
-        json.dumps({
-            "tenants": {
-                tenant_id: {
-                    "language": "en",
-                    "keyterms": [],
-                    "asr_region": region,
+        json.dumps(
+            {
+                "tenants": {
+                    tenant_id: {
+                        "language": "en",
+                        "keyterms": [],
+                        "asr_region": region,
+                    }
                 }
-            }
-        }, indent=2),
+            },
+            indent=2,
+        ),
         encoding="utf-8",
     )
 
@@ -773,10 +776,14 @@ async def run_benchmark(
             print(
                 f"   [{i:2d}/20] chunk_seq={c_seq or 'N/A':<4} | "
                 f"t_recv={t_recv:.3f} | t_pub={t_pub:.3f} | "
-                f"E2E = {t_pub:.3f} - {t_recv:.3f} = {calc_diff:.1f}ms (reported={e2e:.1f}ms) | \"{text}\""
+                f"E2E = {t_pub:.3f} - {t_recv:.3f} = {calc_diff:.1f}ms "
+                f'(reported={e2e:.1f}ms) | "{text}"'
             )
         else:
-            print(f"   [{i:2d}/20] chunk_seq={c_seq or 'N/A':<4} utterance={p.get('utterance_id')} text=\"{text}\"")
+            print(
+                f"   [{i:2d}/20] chunk_seq={c_seq or 'N/A':<4} "
+                f'utterance={p.get("utterance_id")} text="{text}"'
+            )
 
     print("-" * 80)
     print("3. PER-FINAL IN-PROCESS STAGE TIMINGS:")
@@ -868,23 +875,29 @@ async def run_benchmark(
             if raw_p:
                 d = json.loads(raw_p.decode() if isinstance(raw_p, bytes) else raw_p)
                 if d.get("event_type") == "transcript_service_degraded":
-                    degraded_events.append((eid.decode() if isinstance(eid, bytes) else str(eid), d))
+                    eid_str = eid.decode() if isinstance(eid, bytes) else str(eid)
+                    degraded_events.append((eid_str, d))
 
     print(f"   Degraded/Recovered Events ({len(degraded_events)}):")
     for eid, dev in degraded_events:
         dp = dev.get("payload", {})
         ts = dev.get("ts_ms", 0)
         dt_str = datetime.fromtimestamp(ts / 1000.0, UTC).isoformat() if ts else "N/A"
-        print(f"     - [ID {eid} at {dt_str}] state={dp.get('state')} reason={dp.get('reason')} since_ms={dp.get('since_ms')}")
+        print(
+            f"     - [ID {eid} at {dt_str}] state={dp.get('state')} "
+            f"reason={dp.get('reason')} since_ms={dp.get('since_ms')}"
+        )
 
     # Query audit events from Neon
     audit_summary_records = []
     with contextlib.suppress(Exception):
         conn = await asyncpg.connect(dsn, ssl=ssl_ctx)
         try:
-            rows = await conn.fetch(
-                f'SELECT event_type, payload, created_at FROM "{schema_name}".audit_events ORDER BY id'
+            q = (
+                f'SELECT event_type, payload, created_at FROM "{schema_name}".audit_events '
+                f"ORDER BY id"
             )
+            rows = await conn.fetch(q)
             audit_summary_records = [dict(r) for r in rows]
         finally:
             await conn.close()
@@ -895,13 +908,28 @@ async def run_benchmark(
         p_json = rec.get("payload", {})
         if isinstance(p_json, str):
             p_json = json.loads(p_json)
-        print(f"     - [{created_str}] {rec['event_type']}: host={p_json.get('endpoint_host')} provider={p_json.get('provider')} chunks={p_json.get('chunks_sent')}")
+        host_val = p_json.get("endpoint_host")
+        prov_val = p_json.get("provider")
+        chunks_val = p_json.get("chunks_sent")
+        print(
+            f"     - [{created_str}] {rec['event_type']}: host={host_val} "
+            f"provider={prov_val} chunks={chunks_val}"
+        )
 
     # Health zero samples & stall explanation
     print("-" * 80)
     print("8. STALL & ZERO HEALTH SAMPLE DIAGNOSIS:")
-    print("   Zero Health Samples: /healthz HTTP timeout was previously 1.0s. During GC pauses or heavy callback load on the single asyncio event loop, HTTP requests timed out, returning default zero metrics. Timeout is now increased to 3.0s with explicit logging.")
-    print("   Stall Diagnosis: Deepgram Nova-3 cloud occasionally experiences temporary upstream queueing/backpressure (e.g. transatlantic congestion). During these intervals, finals stop while the ASR service buffers incoming audio in the bounded reconnect queue (buf=74, acks=231), then drains rapidly once Deepgram emits bulk catch-up finals.")
+    print(
+        "   Zero Health Samples: /healthz HTTP timeout was previously 1.0s. During GC pauses "
+        "or heavy callback load on the single asyncio event loop, HTTP requests timed out, "
+        "returning default zero metrics. Timeout is now increased to 3.0s with explicit logging."
+    )
+    print(
+        "   Stall Diagnosis: Deepgram Nova-3 cloud occasionally experiences temporary upstream "
+        "queueing/backpressure (e.g. transatlantic congestion). During these intervals, finals "
+        "stop while the ASR service buffers incoming audio in the bounded reconnect queue "
+        "(buf=74, acks=231), then drains rapidly once Deepgram emits bulk catch-up finals."
+    )
     print("=" * 80)
 
 
