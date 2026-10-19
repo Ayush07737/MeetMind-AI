@@ -107,7 +107,14 @@ class AsrService:
         self._reconcile_task = asyncio.create_task(self._reconcile_loop())
         if self.settings.asr_test_hooks:
             self._control_task = asyncio.create_task(self._control_loop())
-        logger.info("MeetMind ASR Service started with worker_id=%s", self.worker_id)
+        logger.info(
+            "MeetMind ASR Service started with worker_id=%s, default_region=%s, "
+            "allowed_regions=%s, test_hooks=%s",
+            self.worker_id,
+            self.settings.asr_region,
+            sorted(self.settings.allowed_regions_set),
+            self.settings.asr_test_hooks,
+        )
 
     async def _ensure_lifecycle_group(self) -> None:
         try:
@@ -175,16 +182,79 @@ class AsrService:
         provider_kwargs: dict[str, Any] = {
             "redis_client": self.redis,
         }
+
+        # Resolve effective region: None = inherit from settings.asr_region
+        # ("global" is NOT sentinel)
+        requested_region = (
+            t_cfg.asr_region if t_cfg.asr_region is not None else self.settings.asr_region
+        )
+        effective_region = requested_region
+
+        if requested_region not in self.settings.allowed_regions_set:
+            if t_cfg.residency_mode == "strict":
+                logger.error(
+                    "Tenant %s requested region '%s' not in ASR_ALLOWED_REGIONS %s. "
+                    "Residency mode is 'strict': refusing session and emitting degraded event.",
+                    tenant,
+                    requested_region,
+                    sorted(self.settings.allowed_regions_set),
+                )
+                pipeline_stub = MeetingPipeline(
+                    tenant_id=tenant,
+                    meeting_id=meeting_id,
+                    worker_id=self.worker_id,
+                    redis_client=self.redis,
+                    provider=get_provider("stub", redis_client=self.redis),
+                    tenant_config=t_cfg,
+                    settings=self.settings,
+                    metrics=self.metrics,
+                    auditor=self.auditor,
+                )
+                await pipeline_stub._emit_degraded_event(
+                    state="degraded",
+                    reason="region_not_allowed",
+                )
+                return
+            else:
+                # Preferred mode: fall back to global if global allowed, audited
+                if "global" in self.settings.allowed_regions_set:
+                    effective_region = "global"
+                    logger.warning(
+                        "Tenant %s requested region '%s' not in ASR_ALLOWED_REGIONS %s. "
+                        "Residency mode is 'preferred': falling back to global (audited).",
+                        tenant,
+                        requested_region,
+                        sorted(self.settings.allowed_regions_set),
+                    )
+                    self.auditor._enqueue(
+                        tenant,
+                        "system_asr",
+                        "asr_region_fallback",
+                        {
+                            "meeting_id": meeting_id,
+                            "requested_region": requested_region,
+                            "effective_region": effective_region,
+                        },
+                    )
+                else:
+                    logger.error(
+                        "Tenant %s requested region '%s' not allowed and "
+                        "global fallback unavailable.",
+                        tenant,
+                        requested_region,
+                    )
+                    return
+
+        # Policy Invariant: Any non-global region or strict tenant forces mip_opt_out=true
+        mip_opt_out = True
+
+        base_url = resolve_asr_base_url(self.settings, effective_region)
         if self.settings.asr_provider == "deepgram" and self.settings.deepgram_api_key:
-            effective_region = (
-                t_cfg.asr_region if t_cfg.asr_region != "global" else self.settings.asr_region
-            )
-            base_url = resolve_asr_base_url(self.settings, effective_region)
             provider_kwargs.update(
                 {
                     "api_key": self.settings.deepgram_api_key,
                     "base_url": base_url,
-                    "mip_opt_out": True,
+                    "mip_opt_out": mip_opt_out,
                 }
             )
 

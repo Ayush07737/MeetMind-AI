@@ -36,6 +36,7 @@ class StubFaultConfig:
     error_on_chunk: int | None = None
     error_on_open: bool = False
     latency_ms: float = 5.0
+    final_delay_ms: float = 0.0
 
 
 class StubProvider(ASRProvider):
@@ -88,6 +89,7 @@ class StubProvider(ASRProvider):
                 self._fault_config.error_on_chunk = data.get("error_on_chunk")
                 self._fault_config.error_on_open = bool(data.get("error_on_open", False))
                 self._fault_config.latency_ms = float(data.get("latency_ms", 5.0))
+                self._fault_config.final_delay_ms = float(data.get("final_delay_ms", 0.0))
             except Exception:
                 pass
 
@@ -214,6 +216,9 @@ class StubProvider(ASRProvider):
 
             self._current_text_idx += 1
             self._chunk_buffer.clear()
+
+            if self._fault_config.final_delay_ms > 0:
+                await asyncio.sleep(self._fault_config.final_delay_ms / 1000.0)
 
             await self._event_queue.put(
                 ProviderEvent(

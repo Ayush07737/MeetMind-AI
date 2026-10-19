@@ -283,12 +283,19 @@ class HealthServer:
                         }
 
                         curr_alloc, peak_alloc = tracemalloc.get_traced_memory()
-                        curr_snap = tracemalloc.take_snapshot()
-                        diff_stats = curr_snap.compare_to(_tracemalloc_base, "lineno")
+                        top_diff: list[str] = []
+                        if "snapshot=1" in path:
+                            def _take_diff() -> list[str]:
+                                curr_snap = tracemalloc.take_snapshot()
+                                diff = curr_snap.compare_to(_tracemalloc_base, "lineno")[:5]
+                                return [str(s) for s in diff]
+
+                            top_diff = await asyncio.to_thread(_take_diff)
+
                         resp_data["metrics"]["tracemalloc"] = {
                             "current_mb": round(curr_alloc / (1024 * 1024), 3),
                             "peak_mb": round(peak_alloc / (1024 * 1024), 3),
-                            "top_diff": [str(s) for s in diff_stats[:5]],
+                            "top_diff": top_diff,
                         }
 
                         if self.service and hasattr(self.service, "_active_pipelines"):

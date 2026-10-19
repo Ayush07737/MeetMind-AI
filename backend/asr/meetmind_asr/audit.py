@@ -49,8 +49,17 @@ class AsrAuditor:
             self._is_running = True
             self._worker_task = asyncio.create_task(self._process_queue())
 
-    async def stop(self) -> None:
-        """Drain queue and stop background worker task."""
+    async def stop(self, timeout: float = 5.0) -> None:
+        """Drain queue within bounded timeout and stop background worker task."""
+        try:
+            await asyncio.wait_for(self._queue.join(), timeout=timeout)
+        except TimeoutError:
+            logger.warning(
+                "Audit queue drain timed out after %.1fs; %d items remaining",
+                timeout,
+                self._queue.qsize(),
+            )
+
         self._is_running = False
         if self._worker_task:
             self._worker_task.cancel()

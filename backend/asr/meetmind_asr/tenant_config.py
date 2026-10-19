@@ -23,7 +23,8 @@ class AsrTenantConfig(BaseModel):
     tenant_id: str
     language: str = "en"
     keyterms: list[str] = Field(default_factory=list)
-    asr_region: Literal["global", "in", "eu"] = "global"
+    asr_region: Literal["global", "in", "eu"] | None = None
+    residency_mode: Literal["strict", "preferred"] = "strict"
 
 
 class TenantAsrConfigProvider(ABC):
@@ -59,7 +60,8 @@ class FileTenantAsrConfigProvider(TenantAsrConfigProvider):
                     tenant_id=tid,
                     language=tcfg.get("language", "en"),
                     keyterms=tcfg.get("keyterms", []),
-                    asr_region=tcfg.get("asr_region", "global"),
+                    asr_region=tcfg.get("asr_region"),
+                    residency_mode=tcfg.get("residency_mode", "strict"),
                 )
             logger.info(
                 "FileTenantAsrConfigProvider loaded %d tenants from %s: %s",
@@ -74,10 +76,11 @@ class FileTenantAsrConfigProvider(TenantAsrConfigProvider):
         if tenant_id in self._configs:
             cfg = self._configs[tenant_id]
             logger.info(
-                "get_config for '%s' found: %d keyterms, region=%s",
+                "get_config for '%s' found: %d keyterms, region=%s, residency=%s",
                 tenant_id,
                 len(cfg.keyterms),
                 cfg.asr_region,
+                cfg.residency_mode,
             )
             return cfg
         # Fallback to TenantRouter if available
@@ -89,8 +92,15 @@ class FileTenantAsrConfigProvider(TenantAsrConfigProvider):
                 tenant_id=tenant_id,
                 language="en",
                 keyterms=[],
-                asr_region=getattr(sec_cfg, "asr_region", "global"),
+                asr_region=getattr(sec_cfg, "asr_region", None),
+                residency_mode=getattr(sec_cfg, "residency_mode", "strict"),
             )
         except Exception:
             pass
-        return AsrTenantConfig(tenant_id=tenant_id, language="en", keyterms=[], asr_region="global")
+        return AsrTenantConfig(
+            tenant_id=tenant_id,
+            language="en",
+            keyterms=[],
+            asr_region=None,
+            residency_mode="strict",
+        )

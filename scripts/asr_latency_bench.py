@@ -198,6 +198,7 @@ async def run_benchmark(
     print("=" * 80)
     print(f"Duration:            {minutes:.1f} minutes ({int(minutes * 60)} seconds)")
     print(f"Target Region:       {region.upper()} ({target_host})")
+    print(f"Base WebSocket URL:  {base_url}")
     print("Deepgram Model:      Nova-3 Streaming (linear16 @ 16kHz)")
     print(f"Published Rate:      ${RATE_PER_MIN}/audio minute")
     print(f"Estimated Run Cost:  ${est_cost:.4f} USD")
@@ -232,6 +233,7 @@ async def run_benchmark(
         qdrant_prefix=tenant_id,
         redis_prefix=tenant_id,
         asr_region=region,
+        residency_mode="strict",
     )
     db._router.register(cfg)
     from meetmind_security.migrations import apply_migrations_conn
@@ -270,6 +272,8 @@ async def run_benchmark(
     redis_url = os.environ.get("ACCEPTANCE_REDIS_URL", "redis://127.0.0.1:6379/0")
     env["REDIS_URL"] = redis_url
     env["AUDIO_REDIS_URL"] = redis_url
+    env["FRAME_RATE_LIMIT"] = "300"
+    env["BURST_FRAME_LIMIT"] = "600"
     env["LOG_LEVEL"] = "WARNING"
     env["PYTHONPATH"] = (
         str(REPO_ROOT / "backend" / "gateway")
@@ -311,6 +315,7 @@ async def run_benchmark(
                         "language": "en",
                         "keyterms": [],
                         "asr_region": region,
+                        "residency_mode": "strict",
                     }
                 }
             },
@@ -324,8 +329,9 @@ async def run_benchmark(
     asr_env["ASR_PROVIDER"] = "deepgram"
     asr_env["DEEPGRAM_API_KEY"] = api_key
     asr_env["MIP_OPT_OUT"] = "true"
-    asr_env["DEEPGRAM_BASE_URL"] = base_url
+    asr_env.pop("DEEPGRAM_BASE_URL", None)
     asr_env["ASR_REGION"] = region
+    asr_env["ASR_ALLOWED_REGIONS"] = "global,in,eu"
     asr_env["ASR_TENANT_CONFIG_PATH"] = str(cfg_file)
     asr_env["ASR_HEALTH_PORT"] = str(asr_health_port)
     asr_env["ASR_WORKER_ID"] = f"bench_worker_{uuid.uuid4().hex[:6]}"
@@ -339,6 +345,8 @@ async def run_benchmark(
         + str(REPO_ROOT / "packages" / "shared-schemas" / "schemas_py")
     )
 
+    asr_log_path = REPO_ROOT / "logs" / "asr_worker_bench.log"
+    asr_log_file = open(asr_log_path, "w", encoding="utf-8")  # noqa: SIM115
     asr_proc = subprocess.Popen(
         [
             sys.executable,
@@ -346,8 +354,8 @@ async def run_benchmark(
             "meetmind_asr",
         ],
         env=asr_env,
-        stdout=subprocess.DEVNULL,
-        stderr=subprocess.DEVNULL,
+        stdout=asr_log_file,
+        stderr=subprocess.STDOUT,
     )
 
     # Wait for both to be healthy
@@ -533,9 +541,6 @@ async def run_benchmark(
             ]
         )
 
-    t_start = time.perf_counter()
-    next_sample_time = t_start + 10.0
-
     async def recv_ack(ws):
         while True:
             m = json.loads(await ws.recv())
@@ -567,6 +572,18 @@ async def run_benchmark(
             )
         )
         await ws.recv()
+
+        # Wait for ASR worker to claim meeting and open provider session
+        asr_session_key = f"mm:{tenant_id}:asr_session:{meeting_id}"
+        print("Waiting for ASR worker provider session to open...")
+        for _ in range(50):
+            if await redis_client.exists(asr_session_key):
+                break
+            await asyncio.sleep(0.1)
+        print("ASR worker provider session ready. Starting real-time audio stream...")
+
+        t_start = time.perf_counter()
+        next_sample_time = t_start + 10.0
 
         for chunk_idx in range(1, total_target_chunks + 1):
             pcm = audio_frames[(chunk_idx - 1) % len(audio_frames)]
@@ -671,6 +688,9 @@ async def run_benchmark(
             to_sleep = target_time - time.perf_counter()
             if to_sleep > 0:
                 await asyncio.sleep(to_sleep)
+            elif to_sleep < -0.3:
+                # Re-anchor pacing if the OS/process lagged to prevent burst-flooding
+                t_start = time.perf_counter() - (chunk_idx * 0.1)
 
         # End meeting
         await ws.send(json.dumps({"type": "control", "action": "meeting_end"}))
@@ -707,6 +727,7 @@ async def run_benchmark(
     gw_proc.wait()
     asr_proc.kill()
     asr_proc.wait()
+    asr_log_file.close()
     jwks.stop()
     await redis_client.aclose()
 
@@ -866,6 +887,18 @@ async def run_benchmark(
     print(f"   Total Provider Reconnects:    {reconnect_count}")
     print(f"   Total Dropped Chunks:         {dropped_chunks}")
 
+    if asr_log_path.exists():
+        with open(asr_log_path, encoding="utf-8", errors="ignore") as lf:
+            diag_lines = [
+                line.strip()
+                for line in lf
+                if "[PROVIDER_DISCONNECT_DIAGNOSTIC]" in line or "[RECONNECT_EVENT]" in line
+            ]
+        if diag_lines:
+            print(f"   Provider Disconnect Diagnostics ({len(diag_lines)}):")
+            for dline in diag_lines[:10]:
+                print(f"     - {dline}")
+
     # Query degraded / recovered events from events stream
     degraded_events = []
     with contextlib.suppress(Exception):
@@ -888,19 +921,23 @@ async def run_benchmark(
             f"reason={dp.get('reason')} since_ms={dp.get('since_ms')}"
         )
 
-    # Query audit events from Neon
+    # Query audit events from Neon (poll with bounded wait for asr_session_summary)
     audit_summary_records = []
-    with contextlib.suppress(Exception):
-        conn = await asyncpg.connect(dsn, ssl=ssl_ctx)
-        try:
-            q = (
-                f'SELECT event_type, payload, created_at FROM "{schema_name}".audit_events '
-                f"ORDER BY id"
-            )
-            rows = await conn.fetch(q)
-            audit_summary_records = [dict(r) for r in rows]
-        finally:
-            await conn.close()
+    for _ in range(20):
+        with contextlib.suppress(Exception):
+            conn = await asyncpg.connect(dsn, ssl=ssl_ctx)
+            try:
+                q = (
+                    f'SELECT event_type, payload, created_at FROM "{schema_name}".audit_events '
+                    f"ORDER BY id"
+                )
+                rows = await conn.fetch(q)
+                audit_summary_records = [dict(r) for r in rows]
+                if any(r.get("event_type") == "asr_session_summary" for r in audit_summary_records):
+                    break
+            finally:
+                await conn.close()
+        await asyncio.sleep(0.5)
 
     print(f"   Audit Records in Neon ({len(audit_summary_records)}):")
     for rec in audit_summary_records:
@@ -956,9 +993,9 @@ if __name__ == "__main__":
     parser.add_argument(
         "--region",
         type=str,
-        default="global",
+        default=None,
         choices=["global", "in", "eu"],
-        help="ASR regional endpoint (global|in|eu, default: global)",
+        help="ASR regional endpoint (global|in|eu, default: settings.asr_region from .env)",
     )
     parser.add_argument(
         "--yes",
@@ -967,12 +1004,24 @@ if __name__ == "__main__":
     )
     args = parser.parse_args()
 
+    from meetmind_asr.config import AsrSettings
+
+    bench_settings = AsrSettings()
+    if args.region is not None:
+        effective_region = args.region
+        region_source = f"CLI --region flag ('{args.region}')"
+    else:
+        effective_region = bench_settings.asr_region
+        region_source = f"AsrSettings (ASR_REGION in .env / default: '{bench_settings.asr_region}')"
+
+    print(f"[Region Resolution] Region: '{effective_region}' [Source: {region_source}]")
+
     asyncio.run(
         run_benchmark(
             minutes=args.minutes,
             endpointing=args.endpointing,
             utterance_end_ms=args.utterance_end_ms,
-            region=args.region,
+            region=effective_region,
             auto_yes=args.yes,
         )
     )

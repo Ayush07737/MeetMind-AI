@@ -118,8 +118,18 @@ class MeetingPipeline:
 
         # Chunk history: [client_seq, start_ms, end_ms, t_recv_wall, t_recv_perf, t_send_perf]
         self._chunk_history: collections.deque[list[Any]] = collections.deque(maxlen=1200)
+        self._seen_interim_words_window: collections.deque[tuple[str, int]] = collections.deque(
+            maxlen=2000
+        )
         self._seen_interim_words: set[tuple[str, int]] = set()
         self._standby_provider: ASRProvider | None = None
+
+        # Provider session timeline tracking (Requirement 2: no TimelineMapper for latency)
+        self._provider_session_origin_wall: float | None = None
+
+        # Bounded sequence dispatch deduplication (Requirement 4 & 5)
+        self._dispatched_seqs_window: collections.deque[int] = collections.deque(maxlen=5000)
+        self._dispatched_seqs_set: set[int] = set()
 
         # Audit stats
         self._chunks_sent = 0
@@ -335,13 +345,14 @@ class MeetingPipeline:
         """Read audio frames from Redis stream mm:{tenant}:audio:{meeting}."""
         while self._is_running:
             try:
-                # 1. Periodic autoclaim for entries idle > 5s
+                # 1. Periodic autoclaim for entries idle > 15s
+                # (prevents re-claiming active replay window)
                 with contextlib.suppress(Exception):
                     claimed = await self.redis.xautoclaim(
                         self._audio_key,
                         "asr",
                         self.worker_id,
-                        min_idle_time=self.settings.asr_audio_idle_ms,
+                        min_idle_time=max(15000, self.settings.asr_replay_window_ms + 10000),
                         start_id="0-0",
                         count=20,
                     )
@@ -415,6 +426,10 @@ class MeetingPipeline:
         if prov_session and prov_session.channels != self._channels:
             prov_session.channels = self._channels
 
+        # Sequence deduplication (Requirement 4: never re-stream duplicate chunks to provider)
+        if hdr.client_seq in self._dispatched_seqs_set:
+            return
+
         # Gap detection
         if self._last_seen_seq is not None and hdr.client_seq > self._last_seen_seq + 1:
             _gap = hdr.client_seq - (self._last_seen_seq + 1)
@@ -425,6 +440,7 @@ class MeetingPipeline:
                     state="degraded",
                     reason="audio_gap",
                 )
+        self._last_seen_seq = hdr.client_seq
 
         # Ensure meeting origin capture timestamp is anchored consistently across workers
         if self._timeline.meeting_origin_capture_ts is None:
@@ -464,7 +480,12 @@ class MeetingPipeline:
         self._chunk_history.append(hist_entry)
 
         # Enqueue chunk
-        self._all_dispatched_client_seqs.add(chunk.client_seq)
+        if len(self._dispatched_seqs_window) >= (self._dispatched_seqs_window.maxlen or 5000):
+            old_seq = self._dispatched_seqs_window.popleft()
+            self._dispatched_seqs_set.discard(old_seq)
+        self._dispatched_seqs_window.append(chunk.client_seq)
+        self._dispatched_seqs_set.add(chunk.client_seq)
+
         await self._dispatch_chunk(eid_str, chunk, hist_entry)
 
     async def _dispatch_chunk(
@@ -488,6 +509,9 @@ class MeetingPipeline:
         if not self._reconnect_buffer:
             try:
                 # Direct send
+                if self._provider_session_origin_wall is None:
+                    self._provider_session_origin_wall = time.time()
+
                 await self.provider.send_audio(chunk)
                 t_send = time.perf_counter()
                 if hist_entry is not None:
@@ -539,10 +563,13 @@ class MeetingPipeline:
             asyncio.create_task(self._init_standby())
 
             self._timeline.reset_session()
+            self._provider_session_origin_wall = None
             reaccept_time: float | None = None
             replay_chunks = list(self._sent_replay_history)
 
             for _, chunk in replay_chunks:
+                if self._provider_session_origin_wall is None:
+                    self._provider_session_origin_wall = time.time()
                 await self.provider.send_audio(chunk)
                 if reaccept_time is None:
                     reaccept_time = time.time()
@@ -566,7 +593,15 @@ class MeetingPipeline:
             self._total_degraded_s += dur_s
             self.metrics.degraded_seconds += dur_s
             self.metrics.record_reconnect_duration(dur_s * 1000.0)
+            was_degraded = self._degraded_active
             self._degraded_active = False
+
+            if was_degraded:
+                await self._emit_degraded_event(
+                    state="recovered",
+                    reason="provider_unreachable",
+                    since_ms=self._degraded_since_ms,
+                )
 
             logger.info(
                 "[RECONNECT_EVENT] meeting=%s (WARM_STANDBY_SWAP) "
@@ -624,11 +659,14 @@ class MeetingPipeline:
                 self._speaker_epoch += 1
                 self._speaker_mapping.clear()
                 self._timeline.reset_session()
+                self._provider_session_origin_wall = None
                 reaccept_time: float | None = None
                 replay_chunks = list(self._sent_replay_history)
 
                 # Resend replay window audio
                 for _, chunk in replay_chunks:
+                    if self._provider_session_origin_wall is None:
+                        self._provider_session_origin_wall = time.time()
                     await self.provider.send_audio(chunk)
                     if reaccept_time is None:
                         reaccept_time = time.time()
@@ -674,7 +712,8 @@ class MeetingPipeline:
                         ),
                     )
 
-                if degraded_event_sent:
+                self._provider_session_origin_wall = None
+                if self._degraded_active or degraded_event_sent:
                     await self._emit_degraded_event(
                         state="recovered",
                         reason="provider_unreachable",
@@ -836,19 +875,28 @@ class MeetingPipeline:
             )
             self.metrics.record_stage_timing("dedupe", (time.perf_counter() - t_dd_0) * 1000.0)
 
-            # End-to-end and Provider latency:
-            chunk_match = self._find_chunk_for_end_ms(end_ms)
-            chunk_seq = None
-            c_recv_wall = None
-            e2e_ms = None
-            if chunk_match:
-                chunk_seq, c_recv_wall, c_recv_perf, c_send_perf = chunk_match
-                t_pub_wall = time.time()
-                e2e_ms = max(0.1, (t_pub_wall - c_recv_wall) * 1000.0)
+            # End-to-end Latency computed directly from Provider Timeline (Requirement 2)
+            # audio_end_wall = session_origin_wall + (provider start + duration in seconds)
+            # where provider start + duration = event.end_ms / 1000.0
+            t_pub_wall = time.time()
+            if self._provider_session_origin_wall is not None:
+                audio_end_wall = self._provider_session_origin_wall + (event.end_ms / 1000.0)
+                e2e_ms = max(0.1, (t_pub_wall - audio_end_wall) * 1000.0)
                 self.metrics.record_e2e_latency(e2e_ms)
-                if c_send_perf > 0 and getattr(event, "recv_perf", 0.0) > 0:
-                    prov_ms = max(0.1, (event.recv_perf - c_send_perf) * 1000.0)
-                    self.metrics.record_provider_latency(prov_ms)
+            else:
+                audio_end_wall = None
+                e2e_ms = None
+
+            # Service-added latency: Deepgram message receipt to internal bus publish
+            svc_ms = 0.0
+            if getattr(event, "recv_perf", 0.0) > 0:
+                svc_ms = max(0.1, (time.perf_counter() - event.recv_perf) * 1000.0)
+                self.metrics.record_service_added_latency(svc_ms)
+
+            # Provider latency: audio end to provider message receipt
+            if e2e_ms is not None:
+                prov_lat = max(0.1, e2e_ms - svc_ms)
+                self.metrics.record_provider_latency(prov_lat)
 
             # Stage 4: Serialization
             t_ser_0 = time.perf_counter()
@@ -866,10 +914,10 @@ class MeetingPipeline:
                 "language": self.tenant_config.language,
                 "provider": self.settings.asr_provider,
                 "model": "nova-3",
-                "chunk_seq": chunk_seq,
-                "chunk_recv_wall": c_recv_wall,
+                "chunk_seq": None,
+                "chunk_recv_wall": audio_end_wall,
                 "final_recv_perf": getattr(event, "recv_perf", 0.0),
-                "publish_wall": time.time(),
+                "publish_wall": t_pub_wall,
                 "e2e_ms": round(e2e_ms, 2) if e2e_ms is not None else None,
             }
 
@@ -910,7 +958,6 @@ class MeetingPipeline:
             alts = raw_msg.get("channel", {}).get("alternatives", [])
             if alts:
                 words = alts[0].get("words", [])
-                t_interim_now = time.perf_counter()
                 for w in words:
                     w_text = w.get("word", "").strip().lower()
                     if not w_text:
@@ -920,13 +967,16 @@ class MeetingPipeline:
                     _, w_end_mtg_ms, _ = self._timeline.map_range(w_end_prov_ms, w_end_prov_ms)
                     w_key = (w_text, w_end_mtg_ms)
                     if w_key not in self._seen_interim_words:
+                        if len(self._seen_interim_words_window) >= 2000:
+                            old_w = self._seen_interim_words_window.popleft()
+                            self._seen_interim_words.discard(old_w)
+                        self._seen_interim_words_window.append(w_key)
                         self._seen_interim_words.add(w_key)
-                        if len(self._seen_interim_words) > 5000:
-                            self._seen_interim_words.clear()
-                        c_match = self._find_chunk_for_end_ms(w_end_mtg_ms)
-                        if c_match:
-                            _, _, c_recv_perf, _ = c_match
-                            i_lat = max(0.1, (t_interim_now - c_recv_perf) * 1000.0)
+
+                        now_w = time.time()
+                        if self._provider_session_origin_wall is not None:
+                            w_audio_end_wall = self._provider_session_origin_wall + w_end_s
+                            i_lat = max(0.1, (now_w - w_audio_end_wall) * 1000.0)
                             self.metrics.record_interim_latency(i_lat)
 
             payload = {
@@ -975,6 +1025,17 @@ class MeetingPipeline:
     ) -> None:
         """Publish transcript_service_degraded to BOTH internal bus and out stream."""
         now_ms = int(time.time() * 1000)
+        if state == "degraded":
+            self._degraded_active = True
+            if not self._degraded_since_ms:
+                self._degraded_since_ms = now_ms
+        elif state == "recovered":
+            self._degraded_active = False
+
+        effective_since = since_ms if since_ms is not None else (self._degraded_since_ms or now_ms)
+        if state == "recovered":
+            self._degraded_since_ms = 0
+
         envelope = {
             "event_type": "transcript_service_degraded",
             "meeting_id": self.meeting_id,
@@ -983,7 +1044,7 @@ class MeetingPipeline:
             "payload": {
                 "state": state,
                 "reason": reason,
-                "since_ms": since_ms if since_ms is not None else now_ms,
+                "since_ms": effective_since,
             },
         }
         json_env = json.dumps(envelope)

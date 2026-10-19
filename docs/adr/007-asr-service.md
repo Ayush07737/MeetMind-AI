@@ -137,17 +137,29 @@ Empirical measurements gathered during live Deepgram Nova-3 benchmarking across 
 - On the global US endpoint, end-to-end latency is dominated by geographic network RTT (~355ms P50).
 - Using Deepgram's India regional endpoint (`api.in.deepgram.com`) reduces initial WebSocket setup from ~2.9s down to **731ms** and network ping RTT from ~355ms down to **112.5ms**, providing dramatic responsiveness gains for APAC and India deployments.
 
-### 11. Data Residency & Enterprise Compliance Strategy
+### 11. Data Residency, Sovereignty & Enterprise Compliance Strategy
 
-1. **Current Reality (D2d Architecture)**:
-   - Deepgram operates regional cloud endpoints in India (`api.in.deepgram.com`) and the European Union (`api.eu.deepgram.com`) alongside its global endpoint.
-   - MeetMind AI enforces per-tenant region routing (`asr_region: "in" | "eu" | "global"`).
-2. **Dual Residency Invariant**:
-   - Audio processed via `api.in.deepgram.com` is guaranteed to stay within India, provided that `mip_opt_out=true` is set.
-   - MeetMind strictly pairs regional endpoint routing with `mip_opt_out=true` for all customer sessions, ensuring no audio or transcript data leaves the designated jurisdiction for model training or background analytics.
-   - Residency tenants fail fast upon regional provider unreachability rather than falling back to global infrastructure.
-3. **Enterprise Compliance Summary**:
-   - Zero raw audio or transcript persistence on disk in MeetMind services.
+1. **Current Reality (D2e Architecture)**:
+   - Deepgram operates regional cloud endpoints in India (`api.in.deepgram.com`) and the European Union (`api.eu.deepgram.com`) alongside its global endpoint (`api.deepgram.com`).
+   - MeetMind AI enforces deployment-level allow-lists (`ASR_ALLOWED_REGIONS`) and per-tenant region routing (`asr_region: "in" | "eu" | "global" | None`, where `None` inherits deployment default).
+   - Tenant `residency_mode` defaults to `strict` (never leaves designated region; failure immediately emits `transcript_service_degraded`), with optional `preferred` mode (falls back to global with an append-only audit event).
+
+2. **Dual Residency Invariant & Enforcement**:
+   - Audio processed via `api.in.deepgram.com` or `api.eu.deepgram.com` is guaranteed to stay within the designated region, **strictly provided that BOTH a regional endpoint AND `mip_opt_out=true` are active**.
+   - If `mip_opt_out` were omitted, Deepgram's Model Improvement Partnership could retain or replicate training data outside the host jurisdiction.
+   - MeetMind AI enforces this invariant at code level: any non-global regional endpoint or strict tenant forces `mip_opt_out=true`, and provider clients fail fast (refusing session creation) if `mip_opt_out` is False.
+   - The resolved endpoint host and `mip_opt_out` flag are immutably logged to Neon's `audit_events` via `asr_session_started`.
+
+3. **"Residency is Not Sovereignty" (Deepgram Trust Docs Clarification)**:
+   - _Technical Residency_: Data packets and ephemeral processing remain within the regional AWS/GCP data centers contracted by Deepgram.
+   - _Jurisdictional / Legal Sovereignty_: Deepgram is a US-headquartered corporation subject to US extraterritorial jurisdiction, including the US CLOUD Act (Clarifying Lawful Overseas Use of Data Act) and US federal subpoenas. Therefore, geographic data residency does NOT equate to full legal data sovereignty against foreign legal process.
+
+4. **Legal Review Note for Enterprise Customers**:
+   - > [!IMPORTANT]
+   - > **Legal Review Requirement**: Enterprise customers with statutory sovereign data mandates (e.g., highly regulated public sector, banking, defense, or strict sovereign compliance under India's Digital Personal Data Protection Act (DPDP) 2023 / EU NIS2) must undergo formal legal review. Such tenants should deploy dedicated self-hosted/air-gapped Deepgram container instances or sovereign private clouds rather than relying on multi-tenant SaaS regional endpoints.
+
+5. **Platform Enterprise Compliance Controls**:
+   - Zero raw audio or transcript persistence on disk in MeetMind services (WP-E).
    - Neon PostgreSQL audit events append-only; payloads never contain audio frames or transcript text.
    - Encryption in transit via TLS 1.3 across all provider and WebSocket connections.
 

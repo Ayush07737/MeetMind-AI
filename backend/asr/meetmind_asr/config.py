@@ -28,7 +28,7 @@ class AsrSettings(BaseSettings):
     app_env: str = Field(default="development", alias="APP_ENV")
     asr_provider: Literal["deepgram", "stub"] = Field(default="stub", alias="ASR_PROVIDER")
     deepgram_api_key: SecretStr | None = Field(default=None, alias="DEEPGRAM_API_KEY")
-    deepgram_base_url: str = Field(default="wss://api.deepgram.com", alias="DEEPGRAM_BASE_URL")
+    deepgram_base_url: str | None = Field(default=None, alias="DEEPGRAM_BASE_URL")
     redis_url: str = Field(default="redis://127.0.0.1:6379/0", alias="REDIS_URL")
     asr_max_meetings_per_worker: int = Field(default=10, alias="ASR_MAX_MEETINGS_PER_WORKER")
     asr_replay_window_ms: int = Field(default=5000, alias="ASR_REPLAY_WINDOW_MS")
@@ -43,6 +43,11 @@ class AsrSettings(BaseSettings):
     asr_test_hooks: bool = Field(default=False, alias="ASR_TEST_HOOKS")
     asr_warm_standby: bool = Field(default=False, alias="ASR_WARM_STANDBY")
     asr_region: Literal["global", "in", "eu"] = Field(default="global", alias="ASR_REGION")
+    asr_allowed_regions: str = Field(default="global,in,eu", alias="ASR_ALLOWED_REGIONS")
+
+    @property
+    def allowed_regions_set(self) -> set[str]:
+        return {r.strip().lower() for r in self.asr_allowed_regions.split(",") if r.strip()}
 
     @model_validator(mode="after")
     def validate_provider_requirements(self) -> AsrSettings:
@@ -59,6 +64,36 @@ class AsrSettings(BaseSettings):
             raise ValueError("ASR_REPLAY_WINDOW_MS must be greater than 0")
         if self.asr_buffer_max_seconds <= 0:
             raise ValueError("ASR_BUFFER_MAX_SECONDS must be greater than 0")
+
+        # Deployment guardrail: ASR_ALLOWED_REGIONS
+        allowed = self.allowed_regions_set
+        valid_regions = set(DEEPGRAM_REGION_HOSTS.keys())
+        unknown = allowed - valid_regions
+        if unknown:
+            raise ValueError(
+                f"Invalid regions in ASR_ALLOWED_REGIONS: {sorted(unknown)}. "
+                f"Allowed: {sorted(valid_regions)}"
+            )
+        if self.asr_region not in allowed:
+            raise ValueError(
+                f"Configured ASR_REGION '{self.asr_region}' contradicts deployment guardrail "
+                f"ASR_ALLOWED_REGIONS: {sorted(allowed)}"
+            )
+
+        # Loopback-only guardrail for DEEPGRAM_BASE_URL
+        if self.deepgram_base_url and self.deepgram_base_url.strip():
+            import urllib.parse
+
+            parsed = urllib.parse.urlparse(self.deepgram_base_url)
+            host = (parsed.hostname or "").lower()
+            if host not in ("127.0.0.1", "localhost"):
+                raise ValueError(
+                    f"DEEPGRAM_BASE_URL '{self.deepgram_base_url}' is not a loopback test server. "
+                    "Hosts must be derived from region via allow-list; "
+                    "DEEPGRAM_BASE_URL is accepted only for loopback test servers "
+                    "(127.0.0.1, localhost)."
+                )
+
         return self
 
 
@@ -87,15 +122,16 @@ def resolve_asr_base_url(settings: AsrSettings, region: str = "global") -> str:
             f"Invalid asr_region '{region}'. Allowed: {sorted(DEEPGRAM_REGION_HOSTS.keys())}"
         )
 
-    # If settings.deepgram_base_url is explicitly set to a local test host, permit it
-    if settings.deepgram_base_url and not settings.deepgram_base_url.startswith("wss://api."):
+    # If settings.deepgram_base_url is explicitly set to a loopback test host, permit it
+    if settings.deepgram_base_url and settings.deepgram_base_url.strip():
         parsed = urllib.parse.urlparse(settings.deepgram_base_url)
         host = (parsed.hostname or "").lower()
-        if host not in ALLOWED_ASR_HOSTS:
-            raise ValueError(
-                f"ASR host '{host}' is not in ALLOWED_ASR_HOSTS: {sorted(ALLOWED_ASR_HOSTS)}"
-            )
-        return settings.deepgram_base_url
+        if host in ("127.0.0.1", "localhost"):
+            return settings.deepgram_base_url
+        raise ValueError(
+            f"ASR host '{host}' is not a loopback test server. "
+            "DEEPGRAM_BASE_URL is accepted only for loopback test servers."
+        )
 
     target_host = DEEPGRAM_REGION_HOSTS[norm_region]
     if target_host not in ALLOWED_ASR_HOSTS:
