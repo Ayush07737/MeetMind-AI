@@ -244,9 +244,7 @@ class DeepgramProvider(ASRProvider):
                 else -1.0
             )
             idle_final_ms = (
-                (now_wall - self._last_final_wall) * 1000.0
-                if self._last_final_wall > 0
-                else -1.0
+                (now_wall - self._last_final_wall) * 1000.0 if self._last_final_wall > 0 else -1.0
             )
 
             logger.info(
