@@ -285,6 +285,7 @@ class HealthServer:
                         curr_alloc, peak_alloc = tracemalloc.get_traced_memory()
                         top_diff: list[str] = []
                         if "snapshot=1" in path:
+
                             def _take_diff() -> list[str]:
                                 curr_snap = tracemalloc.take_snapshot()
                                 diff = curr_snap.compare_to(_tracemalloc_base, "lineno")[:5]
