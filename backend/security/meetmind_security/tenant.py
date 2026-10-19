@@ -57,8 +57,11 @@ class TenantConfig:
     # Redis - key prefix
     redis_prefix: str
 
-    # ASR residency region ("global", "in", "eu")
-    asr_region: str = "global"
+    # ASR residency region (Optional: None = inherit from deployment settings; "global", "in", "eu")
+    asr_region: str | None = None
+
+    # Tenant residency mode ("strict" | "preferred", default "strict")
+    residency_mode: str = "strict"
 
     def __post_init__(self) -> None:
         norm_id = normalize_tenant_id(self.tenant_id)
@@ -68,13 +71,21 @@ class TenantConfig:
             raise ValueError(
                 f"Invalid pg_schema '{self.pg_schema}': must match ^[a-z0-9_]{{1,48}}$"
             )
-        reg = self.asr_region.strip().lower()
-        if reg not in ("global", "in", "eu"):
+        if self.asr_region is not None:
+            reg = self.asr_region.strip().lower()
+            if reg not in ("global", "in", "eu"):
+                raise ValueError(
+                    f"Invalid asr_region '{self.asr_region}': must be one of ('global', 'in', 'eu')"
+                )
+            if self.asr_region != reg:
+                object.__setattr__(self, "asr_region", reg)
+        mode = self.residency_mode.strip().lower()
+        if mode not in ("strict", "preferred"):
             raise ValueError(
-                f"Invalid asr_region '{self.asr_region}': must be one of ('global', 'in', 'eu')"
+                f"Invalid residency_mode '{self.residency_mode}': must be 'strict' or 'preferred'"
             )
-        if self.asr_region != reg:
-            object.__setattr__(self, "asr_region", reg)
+        if self.residency_mode != mode:
+            object.__setattr__(self, "residency_mode", mode)
 
 
 class TenantNotFoundError(Exception):
@@ -171,11 +182,14 @@ class TenantRouter:
                 or existing.qdrant_prefix != config.qdrant_prefix
                 or existing.redis_prefix != config.redis_prefix
                 or existing.asr_region != config.asr_region
+                or existing.residency_mode != config.residency_mode
             ):
                 raise ValueError(
-                    f"Tenant collision for '{norm_id}': existing schema '{existing.pg_schema}' "
-                    f"(region '{existing.asr_region}') conflicts with new schema "
-                    f"'{config.pg_schema}' (region '{config.asr_region}')"
+                    f"Tenant collision for '{norm_id}': "
+                    f"existing schema '{existing.pg_schema}' "
+                    f"(region '{existing.asr_region}', mode '{existing.residency_mode}') "
+                    f"conflicts with new schema '{config.pg_schema}' "
+                    f"(region '{config.asr_region}', mode '{config.residency_mode}')"
                 )
         self._configs[norm_id] = config
 

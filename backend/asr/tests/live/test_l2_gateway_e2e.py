@@ -263,6 +263,5 @@ async def test_l2_end_to_end_gateway_deepgram(
     print(f"Recognized Transcript: {recognized_full}")
     print("=" * 60)
 
-    # Soft threshold: fail only if WER > 0.75
-    # (mono overlapping synthetic speech produces WER 0.42-0.74)
-    assert wer <= 0.75, f"WER too high: {wer:.4f}"
+    # Revert loosened assertion: must meet <= 0.50 threshold
+    assert wer <= 0.50, f"WER too high: {wer:.4f}"

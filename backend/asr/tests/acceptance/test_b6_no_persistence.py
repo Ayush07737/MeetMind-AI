@@ -29,8 +29,19 @@ pytestmark = [pytest.mark.integration, pytest.mark.timeout(90)]
 def _snapshot_directory(root: Path) -> dict[Path, float]:
     """Capture mapping of existing file paths to their modification times."""
     snapshot = {}
+    ignored_dirs = {
+        ".git",
+        ".venv",
+        "node_modules",
+        ".pytest_cache",
+        "__pycache__",
+        ".next",
+        "dist",
+    }
     with contextlib.suppress(OSError, PermissionError):
         for p in root.rglob("*"):
+            if any(part in ignored_dirs for part in p.parts):
+                continue
             if p.is_file():
                 with contextlib.suppress(OSError, PermissionError):
                     snapshot[p] = p.stat().st_mtime
