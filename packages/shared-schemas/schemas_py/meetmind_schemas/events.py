@@ -411,13 +411,14 @@ def decode_audio_frame(data: bytes) -> tuple[AudioHeader, bytes]:
 
 # ── Event Envelope & Payloads (WP-A) ─────────────────────────────────────────
 
-DegradedState = Literal["degraded", "recovered"]
+DegradedState = Literal["degraded", "still_degraded", "recovered"]
 DegradedReason = Literal[
     "provider_unreachable",
     "provider_error",
     "unsupported_codec",
     "buffer_overflow",
     "audio_gap",
+    "residency_violation",
 ]
 
 
@@ -444,6 +445,7 @@ class TranscriptFinalPayload(BaseModel):
     final_recv_perf: float | None = None
     publish_wall: float | None = None
     e2e_ms: float | None = None
+    late: bool = False
 
 
 class TranscriptInterimPayload(BaseModel):
@@ -473,6 +475,19 @@ class TranscriptServiceDegradedPayload(BaseModel):
     state: DegradedState
     reason: DegradedReason
     since_ms: int
+    elapsed_s: float | None = None
+
+
+class AudioGapPayload(BaseModel):
+    """Payload for audio_gap event."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    from_seq: int
+    to_seq: int
+    gap_chunks: int
+    capture_start_ms: int
+    capture_end_ms: int
 
 
 class EventEnvelope(BaseModel):

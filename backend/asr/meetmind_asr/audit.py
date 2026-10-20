@@ -97,9 +97,10 @@ class AsrAuditor:
         reconnects: int,
         dropped_chunks: int,
         degraded_seconds: float,
+        gaps: list[dict[str, Any]] | None = None,
     ) -> None:
         """Enqueue asr_session_summary audit event (non-blocking)."""
-        payload = {
+        payload: dict[str, Any] = {
             "meeting_id": meeting_id,
             "provider": provider,
             "chunks_sent": chunks_sent,
@@ -107,6 +108,7 @@ class AsrAuditor:
             "reconnects": reconnects,
             "dropped_chunks": dropped_chunks,
             "degraded_seconds": round(degraded_seconds, 2),
+            "gaps": gaps or [],
         }
         self._enqueue(tenant_id, user_id, "asr_session_summary", payload)
 

@@ -42,11 +42,14 @@ class AsrSettings(BaseSettings):
     asr_stub_replay_jitter_ms: int = Field(default=0, alias="ASR_STUB_REPLAY_JITTER_MS")
     asr_test_hooks: bool = Field(default=False, alias="ASR_TEST_HOOKS")
     asr_warm_standby: bool = Field(default=False, alias="ASR_WARM_STANDBY")
-    asr_region: Literal["global", "in", "eu"] = Field(default="global", alias="ASR_REGION")
-    asr_allowed_regions: str = Field(default="global,in,eu", alias="ASR_ALLOWED_REGIONS")
+    asr_region: Literal["global", "in", "eu", "au"] = Field(default="global", alias="ASR_REGION")
+    asr_allowed_regions: str | None = Field(default=None, alias="ASR_ALLOWED_REGIONS")
+    asr_catchup_speed: float = Field(default=4.0, alias="ASR_CATCHUP_SPEED")
 
     @property
     def allowed_regions_set(self) -> set[str]:
+        if not self.asr_allowed_regions or not self.asr_allowed_regions.strip():
+            return {self.asr_region.strip().lower()}
         return {r.strip().lower() for r in self.asr_allowed_regions.split(",") if r.strip()}
 
     @model_validator(mode="after")
@@ -64,6 +67,8 @@ class AsrSettings(BaseSettings):
             raise ValueError("ASR_REPLAY_WINDOW_MS must be greater than 0")
         if self.asr_buffer_max_seconds <= 0:
             raise ValueError("ASR_BUFFER_MAX_SECONDS must be greater than 0")
+        if self.asr_catchup_speed <= 0:
+            raise ValueError("ASR_CATCHUP_SPEED must be greater than 0")
 
         # Deployment guardrail: ASR_ALLOWED_REGIONS
         allowed = self.allowed_regions_set
@@ -101,12 +106,14 @@ DEEPGRAM_REGION_HOSTS: dict[str, str] = {
     "global": "api.deepgram.com",
     "in": "api.in.deepgram.com",
     "eu": "api.eu.deepgram.com",
+    "au": "api.au.deepgram.com",
 }
 
 ALLOWED_ASR_HOSTS: set[str] = {
     "api.deepgram.com",
     "api.in.deepgram.com",
     "api.eu.deepgram.com",
+    "api.au.deepgram.com",
     "127.0.0.1",
     "localhost",
 }
