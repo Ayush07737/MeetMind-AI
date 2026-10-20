@@ -359,7 +359,7 @@ export function decodeAudioFrame(data: Uint8Array): { header: AudioHeader; paylo
 
 // ── Event Envelope & Payloads (WP-A) ─────────────────────────────────────────
 
-export const DegradedStateSchema = z.enum(["degraded", "recovered"]);
+export const DegradedStateSchema = z.enum(["degraded", "still_degraded", "recovered"]);
 export type DegradedState = z.infer<typeof DegradedStateSchema>;
 
 export const DegradedReasonSchema = z.enum([
@@ -368,6 +368,7 @@ export const DegradedReasonSchema = z.enum([
   "unsupported_codec",
   "buffer_overflow",
   "audio_gap",
+  "residency_violation",
 ]);
 export type DegradedReason = z.infer<typeof DegradedReasonSchema>;
 
@@ -390,6 +391,7 @@ export const TranscriptFinalPayloadSchema = z.object({
   final_recv_perf: z.number().nullable().optional(),
   publish_wall: z.number().nullable().optional(),
   e2e_ms: z.number().nullable().optional(),
+  late: z.boolean().default(false).optional(),
 });
 export type TranscriptFinalPayload = z.infer<typeof TranscriptFinalPayloadSchema>;
 
@@ -413,10 +415,20 @@ export const TranscriptServiceDegradedPayloadSchema = z.object({
   state: DegradedStateSchema,
   reason: DegradedReasonSchema,
   since_ms: z.number().int(),
+  elapsed_s: z.number().optional(),
 });
 export type TranscriptServiceDegradedPayload = z.infer<
   typeof TranscriptServiceDegradedPayloadSchema
 >;
+
+export const AudioGapPayloadSchema = z.object({
+  from_seq: z.number().int(),
+  to_seq: z.number().int(),
+  gap_chunks: z.number().int(),
+  capture_start_ms: z.number().int(),
+  capture_end_ms: z.number().int(),
+});
+export type AudioGapPayload = z.infer<typeof AudioGapPayloadSchema>;
 
 export const EventEnvelopeSchema = z.object({
   event_type: z.string(),

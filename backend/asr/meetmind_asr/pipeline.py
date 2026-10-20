@@ -137,10 +137,24 @@ class MeetingPipeline:
         self._reconnect_count = 0
         self._dropped_chunks_count = 0
         self._all_dispatched_client_seqs: set[int] = set()
+        self._detected_gaps: list[dict[str, Any]] = []
+        self._reconnect_attempts: list[dict[str, Any]] = []
+
+        # Outage and catch-up state
+        self._is_catching_up = False
+        self._is_reconnecting = False
+        self._drain_pel_needed = True
+        self._last_seen_capture_ts_ms: int | None = None
+        self._last_still_degraded_time = 0.0
+        self._debug_block_connect_until = 0.0
 
         # Background tasks
         self._tasks: list[asyncio.Task[None]] = []
         self._events_task: asyncio.Task[None] | None = None
+
+    @property
+    def _provider_is_ready(self) -> bool:
+        return bool(getattr(self.provider, "_is_open", False)) and not self._is_reconnecting
 
     async def start(self) -> None:
         """Initialize pipeline, resolve metadata, and spawn worker tasks."""
@@ -253,6 +267,18 @@ class MeetingPipeline:
                 logger.warning("Error creating asr group on %s: %s", self._audio_key, exc)
 
     async def _connect_provider(self) -> None:
+        if (
+            self.settings.asr_test_hooks
+            and getattr(self, "_debug_block_connect_until", 0.0) > time.time()
+        ):
+            raise ConnectionError(
+                f"Simulated provider outage: blocked until {self._debug_block_connect_until:.3f}"
+            )
+
+        # Reset sequence dispatch deduplication on every new provider session
+        self._dispatched_seqs_set.clear()
+        self._dispatched_seqs_window.clear()
+
         session = ProviderSession(
             tenant_id=self.tenant_id,
             meeting_id=self.meeting_id,
@@ -345,6 +371,13 @@ class MeetingPipeline:
         """Read audio frames from Redis stream mm:{tenant}:audio:{meeting}."""
         while self._is_running:
             try:
+                # If provider is not connected or reconnecting, do NOT read new audio.
+                # Audio accumulates safely in Redis stream mm:{tenant}:audio:{meeting}
+                # bounded by AUDIO_STREAM_MAXLEN without ack-and-drop.
+                if not self._provider_is_ready:
+                    await asyncio.sleep(0.05)
+                    continue
+
                 # 1. Periodic autoclaim for entries idle > 15s
                 # (prevents re-claiming active replay window)
                 with contextlib.suppress(Exception):
@@ -358,19 +391,46 @@ class MeetingPipeline:
                     )
                     if claimed and len(claimed) >= 2 and claimed[1]:
                         for entry_id, fields in claimed[1]:
+                            if not self._is_running or not self._provider_is_ready:
+                                break
                             await self._process_raw_entry(entry_id, fields)
 
-                # 2. XREADGROUP for new entries (BLOCK 250ms)
+                # 2. Drain pending unacked entries delivered to this worker (PEL read with "0")
+                if self._drain_pel_needed:
+                    pending = await self.redis.xreadgroup(
+                        "asr",
+                        self.worker_id,
+                        {self._audio_key: "0"},
+                        count=50,
+                    )
+                    has_pending = False
+                    if pending:
+                        for _, messages in pending:
+                            if messages:
+                                has_pending = True
+                                for entry_id, fields in messages:
+                                    if not self._is_running or not self._provider_is_ready:
+                                        break
+                                    await self._process_raw_entry(entry_id, fields)
+                    if not has_pending or not self._provider_is_ready:
+                        self._drain_pel_needed = False
+
+                if not self._is_running or not self._provider_is_ready:
+                    continue
+
+                # 3. XREADGROUP for new entries (BLOCK 100ms)
                 entries = await self.redis.xreadgroup(
                     "asr",
                     self.worker_id,
                     {self._audio_key: ">"},
-                    count=100,
-                    block=250,
+                    count=50,
+                    block=100,
                 )
                 if entries:
                     for _, messages in entries:
                         for entry_id, fields in messages:
+                            if not self._is_running or not self._provider_is_ready:
+                                break
                             await self._process_raw_entry(entry_id, fields)
 
             except asyncio.CancelledError:
@@ -430,17 +490,25 @@ class MeetingPipeline:
         if hdr.client_seq in self._dispatched_seqs_set:
             return
 
-        # Gap detection
+        # Beyond the backlog limit: detect client_seq jump and publish ONE audio_gap event
         if self._last_seen_seq is not None and hdr.client_seq > self._last_seen_seq + 1:
-            _gap = hdr.client_seq - (self._last_seen_seq + 1)
-            now = time.time()
-            if now - self._last_gap_degraded_time >= 5.0:
-                self._last_gap_degraded_time = now
-                await self._emit_degraded_event(
-                    state="degraded",
-                    reason="audio_gap",
-                )
+            gap_chunks = hdr.client_seq - (self._last_seen_seq + 1)
+            from_seq = self._last_seen_seq + 1
+            to_seq = hdr.client_seq - 1
+            cap_start = self._last_seen_capture_ts_ms or (hdr.capture_ts_ms - (gap_chunks * 100))
+            cap_end = hdr.capture_ts_ms
+            gap_info = {
+                "from_seq": from_seq,
+                "to_seq": to_seq,
+                "gap_chunks": gap_chunks,
+                "capture_start_ms": cap_start,
+                "capture_end_ms": cap_end,
+            }
+            self._detected_gaps.append(gap_info)
+            await self._emit_audio_gap_event(gap_info)
+
         self._last_seen_seq = hdr.client_seq
+        self._last_seen_capture_ts_ms = hdr.capture_ts_ms
 
         # Ensure meeting origin capture timestamp is anchored consistently across workers
         if self._timeline.meeting_origin_capture_ts is None:
@@ -491,60 +559,67 @@ class MeetingPipeline:
     async def _dispatch_chunk(
         self, entry_id: str, chunk: AudioChunk, hist_entry: list[Any] | None = None
     ) -> None:
-        """Deliver chunk to provider or buffer during provider outage."""
-        # Check buffer capacity
-        max_buffered_chunks = self.settings.asr_buffer_max_seconds * 10  # 10 chunks/sec
-        if len(self._reconnect_buffer) >= max_buffered_chunks:
-            # Buffer overflow: drop oldest chunk
-            dropped_eid, _ = self._reconnect_buffer.popleft()
-            self._dropped_chunks_count += 1
-            self.metrics.dropped_chunks += 1
-            # Acknowledge dropped chunk so it doesn't loop
-            await self.redis.xack(self._audio_key, "asr", dropped_eid)
-            await self._emit_degraded_event(
-                state="degraded",
-                reason="buffer_overflow",
-            )
+        """Deliver chunk to provider with catch-up pacing. Never ack-and-drop."""
+        try:
+            if self._provider_session_origin_wall is None:
+                self._provider_session_origin_wall = time.time()
 
-        if not self._reconnect_buffer:
-            try:
-                # Direct send
-                if self._provider_session_origin_wall is None:
-                    self._provider_session_origin_wall = time.time()
+            await self.provider.send_audio(chunk)
+            t_send = time.perf_counter()
+            if hist_entry is not None:
+                hist_entry[5] = t_send
+            self._pending_acks.append((t_send, entry_id))
+            self._sent_replay_history.append((t_send, chunk))
+            self._timeline.register_chunk(chunk.capture_ts_ms)
+            self._chunks_sent += 1
+            self._bytes_sent += len(chunk.data)
+            self._all_dispatched_client_seqs.add(chunk.client_seq)
 
-                await self.provider.send_audio(chunk)
-                t_send = time.perf_counter()
-                if hist_entry is not None:
-                    hist_entry[5] = t_send
-                self._pending_acks.append((t_send, entry_id))
-                self._sent_replay_history.append((t_send, chunk))
-                self._timeline.register_chunk(chunk.capture_ts_ms)
-                self._chunks_sent += 1
-                self._bytes_sent += len(chunk.data)
+            # Prune replay history older than replay window
+            while self._sent_replay_history and (t_send - self._sent_replay_history[0][0]) > (
+                self.settings.asr_replay_window_ms / 1000.0
+            ):
+                self._sent_replay_history.popleft()
 
-                # Prune replay history older than replay window
-                while self._sent_replay_history and (t_send - self._sent_replay_history[0][0]) > (
-                    self.settings.asr_replay_window_ms / 1000.0
-                ):
-                    self._sent_replay_history.popleft()
-                return
-            except Exception as exc:
-                logger.warning("Provider send failed on %s: %s", self.meeting_id, exc)
-                self._reconnect_buffer.append((entry_id, chunk))
-                asyncio.create_task(self._handle_reconnect())
-        else:
-            # Connection currently recovering; append to in-memory buffer
+            # Catch-up pacing: if chunk was captured in the past (backlog during outage)
+            now_ms = int(time.time() * 1000)
+            chunk_age_ms = now_ms - chunk.capture_ts_ms
+            if chunk_age_ms > 1000:
+                self._is_catching_up = True
+                chunk_dur_s = len(chunk.data) / (self._sample_rate * 2 * self._channels)
+                catchup_speed = max(1.0, float(self.settings.asr_catchup_speed))
+                pacing_sleep = chunk_dur_s / catchup_speed
+                await asyncio.sleep(pacing_sleep)
+            else:
+                self._is_catching_up = False
+
+        except Exception as exc:
+            logger.warning("Provider send failed on %s: %s", self.meeting_id, exc)
             self._reconnect_buffer.append((entry_id, chunk))
+            asyncio.create_task(self._handle_reconnect())
 
     async def _handle_reconnect(self) -> None:
         """Reconnect to provider with backoff and flush buffered audio."""
-        if self._degraded_active:
+        if self._is_reconnecting:
             return
-        self._degraded_active = True
+        self._is_reconnecting = True
         self._reconnect_count += 1
         self.metrics.reconnects += 1
         t_disconnect = time.time()
         self._degraded_since_ms = int(t_disconnect * 1000)
+        self._last_still_degraded_time = t_disconnect
+        degraded_event_sent = False
+
+        import urllib.parse
+
+        prov_base = (
+            getattr(self.provider, "base_url", None)
+            or getattr(self.provider, "_base_url", None)
+            or self.settings.deepgram_base_url
+            or "api.deepgram.com"
+        )
+        parsed_p = urllib.parse.urlparse(prov_base)
+        effective_host = parsed_p.netloc or parsed_p.path or prov_base
 
         # 1. Warm Standby Swap Fast Path
         if (
@@ -593,10 +668,11 @@ class MeetingPipeline:
             self._total_degraded_s += dur_s
             self.metrics.degraded_seconds += dur_s
             self.metrics.record_reconnect_duration(dur_s * 1000.0)
-            was_degraded = self._degraded_active
+            self._is_reconnecting = False
             self._degraded_active = False
+            self._drain_pel_needed = True
 
-            if was_degraded:
+            if degraded_event_sent or (recovery_time - t_disconnect) >= 2.0:
                 await self._emit_degraded_event(
                     state="recovered",
                     reason="provider_unreachable",
@@ -624,30 +700,51 @@ class MeetingPipeline:
                 )
             return
 
-        backoffs = [0.0, 0.25, 0.5, 1.0, 2.0]
-        backoff_idx = 0
-        degraded_event_sent = False
-
-        while self._is_running:
-            now = time.time()
-            if not degraded_event_sent and (now - t_disconnect) >= 2.0:
+        async def _degraded_monitor() -> None:
+            nonlocal degraded_event_sent
+            delay = max(0.0, 2.0 - (time.time() - t_disconnect))
+            if delay > 0:
+                await asyncio.sleep(delay)
+            if not self._is_reconnecting:
+                return
+            if not degraded_event_sent:
                 degraded_event_sent = True
+                self._degraded_active = True
                 await self._emit_degraded_event(
                     state="degraded",
                     reason="provider_unreachable",
                     since_ms=self._degraded_since_ms,
                 )
+                self._last_still_degraded_time = time.time()
 
+            while self._is_reconnecting:
+                await asyncio.sleep(30.0)
+                if not self._is_reconnecting:
+                    break
+                elapsed_s = round(time.time() - t_disconnect, 1)
+                await self._emit_degraded_event(
+                    state="still_degraded",
+                    reason="provider_unreachable",
+                    since_ms=self._degraded_since_ms,
+                    elapsed_s=elapsed_s,
+                )
+                self._last_still_degraded_time = time.time()
+
+        monitor_task = asyncio.create_task(_degraded_monitor())
+
+        backoffs = [0.0, 0.25, 0.5, 1.0, 2.0]
+        backoff_idx = 0
+        attempt = 0
+
+        while self._is_running:
             delay = backoffs[min(backoff_idx, len(backoffs) - 1)]
             if delay > 0:
                 await asyncio.sleep(delay + random.uniform(0.01, 0.05))
             backoff_idx += 1
+            attempt += 1
 
-            if getattr(self, "_debug_block_reconnect_until", 0.0) > 0.0:
-                wait_rem = self._debug_block_reconnect_until - time.time()
-                if wait_rem > 0:
-                    await asyncio.sleep(wait_rem)
-                self._debug_block_reconnect_until = 0.0
+            attempt_start = time.time()
+            elapsed_since_disc = attempt_start - t_disconnect
 
             try:
                 with contextlib.suppress(Exception):
@@ -692,7 +789,13 @@ class MeetingPipeline:
                 self._total_degraded_s += dur_s
                 self.metrics.degraded_seconds += dur_s
                 self.metrics.record_reconnect_duration(dur_s * 1000.0)
+                self._is_reconnecting = False
                 self._degraded_active = False
+                self._drain_pel_needed = True
+
+                monitor_task.cancel()
+                with contextlib.suppress(asyncio.CancelledError):
+                    await monitor_task
 
                 logger.info(
                     "[RECONNECT_EVENT] meeting=%s drop_to_reaccept_ms=%.2f accepted_seqs=%d",
@@ -713,7 +816,7 @@ class MeetingPipeline:
                     )
 
                 self._provider_session_origin_wall = None
-                if self._degraded_active or degraded_event_sent:
+                if degraded_event_sent or (dur_s >= 2.0):
                     await self._emit_degraded_event(
                         state="recovered",
                         reason="provider_unreachable",
@@ -721,15 +824,29 @@ class MeetingPipeline:
                     )
                 break
             except Exception as e:
-                logger.debug("Provider reconnect attempt failed: %s", e)
-                now = time.time()
-                if not degraded_event_sent and (now - t_disconnect) >= 2.0:
-                    degraded_event_sent = True
-                    await self._emit_degraded_event(
-                        state="degraded",
-                        reason="provider_unreachable",
-                        since_ms=self._degraded_since_ms,
-                    )
+                exc_type = type(e).__name__
+                status_code = getattr(e, "status_code", None) or getattr(e, "code", None)
+                attempt_info = {
+                    "timestamp": time.time(),
+                    "attempt": attempt,
+                    "exc_type": exc_type,
+                    "status": status_code,
+                    "elapsed_s": round(elapsed_since_disc, 2),
+                    "backoff_s": round(delay, 2),
+                    "host": effective_host,
+                    "exc_msg": str(e),
+                }
+                self._reconnect_attempts.append(attempt_info)
+                logger.info(
+                    "[RECONNECT_ATTEMPT] attempt=%d host=%s elapsed_s=%.2f backoff_s=%.2f "
+                    "exc_type=%s exc_msg=%s",
+                    attempt,
+                    effective_host,
+                    elapsed_since_disc,
+                    delay,
+                    exc_type,
+                    e,
+                )
 
     async def _ack_flush_loop(self) -> None:
         """Acknowledge entries that have aged out of the replay window."""
@@ -887,6 +1004,10 @@ class MeetingPipeline:
                 audio_end_wall = None
                 e2e_ms = None
 
+            is_late = bool(
+                self._is_catching_up or (audio_end_wall and (t_pub_wall - audio_end_wall) > 2.0)
+            )
+
             # Service-added latency: Deepgram message receipt to internal bus publish
             svc_ms = 0.0
             if getattr(event, "recv_perf", 0.0) > 0:
@@ -919,6 +1040,7 @@ class MeetingPipeline:
                 "final_recv_perf": getattr(event, "recv_perf", 0.0),
                 "publish_wall": t_pub_wall,
                 "e2e_ms": round(e2e_ms, 2) if e2e_ms is not None else None,
+                "late": is_late,
             }
 
             envelope = {
@@ -1022,6 +1144,7 @@ class MeetingPipeline:
         state: str,
         reason: str,
         since_ms: int | None = None,
+        elapsed_s: float | None = None,
     ) -> None:
         """Publish transcript_service_degraded to BOTH internal bus and out stream."""
         now_ms = int(time.time() * 1000)
@@ -1036,16 +1159,20 @@ class MeetingPipeline:
         if state == "recovered":
             self._degraded_since_ms = 0
 
+        payload: dict[str, Any] = {
+            "state": state,
+            "reason": reason,
+            "since_ms": effective_since,
+        }
+        if elapsed_s is not None:
+            payload["elapsed_s"] = elapsed_s
+
         envelope = {
             "event_type": "transcript_service_degraded",
             "meeting_id": self.meeting_id,
             "tenant_id": self.tenant_id,
             "ts_ms": now_ms,
-            "payload": {
-                "state": state,
-                "reason": reason,
-                "since_ms": effective_since,
-            },
+            "payload": payload,
         }
         json_env = json.dumps(envelope)
 
@@ -1062,6 +1189,39 @@ class MeetingPipeline:
         )
         pipe.expire(self._out_key, 86400)
         # Internal bus
+        pipe.xadd(
+            self._events_key,
+            {"payload": json_env},
+            maxlen=5000,
+            approximate=True,
+        )
+        pipe.expire(self._events_key, 86400)
+        with contextlib.suppress(Exception):
+            await pipe.execute()
+
+    async def _emit_audio_gap_event(self, gap_info: dict[str, Any]) -> None:
+        """Publish ONE audio_gap event to BOTH internal bus and out stream."""
+        now_ms = int(time.time() * 1000)
+        envelope = {
+            "event_type": "audio_gap",
+            "meeting_id": self.meeting_id,
+            "tenant_id": self.tenant_id,
+            "ts_ms": now_ms,
+            "payload": gap_info,
+        }
+        json_env = json.dumps(envelope)
+
+        pipe = self.redis.pipeline(transaction=False)
+        pipe.xadd(
+            self._out_key,
+            {
+                "event_type": "audio_gap",
+                "payload": json_env,
+            },
+            maxlen=5000,
+            approximate=True,
+        )
+        pipe.expire(self._out_key, 86400)
         pipe.xadd(
             self._events_key,
             {"payload": json_env},
@@ -1162,4 +1322,5 @@ class MeetingPipeline:
             reconnects=self._reconnect_count,
             dropped_chunks=self._dropped_chunks_count,
             degraded_seconds=self._total_degraded_s,
+            gaps=self._detected_gaps,
         )

@@ -127,13 +127,21 @@ def test_deepgram_base_url_loopback_only():
             DEEPGRAM_BASE_URL="https://external-proxy.example.com",
         )
 
+    # Default allowed regions: falls back to configured ASR_REGION only
+    s_default_allowed = AsrSettings(_env_file=None, ASR_REGION="in", ASR_ALLOWED_REGIONS=None)
+    assert s_default_allowed.allowed_regions_set == {"in"}
+
+    s_au = AsrSettings(_env_file=None, ASR_REGION="au", ASR_ALLOWED_REGIONS="au")
+    assert s_au.allowed_regions_set == {"au"}
+
 
 def test_resolve_asr_base_url_from_allow_list():
     """resolve_asr_base_url resolves host strictly according to DEEPGRAM_REGION_HOSTS."""
-    settings = AsrSettings(_env_file=None, DEEPGRAM_BASE_URL=None)
+    settings = AsrSettings(_env_file=None, DEEPGRAM_BASE_URL=None, ASR_REGION="global")
     assert resolve_asr_base_url(settings, "global") == "wss://api.deepgram.com"
     assert resolve_asr_base_url(settings, "in") == "wss://api.in.deepgram.com"
     assert resolve_asr_base_url(settings, "eu") == "wss://api.eu.deepgram.com"
+    assert resolve_asr_base_url(settings, "au") == "wss://api.au.deepgram.com"
 
     with pytest.raises(ValueError, match="Invalid asr_region"):
         resolve_asr_base_url(settings, "unknown_region")
@@ -189,8 +197,9 @@ async def test_service_strict_residency_mode_emits_degraded():
 
     # In strict mode, pipeline must NOT be added to active pipelines
     assert "meet_1" not in svc._active_pipelines
-    # Redis pipeline xadd was called to emit degraded event
+    # Redis pipeline xadd was called to emit degraded event with reason='residency_violation'
     assert mock_pipe.xadd.called
+    assert any("residency_violation" in str(c) for c in mock_pipe.xadd.call_args_list)
 
 
 @pytest.mark.asyncio

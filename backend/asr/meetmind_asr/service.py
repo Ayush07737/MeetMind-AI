@@ -212,7 +212,7 @@ class AsrService:
                 )
                 await pipeline_stub._emit_degraded_event(
                     state="degraded",
-                    reason="region_not_allowed",
+                    reason="residency_violation",
                 )
                 return
             else:
@@ -529,9 +529,11 @@ class AsrService:
                                     dur,
                                     mid,
                                 )
-                                pipeline._debug_block_reconnect_until = time.time() + dur
+                                pipeline._debug_block_connect_until = time.time() + dur
                                 if hasattr(pipeline.provider, "_debug_drop_connection"):
                                     pipeline.provider._debug_drop_connection()
+                                else:
+                                    asyncio.create_task(pipeline.provider.close())
             except asyncio.CancelledError:
                 break
             except Exception as exc:

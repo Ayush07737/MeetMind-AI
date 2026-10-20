@@ -288,7 +288,7 @@ class HealthServer:
 
                             def _take_diff() -> list[str]:
                                 curr_snap = tracemalloc.take_snapshot()
-                                diff = curr_snap.compare_to(_tracemalloc_base, "lineno")[:5]
+                                diff = curr_snap.compare_to(_tracemalloc_base, "lineno")[:10]
                                 return [str(s) for s in diff]
 
                             top_diff = await asyncio.to_thread(_take_diff)
@@ -306,6 +306,7 @@ class HealthServer:
                                     "reconnect_buffer_depth": len(pipe._reconnect_buffer),
                                     "pending_acks_depth": len(pipe._pending_acks),
                                     "dedupe_lru_size": len(pipe._dedupe._seen_utterance_ids),
+                                    "reconnect_attempts": getattr(pipe, "_reconnect_attempts", []),
                                 }
                             resp_data["metrics"]["pipelines"] = p_info
 

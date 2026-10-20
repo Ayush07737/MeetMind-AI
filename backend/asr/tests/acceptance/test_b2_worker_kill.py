@@ -230,9 +230,16 @@ async def test_b2_worker_kill_and_failover(
 
     # 10. Assert: the stub's received client_seq set covers every sent chunk
     s_key = f"mm:{tenant_id}:stub_seqs:{meeting_id}"
-    raw_seqs = await real_redis.smembers(s_key)
-    received_set = {int(s) for s in raw_seqs}
     expected_all = set(range(1, 17))
+    t_poll_seqs = time.monotonic()
+    received_set: set[int] = set()
+    while time.monotonic() - t_poll_seqs < 10.0:
+        raw_seqs = await real_redis.smembers(s_key)
+        received_set = {int(s) for s in raw_seqs}
+        if expected_all.issubset(received_set):
+            break
+        await asyncio.sleep(0.1)
+
     assert expected_all.issubset(received_set), (
         f"Received client_seq set does not cover all sent chunks. "
         f"Missing: {expected_all - received_set}, Received: {received_set}"

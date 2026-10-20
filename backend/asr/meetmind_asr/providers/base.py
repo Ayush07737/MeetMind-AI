@@ -93,6 +93,11 @@ class ASRProvider(ABC):
         """Signal end of stream and flush remaining transcription results."""
         ...
 
+    @property
+    def is_open(self) -> bool:
+        """Return True if the provider connection is currently open."""
+        return getattr(self, "_is_open", False)
+
     @abstractmethod
     async def close(self) -> None:
         """Terminate provider connection and cleanup resources immediately."""
