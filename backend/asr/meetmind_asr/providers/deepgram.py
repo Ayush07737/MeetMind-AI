@@ -137,7 +137,9 @@ class DeepgramProvider(ASRProvider):
         # Invariant: Any non-global region or strict tenant forces mip_opt_out=true
         is_loopback = "127.0.0.1" in self._base_url or "localhost" in self._base_url
         is_non_global = (
-            "api.in." in self._base_url or "api.eu." in self._base_url
+            "api.in." in self._base_url
+            or "api.eu." in self._base_url
+            or "api.au." in self._base_url
         ) and not is_loopback
         if not self._mip_opt_out and is_non_global:
             raise ValueError(
