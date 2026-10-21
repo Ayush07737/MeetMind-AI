@@ -62,7 +62,7 @@ async def test_t2_frame_routing_all_adapters(
             )
         )
         ack_start = json.loads(await ws.recv())
-        assert ack_start["type"] == "ack"
+        assert ack_start["type"] == "ack", f"Unexpected ack_start: {ack_start}"
         assert ack_start["status"] == "accepted"
 
         # 3. consent_confirmed

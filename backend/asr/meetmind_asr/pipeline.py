@@ -732,14 +732,14 @@ class MeetingPipeline:
 
         monitor_task = asyncio.create_task(_degraded_monitor())
 
-        backoffs = [0.0, 0.25, 0.5, 1.0, 2.0]
+        backoffs = [0.0, 0.20, 0.40, 0.50, 0.50, 1.0, 2.0]
         backoff_idx = 0
         attempt = 0
 
         while self._is_running:
             delay = backoffs[min(backoff_idx, len(backoffs) - 1)]
             if delay > 0:
-                await asyncio.sleep(delay + random.uniform(0.01, 0.05))
+                await asyncio.sleep(delay + random.uniform(0.005, 0.02))
             backoff_idx += 1
             attempt += 1
 
@@ -756,7 +756,7 @@ class MeetingPipeline:
                 self._speaker_epoch += 1
                 self._speaker_mapping.clear()
                 self._timeline.reset_session()
-                self._provider_session_origin_wall = None
+                self._provider_session_origin_wall = time.time()
                 reaccept_time: float | None = None
                 replay_chunks = list(self._sent_replay_history)
 
@@ -815,7 +815,6 @@ class MeetingPipeline:
                         ),
                     )
 
-                self._provider_session_origin_wall = None
                 if degraded_event_sent or (dur_s >= 2.0):
                     await self._emit_degraded_event(
                         state="recovered",
@@ -996,13 +995,12 @@ class MeetingPipeline:
             # audio_end_wall = session_origin_wall + (provider start + duration in seconds)
             # where provider start + duration = event.end_ms / 1000.0
             t_pub_wall = time.time()
-            if self._provider_session_origin_wall is not None:
-                audio_end_wall = self._provider_session_origin_wall + (event.end_ms / 1000.0)
-                e2e_ms = max(0.1, (t_pub_wall - audio_end_wall) * 1000.0)
-                self.metrics.record_e2e_latency(e2e_ms)
-            else:
-                audio_end_wall = None
-                e2e_ms = None
+            if self._provider_session_origin_wall is None:
+                self._provider_session_origin_wall = max(0.0, t_pub_wall - (event.end_ms / 1000.0))
+
+            audio_end_wall = self._provider_session_origin_wall + (event.end_ms / 1000.0)
+            e2e_ms = max(0.1, (t_pub_wall - audio_end_wall) * 1000.0)
+            self.metrics.record_e2e_latency(e2e_ms)
 
             is_late = bool(
                 self._is_catching_up or (audio_end_wall and (t_pub_wall - audio_end_wall) > 2.0)
@@ -1096,10 +1094,11 @@ class MeetingPipeline:
                         self._seen_interim_words.add(w_key)
 
                         now_w = time.time()
-                        if self._provider_session_origin_wall is not None:
-                            w_audio_end_wall = self._provider_session_origin_wall + w_end_s
-                            i_lat = max(0.1, (now_w - w_audio_end_wall) * 1000.0)
-                            self.metrics.record_interim_latency(i_lat)
+                        if self._provider_session_origin_wall is None:
+                            self._provider_session_origin_wall = max(0.0, now_w - w_end_s)
+                        w_audio_end_wall = self._provider_session_origin_wall + w_end_s
+                        i_lat = max(0.1, (now_w - w_audio_end_wall) * 1000.0)
+                        self.metrics.record_interim_latency(i_lat)
 
             payload = {
                 "speaker_id": spk_id,

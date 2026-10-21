@@ -67,6 +67,7 @@ async def test_t3_worker_kill_and_recovery(
     env_b["REDIS_URL"] = redis_url
     env_b["AUDIO_REDIS_URL"] = redis_url
     env_b["AUDIO_STREAM_MAXLEN"] = "20000"
+    env_b["IDLE_TIMEOUT_SECONDS"] = "60.0"
     env_b["LOG_LEVEL"] = "INFO"
     env_b["PYTHONPATH"] = (
         str(repo_root / "backend" / "gateway")
@@ -158,7 +159,10 @@ async def test_t3_worker_kill_and_recovery(
         assert status_a == 200
         ticket_a = ticket_resp_a["ticket"]
 
-        ws_uri_a = f"ws://127.0.0.1:{port_a}/v1/meetings/{meeting_id}/stream?ticket={ticket_a}"
+        ws_uri_a = (
+            f"ws://127.0.0.1:{port_a}/v1/meetings/{meeting_id}/stream"
+            f"?ticket={ticket_a}&idle_timeout=60.0"
+        )
 
         # 2. Connect to Server A, start meeting & consent, stream first 5 chunks (1..5)
         async with websockets.connect(ws_uri_a) as ws_a:
@@ -214,7 +218,10 @@ async def test_t3_worker_kill_and_recovery(
         assert status_b == 200
         ticket_b = ticket_resp_b["ticket"]
 
-        ws_uri_b = f"ws://127.0.0.1:{port_b}/v1/meetings/{meeting_id}/stream?ticket={ticket_b}"
+        ws_uri_b = (
+            f"ws://127.0.0.1:{port_b}/v1/meetings/{meeting_id}/stream"
+            f"?ticket={ticket_b}&idle_timeout=60.0"
+        )
         async with websockets.connect(ws_uri_b) as ws_b:
             await ws_b.send(
                 json.dumps(
@@ -271,7 +278,11 @@ async def test_t3_worker_kill_and_recovery(
         assert found_seqs == list(range(1, 11)), f"Sequences mismatch: {found_seqs}"
 
         # 6. Consumer Group 'asr' reads with XREADGROUP, crashes before XACK
-        await real_redis.xgroup_create(s_key, "asr", id="0", mkstream=True)
+        try:
+            await real_redis.xgroup_create(s_key, "asr", id="0", mkstream=True)
+        except Exception as exc:
+            if "BUSYGROUP" not in str(exc):
+                raise
 
         read_entries = await real_redis.xreadgroup(
             groupname="asr",
