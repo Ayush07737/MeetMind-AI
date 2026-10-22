@@ -146,6 +146,21 @@ class AsrService:
             ):
                 await self.redis.delete(l_key)
 
+    async def _recycle_meeting(self, tenant_id: str, meeting_id: str) -> None:
+        """Gracefully recycle pipeline when max duration is exceeded without dropping audio."""
+        logger.info(
+            "Worker %s initiating graceful recycle of pipeline for %s/%s",
+            self.worker_id,
+            tenant_id,
+            meeting_id,
+        )
+        if meeting_id in self._lease_tasks:
+            self._lease_tasks.pop(meeting_id).cancel()
+        if meeting_id in self._active_pipelines:
+            pipeline = self._active_pipelines.pop(meeting_id)
+            await pipeline.stop(is_ended=False)
+            await self._release_lease(tenant_id, meeting_id)
+
     async def _run_lease_heartbeat(self, tenant_id: str, meeting_id: str) -> None:
         """Refresh lease periodically; abort pipeline if lease lost."""
         interval = max(0.2, (self.settings.asr_owner_lease_ttl_ms / 3000.0))
@@ -269,6 +284,7 @@ class AsrService:
             settings=self.settings,
             metrics=self.metrics,
             auditor=self.auditor,
+            on_recycle=self._recycle_meeting,
         )
         pipeline.started_via = started_via
         if lifecycle_entry_id:

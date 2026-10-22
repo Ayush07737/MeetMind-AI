@@ -27,6 +27,7 @@ import socket
 import statistics
 import subprocess
 import sys
+import threading
 import time
 import uuid
 import wave
@@ -589,24 +590,61 @@ async def run_benchmark(
 
     gc.callbacks.append(_bench_gc_cb)
 
+    # Heartbeat updated by main event loop; watchdog thread monitors staleness
+    main_thread_id = threading.get_ident()
+    loop_heartbeat = time.perf_counter()
     bench_loop_lags: list[float] = []
     current_loop_lag_ms = 0.0
     last_send_latency_ms = 0.0
+    distinct_lag_stacks: dict[str, dict[str, Any]] = {}
 
-    async def _bench_lag_tracker() -> None:
-        nonlocal current_loop_lag_ms
+    async def _bench_heartbeat_loop() -> None:
+        nonlocal loop_heartbeat, current_loop_lag_ms
         while not stop_bench.is_set():
-            t0 = time.perf_counter()
-            await asyncio.sleep(0.010)
-            lag = (time.perf_counter() - t0 - 0.010) * 1000.0
+            t_now = time.perf_counter()
+            lag = max(0.0, (t_now - loop_heartbeat - 0.010) * 1000.0)
             current_loop_lag_ms = lag
             if lag > 0.5:
                 bench_loop_lags.append(lag)
-            if lag > 200.0:
-                stack = "".join(traceback.format_stack())
-                print(f"\n  [LOOP_LAG_SPIKE] Event-loop lag {lag:.1f}ms (>200ms):\n{stack}")
+            loop_heartbeat = t_now
+            await asyncio.sleep(0.010)
 
-    bench_lag_task = asyncio.create_task(_bench_lag_tracker())
+    bench_lag_task = asyncio.create_task(_bench_heartbeat_loop())
+
+    def _watchdog_thread_fn() -> None:
+        last_logged_time = 0.0
+        while not stop_bench.is_set():
+            time.sleep(0.010)
+            if stop_bench.is_set():
+                break
+            stale_ms = (time.perf_counter() - loop_heartbeat) * 1000.0
+            if stale_ms > 200.0:
+                frames = sys._current_frames()
+                frame = frames.get(main_thread_id)
+                if frame:
+                    raw_lines = traceback.format_stack(frame)
+                    stack_key = "".join(raw_lines[-4:])
+                    now_wall = time.time()
+                    if stack_key not in distinct_lag_stacks:
+                        distinct_lag_stacks[stack_key] = {
+                            "count": 1,
+                            "max_ms": stale_ms,
+                            "full_stack": "".join(raw_lines),
+                        }
+                        if now_wall - last_logged_time > 1.0:
+                            last_logged_time = now_wall
+                            print(
+                                f"\n  [LOOP_LAG] Main loop blocked {stale_ms:.1f}ms (>200ms):\n"
+                                f"{distinct_lag_stacks[stack_key]['full_stack']}"
+                            )
+                    else:
+                        distinct_lag_stacks[stack_key]["count"] += 1
+                        distinct_lag_stacks[stack_key]["max_ms"] = max(
+                            distinct_lag_stacks[stack_key]["max_ms"], stale_ms
+                        )
+
+    watchdog_thread = threading.Thread(target=_watchdog_thread_fn, daemon=True)
+    watchdog_thread.start()
 
     # Ingest loop
     ingest_ws_url = f"ws://127.0.0.1:{gw_port}/v1/meetings/{meeting_id}/stream?ticket={ticket}"
@@ -713,15 +751,39 @@ async def run_benchmark(
 
         t_start = time.perf_counter()
 
-        # Dedicated background sampler task (decoupled completely from sender)
-        async def _metrics_sampler():
-            nonlocal chunks_sent_counter, latest_worker_metrics
+        # Dedicated background metrics sampler thread (isolated completely from event loop)
+        # to ensure psutil USS, HTTP health checks, and Redis memory queries NEVER block
+        # audio dispatch loop
+        def _metrics_sampler_worker() -> None:
+            nonlocal latest_worker_metrics
+            sync_redis = None
+            try:
+                import redis
+
+                sync_redis = redis.from_url(redis_url)
+            except Exception:
+                pass
+
+            meeting_keys = [
+                f"mm:{tenant_id}:audio:{meeting_id}",
+                f"mm:{tenant_id}:events:{meeting_id}",
+                f"mm:{tenant_id}:out:{meeting_id}",
+                f"mm:{tenant_id}:asr:session:{meeting_id}",
+                f"mm:{tenant_id}:asr:owner:{meeting_id}",
+            ]
+
             next_sample = t_start + 10.0
+            m5_snapshot_taken = False
             while not stop_bench.is_set():
                 now = time.perf_counter()
                 sleep_dur = next_sample - now
                 if sleep_dur > 0:
-                    await asyncio.sleep(sleep_dur)
+                    time.sleep(min(sleep_dur, 1.0))
+                    if stop_bench.is_set():
+                        break
+                    if time.perf_counter() < next_sample:
+                        continue
+
                 now = time.perf_counter()
                 time_s = int(now - t_start)
                 next_sample = now + 10.0
@@ -738,10 +800,10 @@ async def run_benchmark(
                 rec_depth = 0
                 ack_depth = 0
                 dedupe_size = 0
-                async with httpx.AsyncClient() as h_client:
-                    try:
-                        h_res = await h_client.get(
-                            f"http://127.0.0.1:{asr_health_port}/healthz?verbose=1", timeout=2.0
+                try:
+                    with httpx.Client(timeout=3.0) as h_client:
+                        h_res = h_client.get(
+                            f"http://127.0.0.1:{asr_health_port}/healthz?verbose=1"
                         )
                         if h_res.status_code == 200:
                             h_data = h_res.json().get("metrics", {})
@@ -752,24 +814,18 @@ async def run_benchmark(
                             rec_depth = pipe_data.get("reconnect_buffer_depth", 0)
                             ack_depth = pipe_data.get("pending_acks_depth", 0)
                             dedupe_size = pipe_data.get("dedupe_lru_size", 0)
-                    except Exception as h_exc:
-                        print(f"  [HEALTH_SAMPLE_TIMEOUT] T+{time_s}s: {h_exc}")
+                except Exception as h_exc:
+                    print(f"  [HEALTH_SAMPLE_TIMEOUT] T+{time_s}s: {h_exc}")
 
-                meeting_keys = [
-                    f"mm:{tenant_id}:audio:{meeting_id}",
-                    f"mm:{tenant_id}:events:{meeting_id}",
-                    f"mm:{tenant_id}:out:{meeting_id}",
-                    f"mm:{tenant_id}:asr:session:{meeting_id}",
-                    f"mm:{tenant_id}:asr:owner:{meeting_id}",
-                ]
                 redis_mem_bytes = 0
-                for k in meeting_keys:
-                    try:
-                        m = await redis_client.execute_command("MEMORY USAGE", k)
-                        if m:
-                            redis_mem_bytes += int(m)
-                    except Exception:
-                        pass
+                if sync_redis:
+                    for k in meeting_keys:
+                        try:
+                            m = sync_redis.execute_command("MEMORY USAGE", k)
+                            if m:
+                                redis_mem_bytes += int(m)
+                        except Exception:
+                            pass
 
                 iso_now = datetime.now(UTC).isoformat()
                 row_data = [
@@ -785,7 +841,7 @@ async def run_benchmark(
                     dedupe_size,
                     redis_mem_bytes,
                 ]
-                await asyncio.to_thread(_append_csv_row, csv_path, row_data)
+                _append_csv_row(csv_path, row_data)
 
                 sample = {
                     "time_s": time_s,
@@ -809,7 +865,25 @@ async def run_benchmark(
                     f"Redis Mtg Mem: {redis_mem_bytes / 1024:.1f} KB"
                 )
 
-        sampler_task = asyncio.create_task(_metrics_sampler())
+                # Capture minute-5 snapshot for tracemalloc diff
+                if not m5_snapshot_taken and time_s >= 300:
+                    m5_snapshot_taken = True
+                    try:
+                        with httpx.Client(timeout=5.0) as h_c:
+                            h_url = (
+                                f"http://127.0.0.1:{asr_health_port}"
+                                "/healthz?verbose=1&snapshot=save_m5"
+                            )
+                            h_c.get(h_url)
+                            print("  [SNAPSHOT] Captured minute-5 baseline for tracemalloc")
+                    except Exception as s_exc:
+                        print(f"  [SNAPSHOT_WARN] Failed to capture minute-5 baseline: {s_exc}")
+
+            if sync_redis:
+                sync_redis.close()
+
+        sampler_thread = threading.Thread(target=_metrics_sampler_worker, daemon=True)
+        sampler_thread.start()
 
         # Dedicated isolated audio sender task
         async def _audio_sender():
@@ -902,9 +976,7 @@ async def run_benchmark(
         await asyncio.sleep(6.0)
 
     stop_bench.set()
-    sampler_task.cancel()
-    with contextlib.suppress(asyncio.CancelledError):
-        await sampler_task
+    sampler_thread.join(timeout=5.0)
     await collector_task
 
     if _bench_gc_cb in gc.callbacks:
@@ -1070,6 +1142,14 @@ async def run_benchmark(
     print(
         f"      GC Pauses (STW):   Count={b_gc_cnt} | Max={b_gc_max:.2f}ms | Total={b_gc_tot:.2f}ms"
     )
+    if distinct_lag_stacks:
+        print(f"      Observed Blocker Stacks ({len(distinct_lag_stacks)} unique):")
+        for idx, (_st_key, st_info) in enumerate(distinct_lag_stacks.items(), 1):
+            print(f"        [{idx}] Count={st_info['count']} | Max Lag={st_info['max_ms']:.1f}ms:")
+            for line in st_info["full_stack"].strip().splitlines()[-4:]:
+                print(f"            {line}")
+    else:
+        print("      Observed Blocker Stacks: 0 (>200ms)")
 
     print("-" * 80)
     print("5. REDIS SLOWLOG & EVENTS STREAM BOUNDING:")
@@ -1115,8 +1195,12 @@ async def run_benchmark(
         f"peak={tracemalloc_data.get('peak_mb', 0)} MB"
     )
     if tracemalloc_data.get("top_diff"):
-        print("   Tracemalloc Top-10 Snapshot Diffs:")
+        print("   Tracemalloc Top-10 Snapshot Diffs (Startup -> End):")
         for diff_line in tracemalloc_data["top_diff"][:10]:
+            print(f"     - {diff_line}")
+    if tracemalloc_data.get("top_diff_m5"):
+        print("   Tracemalloc Top-10 Snapshot Diffs (Minute 5 -> End):")
+        for diff_line in tracemalloc_data["top_diff_m5"][:10]:
             print(f"     - {diff_line}")
 
     print("-" * 80)
