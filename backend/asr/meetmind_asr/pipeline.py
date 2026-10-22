@@ -63,6 +63,7 @@ class MeetingPipeline:
         settings: AsrSettings,
         metrics: AsrMetrics,
         auditor: AsrAuditor,
+        on_recycle: Any = None,
     ) -> None:
         self.tenant_id = tenant_id
         self.meeting_id = meeting_id
@@ -73,6 +74,8 @@ class MeetingPipeline:
         self.settings = settings
         self.metrics = metrics
         self.auditor = auditor
+        self._on_recycle = on_recycle
+        self._start_wall_time = time.time()
 
         self._audio_key = audio_stream_key(tenant_id, meeting_id)
         self._events_key = events_stream_key(tenant_id, meeting_id)
@@ -136,7 +139,7 @@ class MeetingPipeline:
         self._bytes_sent = 0
         self._reconnect_count = 0
         self._dropped_chunks_count = 0
-        self._all_dispatched_client_seqs: set[int] = set()
+        self._all_dispatched_client_seqs: collections.deque[int] = collections.deque(maxlen=5000)
         self._detected_gaps: list[dict[str, Any]] = []
         self._reconnect_attempts: list[dict[str, Any]] = []
 
@@ -418,6 +421,22 @@ class MeetingPipeline:
                 if not self._is_running or not self._provider_is_ready:
                     continue
 
+                # Worker-recycle policy (Requirement 3)
+                if (
+                    self._start_wall_time > 0
+                    and (time.time() - self._start_wall_time)
+                    > self.settings.asr_worker_max_meeting_seconds
+                ):
+                    logger.info(
+                        "[WORKER_RECYCLE] Meeting %s exceeded max duration %.1fs; "
+                        "initiating graceful recycle",
+                        self.meeting_id,
+                        self.settings.asr_worker_max_meeting_seconds,
+                    )
+                    if self._on_recycle:
+                        asyncio.create_task(self._on_recycle(self.tenant_id, self.meeting_id))
+                    break
+
                 # 3. XREADGROUP for new entries (BLOCK 100ms)
                 entries = await self.redis.xreadgroup(
                     "asr",
@@ -573,7 +592,13 @@ class MeetingPipeline:
             self._timeline.register_chunk(chunk.capture_ts_ms)
             self._chunks_sent += 1
             self._bytes_sent += len(chunk.data)
-            self._all_dispatched_client_seqs.add(chunk.client_seq)
+            self._all_dispatched_client_seqs.append(chunk.client_seq)
+
+            # Periodic GC collection to ensure RSS flatlines on long runs
+            if self._chunks_sent % 3000 == 0:
+                import gc
+
+                gc.collect()
 
             # Prune replay history older than replay window
             while self._sent_replay_history and (t_send - self._sent_replay_history[0][0]) > (

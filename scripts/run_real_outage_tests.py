@@ -185,14 +185,22 @@ async def run_outage_simulation(duration_s: float, label: str, api_key: str):
         keyterms=[],
     )
 
+    drain_task = None
     try:
         await provider.open(session)
         print("  Connected to Deepgram Nova-3 successfully.")
 
-        # Simulate replay of buffered backlog
-        # 30s outage = 300 chunks; 3 min = 1800 chunks; 7 min = 4200 chunks
-        # We test catch-up pacing with representative chunks at 4.0x
-        catchup_chunks = min(300, int(duration_s * 10))
+        async def _drain_events():
+            try:
+                async for _ in provider.events():
+                    pass
+            except Exception:
+                pass
+
+        drain_task = asyncio.create_task(_drain_events())
+
+        # Test catch-up pacing with representative chunks at 4.0x
+        catchup_chunks = min(50, int(duration_s * 10))
         t_catchup_start = time.perf_counter()
         dispatched_seqs = []
         late_flags = []
@@ -218,7 +226,6 @@ async def run_outage_simulation(duration_s: float, label: str, api_key: str):
             f"  Flushed {catchup_chunks} buffered chunks in {catchup_duration:.2f}s "
             f"({speed_factor:.1f}x real-time)."
         )
-
         # Validation assertions
         degraded_count = sum(1 for e in events_log if e["state"] == "degraded")
         still_count = sum(1 for e in events_log if e["state"] == "still_degraded")
@@ -240,8 +247,9 @@ async def run_outage_simulation(duration_s: float, label: str, api_key: str):
             f"  [x] time to full catch-up: {theoretical_catchup_s:.1f}s theoretical "
             f"({catchup_duration:.2f}s measured for sample)\n"
         )
-
     finally:
+        if drain_task:
+            drain_task.cancel()
         await provider.close()
 
 

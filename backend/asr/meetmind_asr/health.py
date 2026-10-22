@@ -20,6 +20,7 @@ from typing import Any
 if not tracemalloc.is_tracing():
     tracemalloc.start()
 _tracemalloc_base = tracemalloc.take_snapshot()
+_tracemalloc_m5: tracemalloc.Snapshot | None = None
 
 if sys.platform == "win32":
     with contextlib.suppress(Exception):
@@ -195,7 +196,7 @@ class HealthServer:
                 lag = max(0.0, (time.perf_counter() - t0 - interval) * 1000.0)
                 self.metrics.loop_lag_ms = round(lag, 2)
                 self.metrics.loop_lag_samples_ms.append(lag)
-                if len(self.metrics.loop_lag_samples_ms) > 10000:
+                if len(self.metrics.loop_lag_samples_ms) > 1000:
                     self.metrics.loop_lag_samples_ms.pop(0)
                 if lag > self.metrics.max_loop_lag_ms:
                     self.metrics.max_loop_lag_ms = round(lag, 2)
@@ -219,6 +220,7 @@ class HealthServer:
     async def _handle_client(
         self, reader: asyncio.StreamReader, writer: asyncio.StreamWriter
     ) -> None:
+        global _tracemalloc_m5
         try:
             line = await reader.readline()
             if not line:
@@ -242,6 +244,10 @@ class HealthServer:
                         "status": "healthy" if redis_ok else "unhealthy",
                         "redis": "connected" if redis_ok else "disconnected",
                     }
+
+                    if "snapshot=save_m5" in path:
+                        _tracemalloc_m5 = tracemalloc.take_snapshot()
+                        logger.info("Captured minute-5 tracemalloc snapshot")
 
                     if "verbose=1" in path or "verbose=true" in path:
                         gc_pauses = self.metrics.gc_pauses_ms
@@ -284,19 +290,30 @@ class HealthServer:
 
                         curr_alloc, peak_alloc = tracemalloc.get_traced_memory()
                         top_diff: list[str] = []
-                        if "snapshot=1" in path:
+                        top_diff_m5: list[str] = []
+                        if "snapshot=1" in path or "snapshot=diff" in path:
 
-                            def _take_diff() -> list[str]:
+                            def _take_diff() -> tuple[list[str], list[str]]:
                                 curr_snap = tracemalloc.take_snapshot()
-                                diff = curr_snap.compare_to(_tracemalloc_base, "lineno")[:10]
-                                return [str(s) for s in diff]
+                                d_base = [
+                                    str(s)
+                                    for s in curr_snap.compare_to(_tracemalloc_base, "lineno")[:10]
+                                ]
+                                m5_diff = (
+                                    curr_snap.compare_to(_tracemalloc_m5, "lineno")[:10]
+                                    if _tracemalloc_m5
+                                    else []
+                                )
+                                d_m5 = [str(s) for s in m5_diff]
+                                return d_base, d_m5
 
-                            top_diff = await asyncio.to_thread(_take_diff)
+                            top_diff, top_diff_m5 = await asyncio.to_thread(_take_diff)
 
                         resp_data["metrics"]["tracemalloc"] = {
                             "current_mb": round(curr_alloc / (1024 * 1024), 3),
                             "peak_mb": round(peak_alloc / (1024 * 1024), 3),
                             "top_diff": top_diff,
+                            "top_diff_m5": top_diff_m5,
                         }
 
                         if self.service and hasattr(self.service, "_active_pipelines"):

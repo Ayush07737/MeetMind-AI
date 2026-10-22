@@ -45,6 +45,9 @@ class AsrSettings(BaseSettings):
     asr_region: Literal["global", "in", "eu", "au"] = Field(default="global", alias="ASR_REGION")
     asr_allowed_regions: str | None = Field(default=None, alias="ASR_ALLOWED_REGIONS")
     asr_catchup_speed: float = Field(default=4.0, alias="ASR_CATCHUP_SPEED")
+    asr_worker_max_meeting_seconds: float = Field(
+        default=3600.0, alias="ASR_WORKER_MAX_MEETING_SECONDS"
+    )
 
     @property
     def allowed_regions_set(self) -> set[str]:
