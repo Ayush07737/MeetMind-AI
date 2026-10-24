@@ -29,6 +29,7 @@ import subprocess
 import sys
 import threading
 import time
+import urllib.request
 import uuid
 import wave
 from datetime import UTC, datetime
@@ -801,12 +802,13 @@ async def run_benchmark(
                 ack_depth = 0
                 dedupe_size = 0
                 try:
-                    with httpx.Client(timeout=3.0) as h_client:
-                        h_res = h_client.get(
-                            f"http://127.0.0.1:{asr_health_port}/healthz?verbose=1"
-                        )
-                        if h_res.status_code == 200:
-                            h_data = h_res.json().get("metrics", {})
+                    req = urllib.request.Request(
+                        f"http://127.0.0.1:{asr_health_port}/healthz?verbose=1"
+                    )
+                    with urllib.request.urlopen(req, timeout=3.0) as resp:
+                        if resp.status == 200:
+                            raw_b = resp.read()
+                            h_data = json.loads(raw_b.decode("utf-8")).get("metrics", {})
                             if h_data:
                                 latest_worker_metrics = h_data
                             loop_lag_ms = h_data.get("loop_lag_ms", 0.0)
@@ -869,12 +871,11 @@ async def run_benchmark(
                 if not m5_snapshot_taken and time_s >= 300:
                     m5_snapshot_taken = True
                     try:
-                        with httpx.Client(timeout=5.0) as h_c:
-                            h_url = (
-                                f"http://127.0.0.1:{asr_health_port}"
-                                "/healthz?verbose=1&snapshot=save_m5"
-                            )
-                            h_c.get(h_url)
+                        req_m5 = urllib.request.Request(
+                            f"http://127.0.0.1:{asr_health_port}/healthz?verbose=1&snapshot=save_m5"
+                        )
+                        with urllib.request.urlopen(req_m5, timeout=5.0) as resp_m5:
+                            resp_m5.read()
                             print("  [SNAPSHOT] Captured minute-5 baseline for tracemalloc")
                     except Exception as s_exc:
                         print(f"  [SNAPSHOT_WARN] Failed to capture minute-5 baseline: {s_exc}")
@@ -885,95 +886,124 @@ async def run_benchmark(
         sampler_thread = threading.Thread(target=_metrics_sampler_worker, daemon=True)
         sampler_thread.start()
 
+        # Dedicated decoupled ack receiver task
+        acks_received_set = set()
+
+        async def _ack_consumer():
+            try:
+                while not stop_bench.is_set():
+                    raw = await ws.recv()
+                    if isinstance(raw, str):
+                        m = json.loads(raw)
+                        if m.get("type") == "ack":
+                            acks_received_set.add(m.get("seq"))
+            except Exception:
+                pass
+
+        ack_task = asyncio.create_task(_ack_consumer())
+
         # Dedicated isolated audio sender task
         async def _audio_sender():
             nonlocal chunks_sent_counter, last_send_latency_ms
             chunk_idx = 1
-            while chunk_idx <= total_target_chunks:
-                chunks_sent_counter = chunk_idx
-                pcm = audio_frames[(chunk_idx - 1) % len(audio_frames)]
-                ts = int(time.time() * 1000)
-                frame = encode_audio_frame(client_seq=chunk_idx, capture_ts_ms=ts, payload=pcm)
+            import gc
 
-                # Stall detection policy: if behind by >5.0s of audio, DO NOT BURST
-                target_time = t_start + (chunk_idx * 0.1)
-                now = time.perf_counter()
-                behind_s = now - target_time
+            gc.disable()
+            try:
+                while chunk_idx <= total_target_chunks:
+                    chunks_sent_counter = chunk_idx
+                    pcm = audio_frames[(chunk_idx - 1) % len(audio_frames)]
+                    ts = int(time.time() * 1000)
+                    frame = encode_audio_frame(client_seq=chunk_idx, capture_ts_ms=ts, payload=pcm)
 
-                if behind_s > 5.0:
-                    skip_to = min(total_target_chunks, int((now - t_start) / 0.1))
-                    stall_info = {
-                        "start_s": round(target_time - t_start, 2),
-                        "duration_s": round(behind_s, 2),
-                        "chunk": chunk_idx,
-                        "skip_to": skip_to,
-                        "send_lat_ms": round(last_send_latency_ms, 2),
-                        "loop_lag_ms": round(current_loop_lag_ms, 2),
-                    }
-                    stalls_recorded.append(stall_info)
-                    print(
-                        f"\n  [CLIENT_STALL_DETECTED] Behind by {behind_s:.2f}s (>5.0s cap) "
-                        f"at chunk {chunk_idx}. DO NOT BURST: Skipping {skip_to - chunk_idx} "
-                        f"chunks to real-time position {skip_to}. Run marked INVALID."
-                    )
-                    chunk_idx = skip_to
-                    continue
+                    # Stall detection policy: if behind by >5.0s of audio, DO NOT BURST
+                    target_time = t_start + (chunk_idx * 0.1)
+                    now = time.perf_counter()
+                    behind_s = now - target_time
 
-                if behind_s < 0:
-                    await asyncio.sleep(-behind_s)
+                    if behind_s > 5.0:
+                        skip_to = min(total_target_chunks, int((now - t_start) / 0.1))
+                        stall_info = {
+                            "start_s": round(target_time - t_start, 2),
+                            "duration_s": round(behind_s, 2),
+                            "chunk": chunk_idx,
+                            "skip_to": skip_to,
+                            "send_lat_ms": round(last_send_latency_ms, 2),
+                            "loop_lag_ms": round(current_loop_lag_ms, 2),
+                        }
+                        stalls_recorded.append(stall_info)
+                        print(
+                            f"\n  [CLIENT_STALL_DETECTED] Behind by {behind_s:.2f}s (>5.0s cap) "
+                            f"at chunk {chunk_idx}. DO NOT BURST: Skipping {skip_to - chunk_idx} "
+                            f"chunks to real-time position {skip_to}. Run marked INVALID."
+                        )
+                        chunk_idx = skip_to
+                        continue
 
-                t_send_0 = time.perf_counter()
-                await ws.send(frame)
-                await recv_ack(ws)
-                send_dur = (time.perf_counter() - t_send_0) * 1000.0
-                last_send_latency_ms = send_dur
+                    if behind_s < 0:
+                        await asyncio.sleep(-behind_s)
 
-                if send_dur > 500.0:
-                    stack = "".join(traceback.format_stack())
-                    print(
-                        f"\n  [SEND_LATENCY_SPIKE] ws.send+ack took {send_dur:.1f}ms (>500ms) "
-                        f"at chunk {chunk_idx} (T+{now - t_start:.1f}s):\n{stack}"
-                    )
+                    t_send_0 = time.perf_counter()
+                    await ws.send(frame)
+                    send_dur = (time.perf_counter() - t_send_0) * 1000.0
+                    last_send_latency_ms = send_dur
 
-                # Optional simulated outage injection
-                if simulate_outage_s > 0 and chunk_idx == 600:
-                    print(
-                        f"\n  [OUTAGE_SIMULATION] Triggering {simulate_outage_s:.1f}s "
-                        "provider outage via control stream..."
-                    )
-                    with contextlib.suppress(Exception):
-                        await redis_client.xadd(
-                            "mm:system:asr_control",
-                            {
-                                "action": "provider_outage",
-                                "meeting_id": meeting_id,
-                                "duration_s": str(simulate_outage_s),
-                            },
+                    if send_dur > 200.0:
+                        stack = "".join(traceback.format_stack())
+                        print(
+                            f"\n  [SEND_LATENCY_SPIKE] ws.send took {send_dur:.1f}ms (>200ms) "
+                            f"at chunk {chunk_idx} (T+{now - t_start:.1f}s):\n{stack}"
                         )
 
-                chunk_idx += 1
+                    # Optional simulated outage injection
+                    if simulate_outage_s > 0 and chunk_idx == 600:
+                        print(
+                            f"\n  [OUTAGE_SIMULATION] Triggering {simulate_outage_s:.1f}s "
+                            "provider outage via control stream..."
+                        )
+                        with contextlib.suppress(Exception):
+                            await redis_client.xadd(
+                                "mm:system:asr_control",
+                                {
+                                    "action": "provider_outage",
+                                    "meeting_id": meeting_id,
+                                    "duration_s": str(simulate_outage_s),
+                                },
+                            )
+
+                    chunk_idx += 1
+            finally:
+                gc.enable()
 
         sender_task = asyncio.create_task(_audio_sender())
         await sender_task
 
         actual_stream_dur = time.perf_counter() - t_start
 
-        # Fetch final live metrics before ending meeting
-        async with httpx.AsyncClient() as h_client:
+        def _fetch_health(url: str, timeout: float) -> dict[str, Any]:
             try:
-                h_res = await h_client.get(
-                    f"http://127.0.0.1:{asr_health_port}/healthz?verbose=1", timeout=5.0
-                )
-                if h_res.status_code == 200:
-                    h_m = h_res.json().get("metrics", {})
-                    if h_m:
-                        latest_worker_metrics.update(h_m)
-            except Exception as e:
-                print(f"  [PRE_END_METRICS_WARN] {e}")
+                req = urllib.request.Request(url)
+                with urllib.request.urlopen(req, timeout=timeout) as resp:
+                    if resp.status == 200:
+                        return json.loads(resp.read().decode("utf-8")).get("metrics", {})
+            except Exception:
+                pass
+            return {}
+
+        # Fetch final live metrics before ending meeting
+        pre_end_metrics = await asyncio.to_thread(
+            _fetch_health, f"http://127.0.0.1:{asr_health_port}/healthz?verbose=1", 5.0
+        )
+        if pre_end_metrics:
+            latest_worker_metrics.update(pre_end_metrics)
 
         # End meeting
         await ws.send(json.dumps({"type": "control", "action": "meeting_end"}))
         await asyncio.sleep(6.0)
+
+        ack_task.cancel()
+        with contextlib.suppress(asyncio.CancelledError):
+            await ack_task
 
     stop_bench.set()
     sampler_thread.join(timeout=5.0)
@@ -987,17 +1017,13 @@ async def run_benchmark(
 
     # Query final in-process telemetry (with snapshot=1 off the sender loop)
     final_worker_metrics: dict[str, Any] = latest_worker_metrics.copy()
-    async with httpx.AsyncClient() as h_client:
-        try:
-            h_res = await h_client.get(
-                f"http://127.0.0.1:{asr_health_port}/healthz?verbose=1&snapshot=1", timeout=15.0
-            )
-            if h_res.status_code == 200:
-                post_m = h_res.json().get("metrics", {})
-                if "tracemalloc" in post_m:
-                    final_worker_metrics["tracemalloc"] = post_m["tracemalloc"]
-        except Exception as e:
-            print(f"  [SNAPSHOT_FETCH_WARN] {e}")
+    post_metrics = await asyncio.to_thread(
+        _fetch_health,
+        f"http://127.0.0.1:{asr_health_port}/healthz?verbose=1&snapshot=1",
+        15.0,
+    )
+    if "tracemalloc" in post_metrics:
+        final_worker_metrics["tracemalloc"] = post_metrics["tracemalloc"]
 
     # Query Redis slowlog before closing
     redis_slowlog = []
@@ -1175,19 +1201,48 @@ async def run_benchmark(
                 f"final={uss_vals[-1]:.1f} MB"
             )
 
-    # Memory slope after minute 5 (Requirement 8: <= 0.05 MB/min)
-    m5_samples = [s for s in stability_samples if s["time_s"] >= 300 and s["asr_rss_mb"] > 0]
-    m5_slope_mb_min = 0.0
+    # Memory slope after minute 5 (D2i: Tracemalloc <= 0.02 MB/min, USS Min-Envelope <= 0.05 MB/min)
+    m5_samples = [s for s in stability_samples if s["time_s"] >= 300 and s["asr_uss_mb"] > 0]
+
+    # 1. USS Min-Envelope Slope
+    uss_min_env_slope_mb_min = 0.0
     if len(m5_samples) >= 2:
-        dt_min = (m5_samples[-1]["time_s"] - m5_samples[0]["time_s"]) / 60.0
-        drss = m5_samples[-1]["asr_rss_mb"] - m5_samples[0]["asr_rss_mb"]
+        min_env_points = []
+        for i in range(len(m5_samples)):
+            w_start = max(0, i - 5)  # 6-sample (~60s) rolling window
+            min_val = min(s["asr_uss_mb"] for s in m5_samples[w_start : i + 1])
+            min_env_points.append((m5_samples[i]["time_s"], min_val))
+
+        n_pts = len(min_env_points)
+        sum_t = sum(p[0] for p in min_env_points)
+        sum_u = sum(p[1] for p in min_env_points)
+        sum_tt = sum(p[0] ** 2 for p in min_env_points)
+        sum_tu = sum(p[0] * p[1] for p in min_env_points)
+        denom = (n_pts * sum_tt) - (sum_t**2)
+        if denom > 0:
+            slope_per_sec = ((n_pts * sum_tu) - (sum_t * sum_u)) / denom
+            uss_min_env_slope_mb_min = round(slope_per_sec * 60.0, 4)
+
+    # 2. Worker Tracemalloc Slope
+    tm_slope_mb_min = 0.0
+    tm_curr = tracemalloc_data.get("current_mb", 0.0)
+    tm_m5 = tracemalloc_data.get("m5_current_mb")
+    if tm_m5 is not None and len(m5_samples) >= 2:
+        dt_min = (m5_samples[-1]["time_s"] - 300.0) / 60.0
         if dt_min > 0:
-            m5_slope_mb_min = round(drss / dt_min, 4)
-    mem_slope_pass = m5_slope_mb_min <= 0.05 if m5_samples else True
-    mem_slope_status = "PASS" if mem_slope_pass else "FAIL"
+            tm_slope_mb_min = round((tm_curr - tm_m5) / dt_min, 4)
+
+    tm_pass = tm_slope_mb_min <= 0.02
+    uss_pass = uss_min_env_slope_mb_min <= 0.05
+    mem_slope_pass = tm_pass and uss_pass
+
     print(
-        f"   Memory Slope (T >= 5m):       {m5_slope_mb_min:.4f} MB/min "
-        f"(threshold <= 0.05 MB/min) -> [{mem_slope_status}]"
+        f"   Worker Tracemalloc Slope (T >= 5m): {tm_slope_mb_min:.4f} MB/min "
+        f"(threshold <= 0.02 MB/min) -> [{'PASS' if tm_pass else 'FAIL'}]"
+    )
+    print(
+        f"   USS Min-Envelope Slope (T >= 5m):   {uss_min_env_slope_mb_min:.4f} MB/min "
+        f"(threshold <= 0.05 MB/min) -> [{'PASS' if uss_pass else 'FAIL'}]"
     )
 
     print(
@@ -1343,8 +1398,16 @@ async def run_benchmark(
 
     has_stall = len(stalls_recorded) > 0
     interim_p50 = float(interim_stats.get("p50", 999.0))
-    interim_pass = interim_p50 <= 500.0
     ws_rtt_p50 = float(net_stats.get("ping_rtt_ms", {}).get("p50", 0.0))
+
+    if has_stall:
+        verdict_str = "INVALID"
+        v_interim = "N/A - INVALID RUN"
+    elif ws_rtt_p50 > 0 and interim_p50 < (ws_rtt_p50 / 2.0):
+        verdict_str = "INVALID"
+        v_interim = f"INVALID - BELOW PHYSICAL MINIMUM (RTT/2 = {ws_rtt_p50 / 2.0:.1f}ms)"
+    else:
+        v_interim = "PASS" if (interim_p50 <= 500.0) else "NOT MET"
 
     overall_pass = (
         calib_pass
@@ -1354,28 +1417,31 @@ async def run_benchmark(
         and duration_pass
         and degraded_count_pass
         and not has_stall
+        and (v_interim != "N/A - INVALID RUN")
+        and not v_interim.startswith("INVALID")
     )
-    if has_stall:
-        verdict_str = "INVALID"
-    elif not overall_pass:
-        verdict_str = "FAIL"
-    else:
-        verdict_str = "PASSED"
+    if not has_stall and not v_interim.startswith("INVALID"):
+        verdict_str = "PASSED" if overall_pass else "FAIL"
 
-    v_svc = "PASS" if svc_pass else "FAIL"
+    if has_stall or verdict_str == "INVALID" or v_interim.startswith("INVALID"):
+        v_svc = "N/A - INVALID RUN"
+    else:
+        v_svc = "PASS" if svc_pass else "FAIL"
     v_calib = "PASS" if calib_pass else "FAIL"
     v_zero = "PASS" if zero_drops_pass else "FAIL"
     v_mem = "PASS" if mem_slope_pass else "FAIL"
     v_dur = "PASS" if duration_pass else "FAIL"
     v_deg = "PASS" if degraded_count_pass else "FAIL"
     v_stall = "PASS" if not has_stall else "INVALID"
-    v_interim = "PASS" if interim_pass else "NOT MET"
     calib_err = calib_res.get("error_ms", 0.0)
 
     print(f"   [1] Service Overhead P95 < 25ms:     P95={p95_svc:.2f}ms  -> [{v_svc}]")
     print(f"   [2] Verification Calibration:        Error={calib_err:.2f}ms -> [{v_calib}]")
     print(f"   [3] Zero Audio Chunks Dropped:       Dropped={dropped_chunks}      -> [{v_zero}]")
-    print(f"   [4] Memory Flatlining (Slope <=0.05): Slope={m5_slope_mb_min:.4f}MB/m -> [{v_mem}]")
+    print(
+        f"   [4] Memory Flatlining:               TM Slope={tm_slope_mb_min:.4f}MB/m (<=0.02), "
+        f"USS Slope={uss_min_env_slope_mb_min:.4f}MB/m (<=0.05) -> [{v_mem}]"
+    )
     print(f"   [5] Stream Duration Accuracy <=2%:   Error={duration_err_pct:.2f}%     -> [{v_dur}]")
     print(f"   [6] Degraded State Machine (<=25):   Events={len(degraded_events)}     -> [{v_deg}]")
     print(
