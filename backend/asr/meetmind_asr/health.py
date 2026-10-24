@@ -14,6 +14,7 @@ import logging
 import sys
 import time
 import tracemalloc
+from collections import deque
 from dataclasses import dataclass, field
 from typing import Any
 
@@ -21,6 +22,7 @@ if not tracemalloc.is_tracing():
     tracemalloc.start()
 _tracemalloc_base = tracemalloc.take_snapshot()
 _tracemalloc_m5: tracemalloc.Snapshot | None = None
+_tracemalloc_m5_alloc: int | None = None
 
 if sys.platform == "win32":
     with contextlib.suppress(Exception):
@@ -41,22 +43,22 @@ class AsrMetrics:
     dropped_chunks: int = 0
     reconnects: int = 0
     degraded_seconds: float = 0.0
-    publish_latencies_ms: list[float] = field(default_factory=list)
-    service_added_latencies_ms: list[float] = field(default_factory=list)
-    e2e_latencies_ms: list[float] = field(default_factory=list)
-    interim_latencies_ms: list[float] = field(default_factory=list)
-    provider_latencies_ms: list[float] = field(default_factory=list)
-    stage_parse_ms: list[float] = field(default_factory=list)
-    stage_timeline_ms: list[float] = field(default_factory=list)
-    stage_speaker_ms: list[float] = field(default_factory=list)
-    stage_dedupe_ms: list[float] = field(default_factory=list)
-    stage_serialize_ms: list[float] = field(default_factory=list)
-    stage_xadd_ms: list[float] = field(default_factory=list)
+    publish_latencies_ms: deque[float] = field(default_factory=lambda: deque(maxlen=300))
+    service_added_latencies_ms: deque[float] = field(default_factory=lambda: deque(maxlen=300))
+    e2e_latencies_ms: deque[float] = field(default_factory=lambda: deque(maxlen=300))
+    interim_latencies_ms: deque[float] = field(default_factory=lambda: deque(maxlen=300))
+    provider_latencies_ms: deque[float] = field(default_factory=lambda: deque(maxlen=300))
+    stage_parse_ms: deque[float] = field(default_factory=lambda: deque(maxlen=100))
+    stage_timeline_ms: deque[float] = field(default_factory=lambda: deque(maxlen=100))
+    stage_speaker_ms: deque[float] = field(default_factory=lambda: deque(maxlen=100))
+    stage_dedupe_ms: deque[float] = field(default_factory=lambda: deque(maxlen=100))
+    stage_serialize_ms: deque[float] = field(default_factory=lambda: deque(maxlen=100))
+    stage_xadd_ms: deque[float] = field(default_factory=lambda: deque(maxlen=100))
     loop_lag_ms: float = 0.0
     max_loop_lag_ms: float = 0.0
-    loop_lag_samples_ms: list[float] = field(default_factory=list)
-    gc_pauses_ms: list[float] = field(default_factory=list)
-    reconnect_durations_ms: list[float] = field(default_factory=list)
+    loop_lag_samples_ms: deque[float] = field(default_factory=lambda: deque(maxlen=300))
+    gc_pauses_ms: deque[float] = field(default_factory=lambda: deque(maxlen=300))
+    reconnect_durations_ms: deque[float] = field(default_factory=lambda: deque(maxlen=100))
     started_via: str = ""
     started_via_counts: dict[str, int] = field(
         default_factory=lambda: {"lifecycle": 0, "reconciler": 0}
@@ -64,8 +66,6 @@ class AsrMetrics:
 
     def record_reconnect_duration(self, duration_ms: float) -> None:
         self.reconnect_durations_ms.append(duration_ms)
-        if len(self.reconnect_durations_ms) > 1000:
-            self.reconnect_durations_ms.pop(0)
 
     def record_started_via(self, meeting_id: str, source: str) -> None:
         self.started_via = source
@@ -73,43 +73,29 @@ class AsrMetrics:
 
     def record_publish_latency(self, latency_ms: float) -> None:
         self.publish_latencies_ms.append(latency_ms)
-        if len(self.publish_latencies_ms) > 5000:
-            self.publish_latencies_ms.pop(0)
 
     def record_service_added_latency(self, latency_ms: float) -> None:
         self.service_added_latencies_ms.append(latency_ms)
-        if len(self.service_added_latencies_ms) > 5000:
-            self.service_added_latencies_ms.pop(0)
 
     def record_e2e_latency(self, latency_ms: float) -> None:
         self.e2e_latencies_ms.append(latency_ms)
-        if len(self.e2e_latencies_ms) > 5000:
-            self.e2e_latencies_ms.pop(0)
 
     def record_interim_latency(self, latency_ms: float) -> None:
         self.interim_latencies_ms.append(latency_ms)
-        if len(self.interim_latencies_ms) > 5000:
-            self.interim_latencies_ms.pop(0)
 
     def record_provider_latency(self, latency_ms: float) -> None:
         self.provider_latencies_ms.append(latency_ms)
-        if len(self.provider_latencies_ms) > 5000:
-            self.provider_latencies_ms.pop(0)
 
     def record_stage_timing(self, stage: str, timing_ms: float) -> None:
         attr = f"stage_{stage}_ms"
         lst = getattr(self, attr, None)
-        if lst is not None and isinstance(lst, list):
+        if lst is not None:
             lst.append(timing_ms)
-            if len(lst) > 5000:
-                lst.pop(0)
 
     def record_gc_pause(self, pause_ms: float) -> None:
         self.gc_pauses_ms.append(pause_ms)
-        if len(self.gc_pauses_ms) > 1000:
-            self.gc_pauses_ms.pop(0)
 
-    def _calc_percentiles(self, vals: list[float]) -> dict[str, Any]:
+    def _calc_percentiles(self, vals: Any) -> dict[str, Any]:
         if not vals:
             return {"p50": 0.0, "p95": 0.0, "p99": 0.0, "max": 0.0, "mean": 0.0, "n": 0}
         s = sorted(vals)
@@ -220,7 +206,7 @@ class HealthServer:
     async def _handle_client(
         self, reader: asyncio.StreamReader, writer: asyncio.StreamWriter
     ) -> None:
-        global _tracemalloc_m5
+        global _tracemalloc_m5, _tracemalloc_m5_alloc
         try:
             line = await reader.readline()
             if not line:
@@ -229,6 +215,13 @@ class HealthServer:
 
             req_line = line.decode("utf-8").strip()
             parts = req_line.split()
+
+            # Fully consume HTTP headers to prevent TCP RST on Windows socket close
+            while True:
+                h_line = await reader.readline()
+                if not h_line or h_line in (b"\r\n", b"\n"):
+                    break
+
             if len(parts) >= 2 and parts[0] == "GET":
                 path = parts[1]
                 if path.startswith("/healthz"):
@@ -247,6 +240,7 @@ class HealthServer:
 
                     if "snapshot=save_m5" in path:
                         _tracemalloc_m5 = tracemalloc.take_snapshot()
+                        _tracemalloc_m5_alloc = tracemalloc.get_traced_memory()[0]
                         logger.info("Captured minute-5 tracemalloc snapshot")
 
                     if "verbose=1" in path or "verbose=true" in path:
@@ -311,6 +305,11 @@ class HealthServer:
 
                         resp_data["metrics"]["tracemalloc"] = {
                             "current_mb": round(curr_alloc / (1024 * 1024), 3),
+                            "m5_current_mb": (
+                                round(_tracemalloc_m5_alloc / (1024 * 1024), 3)
+                                if _tracemalloc_m5_alloc is not None
+                                else None
+                            ),
                             "peak_mb": round(peak_alloc / (1024 * 1024), 3),
                             "top_diff": top_diff,
                             "top_diff_m5": top_diff_m5,

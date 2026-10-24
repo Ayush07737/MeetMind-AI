@@ -120,9 +120,9 @@ class MeetingPipeline:
         )
 
         # Chunk history: [client_seq, start_ms, end_ms, t_recv_wall, t_recv_perf, t_send_perf]
-        self._chunk_history: collections.deque[list[Any]] = collections.deque(maxlen=1200)
+        self._chunk_history: collections.deque[list[Any]] = collections.deque(maxlen=600)
         self._seen_interim_words_window: collections.deque[tuple[str, int]] = collections.deque(
-            maxlen=2000
+            maxlen=300
         )
         self._seen_interim_words: set[tuple[str, int]] = set()
         self._standby_provider: ASRProvider | None = None
@@ -1112,7 +1112,9 @@ class MeetingPipeline:
                     _, w_end_mtg_ms, _ = self._timeline.map_range(w_end_prov_ms, w_end_prov_ms)
                     w_key = (w_text, w_end_mtg_ms)
                     if w_key not in self._seen_interim_words:
-                        if len(self._seen_interim_words_window) >= 2000:
+                        if len(self._seen_interim_words_window) >= (
+                            self._seen_interim_words_window.maxlen or 300
+                        ):
                             old_w = self._seen_interim_words_window.popleft()
                             self._seen_interim_words.discard(old_w)
                         self._seen_interim_words_window.append(w_key)
@@ -1261,29 +1263,30 @@ class MeetingPipeline:
         self._meeting_ended = is_ended
         self._is_running = False
 
-        # 1. Drain ALL remaining audio from Redis
-        try:
-            with contextlib.suppress(Exception):
-                while True:
-                    entries = await self.redis.xreadgroup(
-                        "asr",
-                        self.worker_id,
-                        {self._audio_key: ">"},
-                        count=100,
-                        block=50,
-                    )
-                    if not entries:
-                        break
-                    found_any = False
-                    for _, messages in entries:
-                        if messages:
-                            found_any = True
-                            for entry_id, fields in messages:
-                                await self._process_raw_entry(entry_id, fields)
-                    if not found_any:
-                        break
-        except Exception:
-            pass
+        # 1. Drain ALL remaining audio from Redis (only if meeting ended)
+        if is_ended:
+            try:
+                with contextlib.suppress(Exception):
+                    while True:
+                        entries = await self.redis.xreadgroup(
+                            "asr",
+                            self.worker_id,
+                            {self._audio_key: ">"},
+                            count=100,
+                            block=50,
+                        )
+                        if not entries:
+                            break
+                        found_any = False
+                        for _, messages in entries:
+                            if messages:
+                                found_any = True
+                                for entry_id, fields in messages:
+                                    await self._process_raw_entry(entry_id, fields)
+                        if not found_any:
+                            break
+            except Exception:
+                pass
 
         # Drain all remaining buffered audio chunks to provider
         try:
