@@ -927,6 +927,22 @@ class MeetingPipeline:
                 break
             await asyncio.sleep(0.02)
 
+    def _find_chunk_for_end_ms(self, end_ms: int) -> tuple[int, float, float, float] | None:
+        """Find (client_seq, t_recv_wall, t_recv_perf, t_send_perf) for chunk containing end_ms."""
+        if not self._chunk_history:
+            return None
+        best_match = None
+        min_distance = float("inf")
+        for entry in reversed(self._chunk_history):
+            client_seq, c_start, c_end, t_r_wall, t_r_perf, t_s_perf = entry
+            if c_start <= end_ms <= c_end:
+                return client_seq, t_r_wall, t_r_perf, t_s_perf
+            dist = abs(c_end - end_ms)
+            if dist < min_distance:
+                min_distance = dist
+                best_match = (client_seq, t_r_wall, t_r_perf, t_s_perf)
+        return best_match
+
     async def _handle_transcript_event(self, event: ProviderEvent) -> None:
         if not event.text or not event.text.strip():
             return
@@ -1044,6 +1060,8 @@ class MeetingPipeline:
 
             # Stage 4: Serialization
             t_ser_0 = time.perf_counter()
+            chunk_match = self._find_chunk_for_end_ms(end_ms)
+            chunk_seq = chunk_match[0] if chunk_match else None
             payload = {
                 "utterance_id": uid,
                 "speaker_id": spk_id,
@@ -1058,7 +1076,7 @@ class MeetingPipeline:
                 "language": self.tenant_config.language,
                 "provider": self.settings.asr_provider,
                 "model": "nova-3",
-                "chunk_seq": None,
+                "chunk_seq": chunk_seq,
                 "chunk_recv_wall": audio_end_wall,
                 "final_recv_perf": getattr(event, "recv_perf", 0.0),
                 "publish_wall": t_pub_wall,
@@ -1260,6 +1278,17 @@ class MeetingPipeline:
 
     async def stop(self, is_ended: bool = True) -> None:
         """Clean shutdown and drain audio."""
+        if getattr(self, "_is_stopping", False):
+            if hasattr(self, "_stop_future") and not self._stop_future.done():
+                await self._stop_future
+            return
+        self._is_stopping = True
+        try:
+            loop = asyncio.get_running_loop()
+            self._stop_future = loop.create_future()
+        except RuntimeError:
+            self._stop_future = None
+
         self._meeting_ended = is_ended
         self._is_running = False
 
@@ -1339,15 +1368,22 @@ class MeetingPipeline:
                 json.dumps(sorted(list(self._all_dispatched_client_seqs))),
             )
 
-        self.auditor.record_session_summary(
-            tenant_id=self.tenant_id,
-            user_id="system_asr",
-            meeting_id=self.meeting_id,
-            provider=self.settings.asr_provider,
-            chunks_sent=self._chunks_sent,
-            bytes_sent=self._bytes_sent,
-            reconnects=self._reconnect_count,
-            dropped_chunks=self._dropped_chunks_count,
-            degraded_seconds=self._total_degraded_s,
-            gaps=self._detected_gaps,
-        )
+        # 5. Record session summary audit (synchronously with 15s timeout & 3 retries)
+        if not getattr(self, "_summary_recorded", False):
+            self._summary_recorded = True
+            await self.auditor.record_session_summary_sync(
+                tenant_id=self.tenant_id,
+                user_id="system_asr",
+                meeting_id=self.meeting_id,
+                provider=self.settings.asr_provider,
+                chunks_sent=self._chunks_sent,
+                bytes_sent=self._bytes_sent,
+                reconnects=self._reconnect_count,
+                dropped_chunks=self._dropped_chunks_count,
+                degraded_seconds=self._total_degraded_s,
+                gaps=self._detected_gaps,
+                timeout=15.0,
+                retries=3,
+            )
+        if getattr(self, "_stop_future", None) and not self._stop_future.done():
+            self._stop_future.set_result(None)

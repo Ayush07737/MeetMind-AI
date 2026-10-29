@@ -224,7 +224,16 @@ async def get_pool(tenant_id: str = "default") -> asyncpg.Pool:
     The ``tenant_id`` parameter is accepted for backward compatibility.
     """
     global _shared_pool
-    if _shared_pool is not None and not _shared_pool._closed:
+    try:
+        current_loop = asyncio.get_running_loop()
+    except RuntimeError:
+        current_loop = None
+
+    if (
+        _shared_pool is not None
+        and not _shared_pool._closed
+        and getattr(_shared_pool, "_loop", None) is current_loop
+    ):
         return _shared_pool
 
     return await init_db()
@@ -235,7 +244,16 @@ async def close_db() -> None:
     global _shared_pool
     async with _pool_lock:
         if _shared_pool is not None:
-            await _shared_pool.close()
+            try:
+                if (
+                    not _shared_pool._closed
+                    and getattr(_shared_pool, "_loop", None) is asyncio.get_running_loop()
+                ):
+                    await _shared_pool.close()
+                else:
+                    _shared_pool.terminate()
+            except Exception:
+                pass
             _shared_pool = None
 
 

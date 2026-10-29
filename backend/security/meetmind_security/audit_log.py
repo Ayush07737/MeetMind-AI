@@ -12,7 +12,9 @@ must produce an audit event, and no audit event can ever be modified or deleted.
 
 from __future__ import annotations
 
+import asyncio
 import json
+import os
 import uuid
 from datetime import UTC, datetime
 from typing import Any
@@ -66,6 +68,10 @@ async def write_audit_event(
     Returns:
         The created AuditEvent with server-assigned id and timestamp.
     """
+    delay_s = float(os.environ.get("TEST_AUDIT_STATEMENT_DELAY_SECONDS", "0"))
+    if delay_s > 0:
+        await asyncio.sleep(delay_s)
+
     event = AuditEvent(
         tenant_id=tenant_id,
         user_id=user_id,

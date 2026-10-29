@@ -66,6 +66,7 @@ class AsrService:
         self._discovery_task: asyncio.Task[None] | None = None
         self._reconcile_task: asyncio.Task[None] | None = None
         self._control_task: asyncio.Task[None] | None = None
+        self._stopping_tasks: set[asyncio.Task[Any]] = set()
 
     async def start(self) -> None:
         """Start ASR worker daemon."""
@@ -466,8 +467,18 @@ class AsrService:
                     lease_task.cancel()
 
                 pipeline = self._active_pipelines.pop(meeting_id)
-                await pipeline.stop(is_ended=True)
-                await self._release_lease(tenant, meeting_id)
+                t = asyncio.create_task(self._stop_pipeline_lifecycle(tenant, meeting_id, pipeline))
+                self._stopping_tasks.add(t)
+                t.add_done_callback(self._stopping_tasks.discard)
+                await asyncio.shield(t)
+
+    async def _stop_pipeline_lifecycle(
+        self, tenant: str, meeting_id: str, pipeline: MeetingPipeline
+    ) -> None:
+        try:
+            await pipeline.stop(is_ended=True)
+        finally:
+            await self._release_lease(tenant, meeting_id)
 
     async def stop(self) -> None:
         """Gracefully stop worker daemon on SIGTERM."""
@@ -491,6 +502,10 @@ class AsrService:
             await asyncio.gather(*stop_tasks, return_exceptions=True)
 
         self._active_pipelines.clear()
+
+        # Wait for any in-flight stopping tasks (e.g. from lifecycle meeting_ended)
+        if self._stopping_tasks:
+            await asyncio.gather(*list(self._stopping_tasks), return_exceptions=True)
 
         if self.health_server:
             await self.health_server.stop()
