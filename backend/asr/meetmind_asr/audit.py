@@ -49,7 +49,7 @@ class AsrAuditor:
             self._is_running = True
             self._worker_task = asyncio.create_task(self._process_queue())
 
-    async def stop(self, timeout: float = 5.0) -> None:
+    async def stop(self, timeout: float = 15.0) -> None:
         """Drain queue within bounded timeout and stop background worker task."""
         try:
             await asyncio.wait_for(self._queue.join(), timeout=timeout)
@@ -63,7 +63,7 @@ class AsrAuditor:
         self._is_running = False
         if self._worker_task:
             self._worker_task.cancel()
-            with asyncio.suppress(asyncio.CancelledError):
+            with contextlib.suppress(asyncio.CancelledError):
                 await self._worker_task
 
     def record_session_started(
@@ -86,6 +86,84 @@ class AsrAuditor:
         }
         self._enqueue(tenant_id, user_id, "asr_session_started", payload)
 
+    async def record_session_summary_sync(
+        self,
+        tenant_id: str,
+        user_id: str,
+        meeting_id: str,
+        provider: str,
+        chunks_sent: int,
+        bytes_sent: int,
+        reconnects: int,
+        dropped_chunks: int,
+        degraded_seconds: float,
+        gaps: list[dict[str, Any]] | None = None,
+        timeout: float = 15.0,
+        retries: int = 3,
+    ) -> bool:
+        """Write asr_session_summary audit event synchronously with timeout and retries."""
+        payload: dict[str, Any] = {
+            "meeting_id": meeting_id,
+            "provider": provider,
+            "chunks_sent": chunks_sent,
+            "bytes_sent": bytes_sent,
+            "reconnects": reconnects,
+            "dropped_chunks": dropped_chunks,
+            "degraded_seconds": round(degraded_seconds, 2),
+            "gaps": gaps or [],
+        }
+
+        async def _write() -> bool:
+            last_exc: Exception | None = None
+            delay = 0.5
+            for attempt in range(1, retries + 1):
+                try:
+                    await audit.write_audit_event(
+                        tenant_id=tenant_id,
+                        user_id=user_id,
+                        event_type="asr_session_summary",
+                        payload=payload,
+                    )
+                    self.successful_audit_count += 1
+                    logger.info(
+                        "Synchronously recorded asr_session_summary for meeting %s (attempt %d/%d)",
+                        meeting_id,
+                        attempt,
+                        retries,
+                    )
+                    return True
+                except Exception as exc:
+                    last_exc = exc
+                    self.failed_audit_count += 1
+                    logger.warning(
+                        "Attempt %d/%d failed writing asr_session_summary for %s: %s",
+                        attempt,
+                        retries,
+                        meeting_id,
+                        exc,
+                    )
+                    if attempt < retries:
+                        await asyncio.sleep(delay)
+                        delay *= 2
+            logger.error(
+                "All %d attempts failed writing asr_session_summary for %s: %s",
+                retries,
+                meeting_id,
+                last_exc,
+            )
+            return False
+
+        try:
+            return await asyncio.wait_for(_write(), timeout=timeout)
+        except TimeoutError:
+            self.failed_audit_count += 1
+            logger.error(
+                "Timed out after %.1fs writing synchronous asr_session_summary for %s",
+                timeout,
+                meeting_id,
+            )
+            return False
+
     def record_session_summary(
         self,
         tenant_id: str,
@@ -99,7 +177,7 @@ class AsrAuditor:
         degraded_seconds: float,
         gaps: list[dict[str, Any]] | None = None,
     ) -> None:
-        """Enqueue asr_session_summary audit event (non-blocking)."""
+        """Enqueue asr_session_summary audit event (non-blocking fallback)."""
         payload: dict[str, Any] = {
             "meeting_id": meeting_id,
             "provider": provider,

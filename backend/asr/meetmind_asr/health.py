@@ -11,10 +11,11 @@ import contextlib
 import gc
 import json
 import logging
+import os
 import sys
 import time
 import tracemalloc
-from collections import deque
+from collections import defaultdict, deque
 from dataclasses import dataclass, field
 from typing import Any
 
@@ -64,6 +65,22 @@ class AsrMetrics:
         default_factory=lambda: {"lifecycle": 0, "reconciler": 0}
     )
 
+    # Full counts across the entire session (untruncated by rolling deques)
+    total_finals_count: int = 0
+    total_interims_count: int = 0
+    total_stage_counts: dict[str, int] = field(
+        default_factory=lambda: {
+            "parse": 0,
+            "timeline": 0,
+            "speaker": 0,
+            "dedupe": 0,
+            "serialize": 0,
+            "xadd": 0,
+        }
+    )
+    benchmark_mode: bool = False
+    bench_samples: dict[str, list[float]] = field(default_factory=lambda: defaultdict(list))
+
     def record_reconnect_duration(self, duration_ms: float) -> None:
         self.reconnect_durations_ms.append(duration_ms)
 
@@ -73,24 +90,39 @@ class AsrMetrics:
 
     def record_publish_latency(self, latency_ms: float) -> None:
         self.publish_latencies_ms.append(latency_ms)
+        if self.benchmark_mode:
+            self.bench_samples["publish"].append(latency_ms)
 
     def record_service_added_latency(self, latency_ms: float) -> None:
         self.service_added_latencies_ms.append(latency_ms)
+        if self.benchmark_mode:
+            self.bench_samples["service_added"].append(latency_ms)
 
     def record_e2e_latency(self, latency_ms: float) -> None:
+        self.total_finals_count += 1
         self.e2e_latencies_ms.append(latency_ms)
+        if self.benchmark_mode:
+            self.bench_samples["e2e"].append(latency_ms)
 
     def record_interim_latency(self, latency_ms: float) -> None:
+        self.total_interims_count += 1
         self.interim_latencies_ms.append(latency_ms)
+        if self.benchmark_mode:
+            self.bench_samples["interim"].append(latency_ms)
 
     def record_provider_latency(self, latency_ms: float) -> None:
         self.provider_latencies_ms.append(latency_ms)
+        if self.benchmark_mode:
+            self.bench_samples["provider"].append(latency_ms)
 
     def record_stage_timing(self, stage: str, timing_ms: float) -> None:
+        self.total_stage_counts[stage] = self.total_stage_counts.get(stage, 0) + 1
         attr = f"stage_{stage}_ms"
         lst = getattr(self, attr, None)
         if lst is not None:
             lst.append(timing_ms)
+        if self.benchmark_mode:
+            self.bench_samples[f"stage_{stage}"].append(timing_ms)
 
     def record_gc_pause(self, pause_ms: float) -> None:
         self.gc_pauses_ms.append(pause_ms)
@@ -133,6 +165,9 @@ class AsrMetrics:
         attr = f"stage_{stage}_ms"
         lst = getattr(self, attr, [])
         return self._calc_percentiles(lst)
+
+    def get_full_percentiles(self, metric: str) -> dict[str, Any]:
+        return self._calc_percentiles(self.bench_samples.get(metric, []))
 
     def get_loop_lag_percentiles(self) -> dict[str, Any]:
         return self._calc_percentiles(self.loop_lag_samples_ms)
@@ -192,6 +227,11 @@ class HealthServer:
                 pass
 
     async def start(self) -> None:
+        bench_mode = (
+            self.service and getattr(self.service.settings, "asr_benchmark_mode", False)
+        ) or os.environ.get("ASR_BENCHMARK_MODE") == "1"
+        if bench_mode:
+            self.metrics.benchmark_mode = True
         self._server = await asyncio.start_server(self._handle_client, self.host, self.port)
         self._lag_task = asyncio.create_task(self._lag_monitor_loop())
         logger.info("ASR Health endpoint listening on %s:%d", self.host, self.port)
@@ -268,6 +308,41 @@ class HealthServer:
                                 "serialize": self.metrics.get_stage_percentiles("serialize"),
                                 "xadd": self.metrics.get_stage_percentiles("xadd"),
                             },
+                            "totals": {
+                                "finals": self.metrics.total_finals_count,
+                                "interim_words": self.metrics.total_interims_count,
+                                "stage_timings": self.metrics.total_stage_counts,
+                            },
+                            "bench_percentiles": (
+                                {
+                                    "publish_latencies": self.metrics.get_full_percentiles(
+                                        "publish"
+                                    ),
+                                    "service_added_latencies": self.metrics.get_full_percentiles(
+                                        "service_added"
+                                    ),
+                                    "e2e_latencies": self.metrics.get_full_percentiles("e2e"),
+                                    "interim_latencies": self.metrics.get_full_percentiles(
+                                        "interim"
+                                    ),
+                                    "provider_latencies": self.metrics.get_full_percentiles(
+                                        "provider"
+                                    ),
+                                    "stage_timings": {
+                                        stg: self.metrics.get_full_percentiles(f"stage_{stg}")
+                                        for stg in (
+                                            "parse",
+                                            "timeline",
+                                            "speaker",
+                                            "dedupe",
+                                            "serialize",
+                                            "xadd",
+                                        )
+                                    },
+                                }
+                                if self.metrics.benchmark_mode
+                                else None
+                            ),
                             "loop_lag_ms": self.metrics.loop_lag_ms,
                             "max_loop_lag_ms": self.metrics.max_loop_lag_ms,
                             "loop_lag_stats": self.metrics.get_loop_lag_percentiles(),
@@ -315,7 +390,11 @@ class HealthServer:
                             "top_diff_m5": top_diff_m5,
                         }
 
-                        if self.service and hasattr(self.service, "_active_pipelines"):
+                        if (
+                            self.metrics.benchmark_mode
+                            and self.service
+                            and hasattr(self.service, "_active_pipelines")
+                        ):
                             p_info = {}
                             for m_id, pipe in self.service._active_pipelines.items():
                                 p_info[m_id] = {

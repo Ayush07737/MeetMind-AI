@@ -106,18 +106,20 @@ async def test_b9_speaker_names_two_channel_mapping(
         assert (await recv_ack())["status"] == "accepted"
 
     # Wait for processing
-    await asyncio.sleep(2.0)
-
-    # Verify finals in meeting 1
     ev_key_1 = events_stream_key(gateway_harness.tenant_a, mtg_with_meta)
-    raw_1 = await real_redis.xrange(ev_key_1)
     finals_1 = []
-    for _, fields in raw_1:
-        p_raw = fields.get(b"payload") or fields.get("payload")
-        if p_raw:
-            parsed = json.loads(p_raw.decode() if isinstance(p_raw, bytes) else p_raw)
-            if parsed.get("event_type") == "transcript_final":
-                finals_1.append(parsed["payload"])
+    for _ in range(40):
+        raw_1 = await real_redis.xrange(ev_key_1)
+        finals_1 = []
+        for _, fields in raw_1:
+            p_raw = fields.get(b"payload") or fields.get("payload")
+            if p_raw:
+                parsed = json.loads(p_raw.decode() if isinstance(p_raw, bytes) else p_raw)
+                if parsed.get("event_type") == "transcript_final":
+                    finals_1.append(parsed["payload"])
+        if len(finals_1) >= 2:
+            break
+        await asyncio.sleep(0.1)
 
     assert len(finals_1) >= 2, f"Expected at least 2 finals, got {len(finals_1)}"
     # Check channel 0 has Alice Smith
@@ -184,17 +186,20 @@ async def test_b9_speaker_names_two_channel_mapping(
         await ws.send(json.dumps({"type": "control", "action": "meeting_end"}))
         assert (await recv_ack_2())["status"] == "accepted"
 
-    await asyncio.sleep(2.0)
-
     ev_key_2 = events_stream_key(gateway_harness.tenant_a, mtg_no_meta)
-    raw_2 = await real_redis.xrange(ev_key_2)
     finals_2 = []
-    for _, fields in raw_2:
-        p_raw = fields.get(b"payload") or fields.get("payload")
-        if p_raw:
-            parsed = json.loads(p_raw.decode() if isinstance(p_raw, bytes) else p_raw)
-            if parsed.get("event_type") == "transcript_final":
-                finals_2.append(parsed["payload"])
+    for _ in range(40):
+        raw_2 = await real_redis.xrange(ev_key_2)
+        finals_2 = []
+        for _, fields in raw_2:
+            p_raw = fields.get(b"payload") or fields.get("payload")
+            if p_raw:
+                parsed = json.loads(p_raw.decode() if isinstance(p_raw, bytes) else p_raw)
+                if parsed.get("event_type") == "transcript_final":
+                    finals_2.append(parsed["payload"])
+        if len(finals_2) >= 1:
+            break
+        await asyncio.sleep(0.1)
 
     assert len(finals_2) >= 1
     for f in finals_2:

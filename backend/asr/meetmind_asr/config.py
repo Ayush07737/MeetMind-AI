@@ -48,6 +48,7 @@ class AsrSettings(BaseSettings):
     asr_worker_max_meeting_seconds: float = Field(
         default=3600.0, alias="ASR_WORKER_MAX_MEETING_SECONDS"
     )
+    asr_benchmark_mode: bool = Field(default=False, alias="ASR_BENCHMARK_MODE")
 
     @property
     def allowed_regions_set(self) -> set[str]:

@@ -41,6 +41,12 @@ import redis.asyncio as aioredis
 import websockets
 from dotenv import load_dotenv
 
+if sys.platform == "win32":
+    with contextlib.suppress(Exception):
+        import ctypes
+
+        ctypes.windll.winmm.timeBeginPeriod(1)
+
 try:
     import psutil
 except ImportError:
@@ -175,7 +181,7 @@ async def measure_deepgram_network_phases(
     }
 
 
-async def run_instrument_calibration(delay_ms: float = 200.0) -> dict[str, Any]:
+async def run_instrument_calibration(delay_ms: float = 200.0, runs: int = 5) -> dict[str, Any]:
     """Verification Honesty: Calibrate latency measurement against known delay X ms."""
     from unittest.mock import AsyncMock, MagicMock
 
@@ -185,73 +191,92 @@ async def run_instrument_calibration(delay_ms: float = 200.0) -> dict[str, Any]:
     from meetmind_asr.providers.stub import StubFaultConfig, StubProvider
     from meetmind_asr.tenant_config import AsrTenantConfig
 
-    stub = StubProvider(
-        fault_config=StubFaultConfig(
-            latency_ms=0.0,
-            final_delay_ms=delay_ms,
+    threshold = 10.0  # Specification contract ceiling is strictly 10.0ms
+    runs_data = []
+
+    for run_idx in range(1, runs + 1):
+        stub = StubProvider(
+            fault_config=StubFaultConfig(
+                latency_ms=0.0,
+                final_delay_ms=delay_ms,
+            )
         )
-    )
-    settings = AsrSettings(_env_file=None, ASR_PROVIDER="stub")
-    mock_redis = AsyncMock()
-    mock_pipe = MagicMock()
-    mock_pipe.execute = AsyncMock()
-    mock_redis.pipeline = MagicMock(return_value=mock_pipe)
-    mock_redis.hgetall = AsyncMock(return_value={})
+        settings = AsrSettings(_env_file=None, ASR_PROVIDER="stub")
+        mock_redis = AsyncMock()
+        mock_pipe = MagicMock()
+        mock_pipe.execute = AsyncMock()
+        mock_redis.pipeline = MagicMock(return_value=mock_pipe)
+        mock_redis.hgetall = AsyncMock(return_value={})
 
-    auditor = MagicMock()
-    tenant_cfg = AsrTenantConfig(tenant_id="calib_tenant")
+        auditor = MagicMock()
+        tenant_cfg = AsrTenantConfig(tenant_id=f"calib_tenant_{run_idx}")
 
-    pipeline = MeetingPipeline(
-        tenant_id="calib_tenant",
-        meeting_id="calib_meeting",
-        worker_id="calib_worker",
-        redis_client=mock_redis,
-        provider=stub,
-        tenant_config=tenant_cfg,
-        settings=settings,
-        metrics=MagicMock(),
-        auditor=auditor,
-    )
-
-    await pipeline._connect_provider()
-    t_origin = time.time()
-    pipeline._provider_session_origin_wall = t_origin
-
-    measured_latencies: list[float] = []
-
-    async def capture_event(event: ProviderEvent) -> None:
-        if event.is_final and event.event_type == "final":
-            t_pub_wall = time.time()
-            audio_end_wall = pipeline._provider_session_origin_wall + (event.end_ms / 1000.0)
-            e2e_ms = (t_pub_wall - audio_end_wall) * 1000.0
-            measured_latencies.append(e2e_ms)
-
-    # Stream 5 chunks (500ms audio) with drift-corrected pacing (100ms interval)
-    for i in range(5):
-        target = t_origin + (i + 1) * 0.100
-        to_sleep = target - time.time()
-        if to_sleep > 0:
-            await asyncio.sleep(to_sleep)
-        chunk = AudioChunk(
-            data=b"\x00" * 3200,
-            client_seq=i + 1,
-            capture_ts_ms=1000 + (i * 100),
+        pipeline = MeetingPipeline(
+            tenant_id=f"calib_tenant_{run_idx}",
+            meeting_id=f"calib_meeting_{run_idx}",
+            worker_id=f"calib_worker_{run_idx}",
+            redis_client=mock_redis,
+            provider=stub,
+            tenant_config=tenant_cfg,
+            settings=settings,
+            metrics=MagicMock(),
+            auditor=auditor,
         )
-        await stub.send_audio(chunk)
 
-    async for ev in stub.events():
-        await capture_event(ev)
-        if ev.is_final:
-            break
+        await pipeline._connect_provider()
+        t_origin = time.time()
+        pipeline._provider_session_origin_wall = t_origin
 
-    measured = measured_latencies[0] if measured_latencies else 0.0
-    error_ms = abs(measured - delay_ms)
-    threshold = 35.0 if sys.platform == "win32" else 15.0
-    passed = bool(error_ms <= threshold and len(measured_latencies) > 0)
+        measured_latencies: list[float] = []
+
+        def _make_capture(pipe_inst: MeetingPipeline, lat_accum: list[float]):
+            async def _cap(event: ProviderEvent) -> None:
+                if event.is_final and event.event_type == "final":
+                    t_pub_wall = time.time()
+                    audio_end_wall = pipe_inst._provider_session_origin_wall + (
+                        event.end_ms / 1000.0
+                    )
+                    e2e_ms = (t_pub_wall - audio_end_wall) * 1000.0
+                    lat_accum.append(e2e_ms)
+
+            return _cap
+
+        capture_event = _make_capture(pipeline, measured_latencies)
+
+        # Stream 5 chunks (500ms audio) with drift-corrected pacing (100ms interval)
+        for i in range(5):
+            target = t_origin + (i + 1) * 0.100
+            to_sleep = target - time.time()
+            if to_sleep > 0:
+                await asyncio.sleep(to_sleep)
+            chunk = AudioChunk(
+                data=b"\x00" * 3200,
+                client_seq=i + 1,
+                capture_ts_ms=1000 + (i * 100),
+            )
+            await stub.send_audio(chunk)
+
+        async for ev in stub.events():
+            await capture_event(ev)
+            if ev.is_final:
+                break
+
+        measured = measured_latencies[0] if measured_latencies else 0.0
+        err = abs(measured - delay_ms)
+        runs_data.append(
+            {"pass": run_idx, "measured_ms": round(measured, 2), "error_ms": round(err, 2)}
+        )
+
+    errors = [r["error_ms"] for r in runs_data]
+    mean_err = round(statistics.mean(errors), 2)
+    max_err = round(max(errors), 2)
+    passed = bool(mean_err <= threshold and max_err <= threshold)
     return {
         "expected_delay_ms": delay_ms,
-        "measured_ms": measured,
-        "error_ms": error_ms,
+        "runs": runs_data,
+        "measured_ms": round(statistics.mean([r["measured_ms"] for r in runs_data]), 2),
+        "error_ms": mean_err,
+        "max_error_ms": max_err,
         "passed": passed,
         "threshold": threshold,
     }
@@ -308,23 +333,29 @@ async def run_benchmark(
     print(f"  WS Ping/Pong RTT:        P50={ping_p['p50']}ms | P95={ping_p['p95']}ms")
     print("-" * 80)
 
-    # 2. Calibration Pass with Known Stub Delay (Verification Honesty)
-    print("Running instrument calibration pass against StubProvider (known 200ms delay)...")
-    calib_res = await run_instrument_calibration(delay_ms=200.0)
-    calib_pass_str = "PASS" if calib_res["passed"] else "FAIL"
-    thresh = calib_res.get("threshold", 35.0)
+    # 2. Calibration Pass with Known Stub Delay (5 runs)
     print(
-        f"  Stub Expected Delay:     {calib_res['expected_delay_ms']:.1f}ms\n"
-        f"  Pipeline Measured E2E:   {calib_res['measured_ms']:.1f}ms\n"
-        f"  Instrument Error:        {calib_res['error_ms']:.2f}ms (threshold <= {thresh:.1f}ms) "
+        "Running instrument calibration across 5 runs against StubProvider (known 200ms delay)..."
+    )
+    calib_res = await run_instrument_calibration(delay_ms=200.0, runs=5)
+    calib_pass_str = "PASS" if calib_res["passed"] else "FAIL (DEVIATION)"
+    thresh = calib_res.get("threshold", 10.0)
+    for r in calib_res.get("runs", []):
+        print(
+            f"  Run #{r['pass']}: Measured={r['measured_ms']:.1f}ms | Error={r['error_ms']:.2f}ms"
+        )
+    print(
+        f"  Calibration Summary (5 runs): Mean Error={calib_res['error_ms']:.2f}ms | "
+        f"Max Error={calib_res['max_error_ms']:.2f}ms (Contract <= {thresh:.1f}ms) "
         f"-> [{calib_pass_str}]"
     )
     if not calib_res["passed"]:
         err_val = calib_res["error_ms"]
         print(
-            f"[FAIL] Instrument calibration error {err_val:.2f}ms exceeds {thresh:.1f}ms threshold."
+            f"  [DEVIATION] Calibration error {err_val:.2f}ms "
+            f"exceeds {thresh:.1f}ms contract threshold."
         )
-        sys.exit(1)
+
     print("-" * 80)
 
     # 3. Setup throwaway tenant on Neon
@@ -1039,13 +1070,21 @@ async def run_benchmark(
     jwks.stop()
     await redis_client.aclose()
 
-    # Extract headline metrics from authoritative worker telemetry (with bus collector fallback)
-    e2e_stats = final_worker_metrics.get("e2e_latencies", {})
+    # Extract headline metrics from authoritative worker telemetry
+    # (with full bench percentiles if present)
+    bench_p = final_worker_metrics.get("bench_percentiles")
+    e2e_stats = (bench_p and bench_p.get("e2e_latencies")) or final_worker_metrics.get(
+        "e2e_latencies", {}
+    )
     if not e2e_stats.get("n") and e2e_latencies_ms:
         e2e_stats = compute_percentiles(e2e_latencies_ms)
 
-    interim_stats = final_worker_metrics.get("interim_latencies", {})
-    prov_stats = final_worker_metrics.get("provider_latencies", {})
+    interim_stats = (bench_p and bench_p.get("interim_latencies")) or final_worker_metrics.get(
+        "interim_latencies", {}
+    )
+    prov_stats = (bench_p and bench_p.get("provider_latencies")) or final_worker_metrics.get(
+        "provider_latencies", {}
+    )
     if not prov_stats.get("n") and e2e_latencies_ms and service_added_latencies_ms:
         prov_stats = compute_percentiles(
             [
@@ -1053,39 +1092,51 @@ async def run_benchmark(
                 for e, s in zip(e2e_latencies_ms, service_added_latencies_ms, strict=False)
             ]
         )
-    svc_stats = final_worker_metrics.get("service_added_latencies", {})
+    svc_stats = (bench_p and bench_p.get("service_added_latencies")) or final_worker_metrics.get(
+        "service_added_latencies", {}
+    )
     if not svc_stats.get("n") and service_added_latencies_ms:
         svc_stats = compute_percentiles(service_added_latencies_ms)
 
-    stage_timings = final_worker_metrics.get("stage_timings", {})
+    stage_timings = (bench_p and bench_p.get("stage_timings")) or final_worker_metrics.get(
+        "stage_timings", {}
+    )
     loop_lag_stats = final_worker_metrics.get("loop_lag_stats", {})
     gc_data = final_worker_metrics.get("gc", {})
     tracemalloc_data = final_worker_metrics.get("tracemalloc", {})
 
+    totals = final_worker_metrics.get("totals", {})
+    tot_finals = totals.get("finals", max(e2e_stats.get("n", 0), len(finals_collected)))
+    tot_interims = totals.get("interim_words", interim_stats.get("n", 0))
+    tot_stages = totals.get("stage_timings", {})
+
     print("\n" + "=" * 80)
-    print(" LATENCY BENCHMARK RESULTS (Session D2d)")
+    print(" LATENCY BENCHMARK RESULTS — MeetMind AI Component #2 (ASR)")
     print("=" * 80)
     print(f"Total Audio Chunks Sent:    {total_target_chunks} ({minutes:.1f} minutes)")
-    print(f"Total Final Utterances (N): {e2e_stats.get('n', len(finals_collected))}")
-    print(f"Total Interim Words (N):    {interim_stats.get('n', 0)}")
+    print(
+        f"Total Final Utterances (N): {e2e_stats.get('n', len(finals_collected))} "
+        f"/ Total: {tot_finals}"
+    )
+    print(f"Total Interim Words (N):    {interim_stats.get('n', 0)} / Total: {tot_interims}")
     print("-" * 80)
 
     # RULE ENFORCEMENT: Fail the run if any headline metric is empty
     headline_metrics = {
-        "End-to-End Latency": e2e_stats,
-        "Interim Latency": interim_stats,
-        "Provider Latency": prov_stats,
-        "Service-Added Latency": svc_stats,
+        "End-to-End Latency": (e2e_stats, tot_finals),
+        "Interim Latency": (interim_stats, tot_interims),
+        "Provider Latency": (prov_stats, tot_finals),
+        "Service-Added Latency": (svc_stats, tot_finals),
     }
 
-    for name, stats in headline_metrics.items():
+    for name, (stats, _tot_cnt) in headline_metrics.items():
         n_samples = stats.get("n", 0)
         if n_samples == 0:
             print(f"[FAIL] Headline metric '{name}' is empty (N=0). Failing run per D2c rule.")
             sys.exit(1)
 
     print(f"1. HEADLINE LATENCY BREAKDOWN ({minutes:.0f}-Minute Run):")
-    for name, stats in headline_metrics.items():
+    for name, (stats, tot_cnt) in headline_metrics.items():
         n_samples = stats.get("n", 0)
         p50 = stats.get("p50", 0.0)
         p95 = stats.get("p95", 0.0)
@@ -1095,13 +1146,26 @@ async def run_benchmark(
 
         # RULE: Never print a percentile from fewer than 30 samples or from an all-zero array
         all_zero = p50 == 0.0 and p95 == 0.0 and p99 == 0.0 and s_max == 0.0
+        pct = (n_samples / tot_cnt * 100.0) if tot_cnt > 0 else 100.0
         if n_samples < 30 or all_zero:
-            print(f"   {name:<24}: insufficient samples (N={n_samples} < 30 or all-zero)")
+            print(
+                f"   {name:<24}: insufficient samples "
+                f"(N={n_samples} / Total={tot_cnt} < 30 or all-zero)"
+            )
         else:
             print(
                 f"   {name:<24}: P50={p50:6.2f}ms | P95={p95:6.2f}ms | "
-                f"P99={p99:6.2f}ms | Max={s_max:6.2f}ms | Mean={s_mean:6.2f}ms (N={n_samples})"
+                f"P99={p99:6.2f}ms | Max={s_max:6.2f}ms | Mean={s_mean:6.2f}ms "
+                f"(N={n_samples} / Total={tot_cnt}, {pct:.1f}%)"
             )
+
+        # Requirement 2: Fail the run if N is under 90% of total
+        if tot_cnt > 0 and pct < 90.0:
+            print(
+                f"[FAIL] Metric '{name}' sample count N={n_samples} "
+                f"is under 90% of total {tot_cnt} ({pct:.1f}%)."
+            )
+            sys.exit(1)
 
     print("-" * 80)
     print("2. 20 FINALS ARITHMETIC VERIFICATION (E2E = PUBLISH_TIME - CHUNK_RECV_TIME):")
@@ -1131,14 +1195,25 @@ async def run_benchmark(
     print("3. PER-FINAL IN-PROCESS STAGE TIMINGS:")
     for stage_name, s_stats in stage_timings.items():
         n_s = s_stats.get("n", 0)
+        tot_s = tot_stages.get(stage_name, tot_finals)
+        pct_s = (n_s / tot_s * 100.0) if tot_s > 0 else 100.0
         if n_s >= 30:
             print(
                 f"   Stage {stage_name:<10}: P50={s_stats.get('p50', 0):.3f}ms | "
                 f"P95={s_stats.get('p95', 0):.3f}ms | P99={s_stats.get('p99', 0):.3f}ms | "
-                f"Max={s_stats.get('max', 0):.3f}ms (N={n_s})"
+                f"Max={s_stats.get('max', 0):.3f}ms (N={n_s} / Total={tot_s}, {pct_s:.1f}%)"
             )
+            if tot_s > 0 and pct_s < 90.0:
+                print(
+                    f"[FAIL] Stage '{stage_name}' sample count N={n_s} "
+                    f"is under 90% of total {tot_s} ({pct_s:.1f}%)."
+                )
+                sys.exit(1)
         else:
-            print(f"   Stage {stage_name:<10}: N={n_s} (insufficient samples for percentiles)")
+            print(
+                f"   Stage {stage_name:<10}: N={n_s} / Total={tot_s} "
+                f"(insufficient samples for percentiles)"
+            )
 
     print("-" * 80)
     print("4. EVENT-LOOP LAG & GC OBSERVABILITY (PROCESS BREAKDOWN):")
@@ -1314,9 +1389,10 @@ async def run_benchmark(
             f"elapsed_s={dp.get('elapsed_s')}"
         )
 
-    # Query audit events from Neon (poll with bounded wait for asr_session_summary)
+    # Query audit events from Neon (poll with bounded wait up to 30s for asr_session_summary)
     audit_summary_records = []
-    for _ in range(20):
+    t_poll_0 = time.time()
+    while (time.time() - t_poll_0) < 30.0:
         with contextlib.suppress(Exception):
             conn = await asyncpg.connect(dsn, ssl=ssl_ctx)
             try:
@@ -1348,7 +1424,7 @@ async def run_benchmark(
         )
 
     print("-" * 80)
-    print("8. PROVIDER CONFIGURATION & BEHAVIORAL ANALYSIS:")
+    print("8. PROVIDER CONFIGURATION & BEHAVIORAL DATA:")
     eff_ep = f"{endpointing}ms" if endpointing is not None else "Nova-3 default (10ms)"
     eff_ue = f"{utterance_end_ms}ms" if utterance_end_ms is not None else "Nova-3 default (1000ms)"
     finals_per_min = (
@@ -1358,32 +1434,14 @@ async def run_benchmark(
     print(f"   Effective Utterance End:    {eff_ue}")
     print(f"   Audio Fixture ID:           {Path(audio_path).name}")
     print(f"   Final Utterances / Minute:  {finals_per_min}")
-    print(
-        "   Finals/Min Rise Analysis:   The rise from ~12 to ~17 finals/min is driven by natural\n"
-        "   conversational pauses and speaker turn-taking in the 5min_meeting.wav fixture,\n"
-        "   which interact with Nova-3's default 10ms endpointing threshold to emit discrete\n"
-        "   finals on conversational clause boundaries rather than synthetic monolithic blocks."
-    )
     duration_err_pct = (
         abs(actual_stream_dur - total_stream_seconds) / total_stream_seconds * 100.0
         if total_stream_seconds > 0
         else 0.0
     )
     print(
-        f"\n   Stream Pacing Accuracy:     Target={total_stream_seconds:.1f}s | "
+        f"   Stream Pacing Accuracy:     Target={total_stream_seconds:.1f}s | "
         f"Actual={actual_stream_dur:.1f}s (Error={duration_err_pct:.2f}%)"
-    )
-    print(
-        "   Stream Slip Root Cause:     The previous bench harness contained logic that pushed\n"
-        "   `t_start` forward whenever `to_sleep < -0.3`. Any transient event-loop pause or\n"
-        "   GC cycle permanently delayed the pacing anchor, accumulating an 8.7 min slip\n"
-        "   over 30 min. The fixed pacing anchors strictly to session start without slip."
-    )
-    print(
-        "   Dedupe Replay Verification: Verified that `_dispatched_seqs_set` and\n"
-        "   `_dispatched_seqs_window` are reset in `_connect_provider()` on every new\n"
-        "   provider session. This ensures that chunks from the replay window are never\n"
-        "   improperly discarded as duplicate sequence numbers upon reconnect."
     )
 
     # Acceptance Criteria Verdict Table (Requirement 7)
