@@ -475,6 +475,7 @@ async def run_benchmark(
     asr_env["ASR_WORKER_ID"] = f"bench_worker_{uuid.uuid4().hex[:6]}"
     asr_env["REDIS_URL"] = redis_url
     asr_env["APP_ENV"] = "development"
+    asr_env["ASR_BENCHMARK_MODE"] = "1"
     asr_env["PYTHONPATH"] = (
         str(REPO_ROOT / "backend" / "asr")
         + os.pathsep
@@ -1030,7 +1031,26 @@ async def run_benchmark(
 
         # End meeting
         await ws.send(json.dumps({"type": "control", "action": "meeting_end"}))
-        await asyncio.sleep(6.0)
+        # Poll Neon for asr_session_summary before terminating worker
+        audit_summary_records = []
+        t_poll_0 = time.time()
+        while (time.time() - t_poll_0) < 15.0:
+            with contextlib.suppress(Exception):
+                conn = await asyncpg.connect(dsn, ssl=ssl_ctx)
+                try:
+                    q = (
+                        f'SELECT event_type, payload, created_at FROM "{schema_name}".audit_events '
+                        f"ORDER BY id"
+                    )
+                    rows = await conn.fetch(q)
+                    audit_summary_records = [dict(r) for r in rows]
+                    if any(
+                        r.get("event_type") == "asr_session_summary" for r in audit_summary_records
+                    ):
+                        break
+                finally:
+                    await conn.close()
+            await asyncio.sleep(0.5)
 
         ack_task.cancel()
         with contextlib.suppress(asyncio.CancelledError):
@@ -1061,11 +1081,20 @@ async def run_benchmark(
     with contextlib.suppress(Exception):
         redis_slowlog = await redis_client.execute_command("SLOWLOG", "GET", "20")
 
-    # Shutdown subprocesses
-    gw_proc.kill()
-    gw_proc.wait()
-    asr_proc.kill()
-    asr_proc.wait()
+    # Shutdown subprocesses gracefully
+    for proc in (gw_proc, asr_proc):
+        with contextlib.suppress(Exception):
+            proc.terminate()
+    try:
+        gw_proc.wait(timeout=3.0)
+    except subprocess.TimeoutExpired:
+        gw_proc.kill()
+        gw_proc.wait()
+    try:
+        asr_proc.wait(timeout=5.0)
+    except subprocess.TimeoutExpired:
+        asr_proc.kill()
+        asr_proc.wait()
     asr_log_file.close()
     jwks.stop()
     await redis_client.aclose()
@@ -1159,11 +1188,11 @@ async def run_benchmark(
                 f"(N={n_samples} / Total={tot_cnt}, {pct:.1f}%)"
             )
 
-        # Requirement 2: Fail the run if N is under 90% of total
-        if tot_cnt > 0 and pct < 90.0:
+        # Requirement: Fail the run if N is under 90% or over 110% of total
+        if tot_cnt > 0 and (pct < 90.0 or pct > 110.0):
             print(
                 f"[FAIL] Metric '{name}' sample count N={n_samples} "
-                f"is under 90% of total {tot_cnt} ({pct:.1f}%)."
+                f"deviates from total {tot_cnt} ({pct:.1f}% not in [90%, 110%])."
             )
             sys.exit(1)
 
@@ -1203,10 +1232,10 @@ async def run_benchmark(
                 f"P95={s_stats.get('p95', 0):.3f}ms | P99={s_stats.get('p99', 0):.3f}ms | "
                 f"Max={s_stats.get('max', 0):.3f}ms (N={n_s} / Total={tot_s}, {pct_s:.1f}%)"
             )
-            if tot_s > 0 and pct_s < 90.0:
+            if tot_s > 0 and (pct_s < 90.0 or pct_s > 110.0):
                 print(
                     f"[FAIL] Stage '{stage_name}' sample count N={n_s} "
-                    f"is under 90% of total {tot_s} ({pct_s:.1f}%)."
+                    f"deviates from total {tot_s} ({pct_s:.1f}% not in [90%, 110%])."
                 )
                 sys.exit(1)
         else:
@@ -1278,10 +1307,11 @@ async def run_benchmark(
 
     # Memory slope after minute 5 (D2i: Tracemalloc <= 0.02 MB/min, USS Min-Envelope <= 0.05 MB/min)
     m5_samples = [s for s in stability_samples if s["time_s"] >= 300 and s["asr_uss_mb"] > 0]
+    has_post_m5 = len(m5_samples) >= 2
 
     # 1. USS Min-Envelope Slope
     uss_min_env_slope_mb_min = 0.0
-    if len(m5_samples) >= 2:
+    if has_post_m5:
         min_env_points = []
         for i in range(len(m5_samples)):
             w_start = max(0, i - 5)  # 6-sample (~60s) rolling window
@@ -1302,23 +1332,35 @@ async def run_benchmark(
     tm_slope_mb_min = 0.0
     tm_curr = tracemalloc_data.get("current_mb", 0.0)
     tm_m5 = tracemalloc_data.get("m5_current_mb")
-    if tm_m5 is not None and len(m5_samples) >= 2:
+    if tm_m5 is not None and has_post_m5:
         dt_min = (m5_samples[-1]["time_s"] - 300.0) / 60.0
         if dt_min > 0:
             tm_slope_mb_min = round((tm_curr - tm_m5) / dt_min, 4)
 
-    tm_pass = tm_slope_mb_min <= 0.02
-    uss_pass = uss_min_env_slope_mb_min <= 0.05
-    mem_slope_pass = tm_pass and uss_pass
-
-    print(
-        f"   Worker Tracemalloc Slope (T >= 5m): {tm_slope_mb_min:.4f} MB/min "
-        f"(threshold <= 0.02 MB/min) -> [{'PASS' if tm_pass else 'FAIL'}]"
-    )
-    print(
-        f"   USS Min-Envelope Slope (T >= 5m):   {uss_min_env_slope_mb_min:.4f} MB/min "
-        f"(threshold <= 0.05 MB/min) -> [{'PASS' if uss_pass else 'FAIL'}]"
-    )
+    if has_post_m5:
+        tm_pass = tm_slope_mb_min <= 0.02
+        uss_pass = uss_min_env_slope_mb_min <= 0.05
+        mem_slope_pass = tm_pass and uss_pass
+        print(
+            f"   Worker Tracemalloc Slope (T >= 5m): {tm_slope_mb_min:.4f} MB/min "
+            f"(threshold <= 0.02 MB/min) -> [{'PASS' if tm_pass else 'FAIL'}]"
+        )
+        print(
+            f"   USS Min-Envelope Slope (T >= 5m):   {uss_min_env_slope_mb_min:.4f} MB/min "
+            f"(threshold <= 0.05 MB/min) -> [{'PASS' if uss_pass else 'FAIL'}]"
+        )
+    else:
+        tm_pass = True
+        uss_pass = True
+        mem_slope_pass = True
+        print(
+            "   Worker Tracemalloc Slope (T >= 5m): N/A (run duration <= 5.0m; "
+            "no post-baseline samples)"
+        )
+        print(
+            "   USS Min-Envelope Slope (T >= 5m):   N/A (run duration <= 5.0m; "
+            "no post-baseline samples)"
+        )
 
     print(
         f"   Tracemalloc: current={tracemalloc_data.get('current_mb', 0)} MB | "
@@ -1475,11 +1517,22 @@ async def run_benchmark(
         and duration_pass
         and degraded_count_pass
         and not has_stall
-        and (v_interim != "N/A - INVALID RUN")
-        and not v_interim.startswith("INVALID")
+        and (v_interim == "PASS")
     )
     if not has_stall and not v_interim.startswith("INVALID"):
-        verdict_str = "PASSED" if overall_pass else "FAIL"
+        if overall_pass:
+            verdict_str = "PASSED"
+        elif v_interim == "NOT MET" and (
+            calib_pass
+            and svc_pass
+            and zero_drops_pass
+            and mem_slope_pass
+            and duration_pass
+            and degraded_count_pass
+        ):
+            verdict_str = "OPEN DEVIATION (INTERIM SLO NOT MET)"
+        else:
+            verdict_str = "FAIL"
 
     if has_stall or verdict_str == "INVALID" or v_interim.startswith("INVALID"):
         v_svc = "N/A - INVALID RUN"
@@ -1487,7 +1540,7 @@ async def run_benchmark(
         v_svc = "PASS" if svc_pass else "FAIL"
     v_calib = "PASS" if calib_pass else "FAIL"
     v_zero = "PASS" if zero_drops_pass else "FAIL"
-    v_mem = "PASS" if mem_slope_pass else "FAIL"
+    v_mem = ("PASS" if mem_slope_pass else "FAIL") if has_post_m5 else "N/A (requires >5m run)"
     v_dur = "PASS" if duration_pass else "FAIL"
     v_deg = "PASS" if degraded_count_pass else "FAIL"
     v_stall = "PASS" if not has_stall else "INVALID"
@@ -1496,10 +1549,13 @@ async def run_benchmark(
     print(f"   [1] Service Overhead P95 < 25ms:     P95={p95_svc:.2f}ms  -> [{v_svc}]")
     print(f"   [2] Verification Calibration:        Error={calib_err:.2f}ms -> [{v_calib}]")
     print(f"   [3] Zero Audio Chunks Dropped:       Dropped={dropped_chunks}      -> [{v_zero}]")
-    print(
-        f"   [4] Memory Flatlining:               TM Slope={tm_slope_mb_min:.4f}MB/m (<=0.02), "
-        f"USS Slope={uss_min_env_slope_mb_min:.4f}MB/m (<=0.05) -> [{v_mem}]"
-    )
+    if has_post_m5:
+        print(
+            f"   [4] Memory Flatlining:               TM Slope={tm_slope_mb_min:.4f}MB/m (<=0.02), "
+            f"USS Slope={uss_min_env_slope_mb_min:.4f}MB/m (<=0.05) -> [{v_mem}]"
+        )
+    else:
+        print(f"   [4] Memory Flatlining:               Baseline at T=5m -> [{v_mem}]")
     print(f"   [5] Stream Duration Accuracy <=2%:   Error={duration_err_pct:.2f}%     -> [{v_dur}]")
     print(f"   [6] Degraded State Machine (<=25):   Events={len(degraded_events)}     -> [{v_deg}]")
     print(
@@ -1521,7 +1577,7 @@ async def run_benchmark(
         )
     print("=" * 80)
 
-    if not overall_pass or has_stall:
+    if verdict_str not in ("PASSED", "OPEN DEVIATION (INTERIM SLO NOT MET)"):
         sys.exit(1)
 
 

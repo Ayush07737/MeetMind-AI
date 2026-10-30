@@ -137,7 +137,12 @@ def test_deepgram_base_url_loopback_only():
 
 def test_resolve_asr_base_url_from_allow_list():
     """resolve_asr_base_url resolves host strictly according to DEEPGRAM_REGION_HOSTS."""
-    settings = AsrSettings(_env_file=None, DEEPGRAM_BASE_URL=None, ASR_REGION="global")
+    settings = AsrSettings(
+        _env_file=None,
+        DEEPGRAM_BASE_URL=None,
+        ASR_REGION="global",
+        ASR_ALLOWED_REGIONS=None,
+    )
     assert resolve_asr_base_url(settings, "global") == "wss://api.deepgram.com"
     assert resolve_asr_base_url(settings, "in") == "wss://api.in.deepgram.com"
     assert resolve_asr_base_url(settings, "eu") == "wss://api.eu.deepgram.com"

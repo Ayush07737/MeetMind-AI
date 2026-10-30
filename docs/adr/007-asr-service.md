@@ -186,38 +186,38 @@ $$\text{Latency}_{\text{total}} = \text{RTT}_{\text{ingress}} + \text{Overhead}_
    - In-process JSON parsing, timeline alignment, speaker resolution, hash deduplication, payload serialization, and Redis Stream dispatch.
    - **Empirical Measurement**: **P50 = 3.3ms–3.6ms | P95 = 10.5ms**, consistently well below the 25.0ms architectural SLO. Service overhead accounts for less than **1.5%** of end-to-end latency.
 
-#### 12.2 Analysis of the 500ms Interim Latency Target
+#### 12.2 Analysis of the 500ms Interim Latency Target (Open Deviation)
 
-The initial platform specification suggested a target of P50 < 500ms for streaming interim results. Empirical verification against live Deepgram Nova-3 cloud endpoints proves:
+The initial platform specification suggested a target of P50 < 500ms for streaming interim results. Empirical verification against live Deepgram Nova-3 cloud endpoints demonstrates:
 
 > [!IMPORTANT]
-> **Observed P50 of 590 to 690 ms across runs**: An interim latency P50 < 500ms was not observed in any benchmark run using Deepgram Nova-3 live streaming.
+> **Open Deviation — Interim Latency Target**: An interim latency P50 < 500ms was not observed in any benchmark run using Deepgram Nova-3 live streaming.
 >
-> **Derivation**:
+> In all valid benchmark runs against `api.in.deepgram.com`, interim latency P50 measured between **580ms and 690ms** (observed P50 of 590 to 690 ms across runs).
 >
-> - Minimal one-way network transit (to provider): $\sim 50\text{ms} - 85\text{ms}$
-> - Deepgram acoustic transformer chunk accumulation window: $\sim 500\text{ms} - 750\text{ms}$
-> - Minimal return network transit (from provider): $\sim 50\text{ms} - 85\text{ms}$
-> - Service processing overhead: $\sim 3.5\text{ms}$
-> - **Total Interim Latency Lower Bound**: $\approx 600\text{ms} - 950\text{ms}$.
+> **Analysis**:
 >
-> In all valid 5-minute and 30-minute benchmark runs against `api.in.deepgram.com`, interim latency P50 measured between **593.8ms and 690.0ms** (observed P50 of 590 to 690 ms across runs). Artificially tuning or claiming compliance against 500ms would violate measurement truthfulness. The target is recorded as **`[NOT MET]`** by design.
+> - Geographic network transit to/from cloud ingress (`api.in.deepgram.com`) contributes measured P50 ping/pong RTT of ~112ms–137ms.
+> - Service-added pipeline overhead is sub-10ms (P50 3.3ms, P95 6.5ms).
+> - The remaining ~450ms–550ms is provider-internal processing latency. Hypotheses regarding provider acoustic context windows (e.g., 400–750ms) are unverified vendor-internal mechanisms rather than direct instrumentation measurements.
+>
+> **Governance Verdict**: While an interim latency of P50 ≤ 800ms is empirically defensible and operationally viable for real-time evidence card generation, the 500ms target is a specification miss and is recorded strictly as an **Open Deviation (`[NOT MET]`)**. The benchmark harness records `[OPEN DEVIATION (INTERIM SLO NOT MET)]` rather than claiming a false pass, until formally amended by the project owner.
 
 ---
 
 ### 13. Deepgram Flux (`/v2/listen`) Evaluation on India Regional Endpoint
 
-Deepgram introduced Flux as a low-latency conversational speech-to-text API on the `/v2/listen` route. A formal evaluation was conducted regarding its suitability for MeetMind AI on `api.in.deepgram.com`:
+Deepgram introduced Flux (released October 2025; Multilingual support April 2026) as a conversational speech-to-text API on the `/v2/listen` route. A formal architectural evaluation was conducted regarding its suitability for MeetMind AI:
 
-| Capability / Criterion     | Nova-3 (`/v1/listen`)                                                              | Flux (`/v2/listen`)                                                                                                | Evaluation Verdict                                                     | Official Citation                                                                                   |
-| :------------------------- | :--------------------------------------------------------------------------------- | :----------------------------------------------------------------------------------------------------------------- | :--------------------------------------------------------------------- | :-------------------------------------------------------------------------------------------------- |
-| **Speaker Diarization**    | Native multi-speaker diarization (`diarize=true`, `diarize_version=2024-01-11`)    | **Not supported**. Flux is designed primarily for single-speaker turn-taking voice bots.                           | **Incompatible** with multi-party meeting transcription.               | [Deepgram Flux API Overview, August 2024](https://developers.deepgram.com/docs/flux)                |
-| **Keyterm Prompting**      | Supported via repeated `keyterm` query parameters (up to 100 terms).               | **Unsupported / Restricted**. Financial and enterprise vocabulary boosting is unavailable.                         | **Incompatible** with enterprise financial vocabulary requirements.    | [Deepgram Flux Query Parameters, August 2024](https://developers.deepgram.com/docs/flux)            |
-| **Interim Results**        | Continuous word-by-word interim transcripts with timestamps and confidence scores. | Turn-based conversational endpointing. Returns finalized turn chunks rather than fine-grained continuous interims. | **Incompatible** with live real-time closed-caption UI.                | [Deepgram Flux Streaming Protocol, August 2024](https://developers.deepgram.com/docs/flux)          |
-| **Measured Turn Latency**  | P50 $\sim 530\text{ms}$ finals, $\sim 590-690\text{ms}$ interims                   | P50 $\sim 280-420\text{ms}$ on turn completion                                                                     | Faster conversational turn detection, but lacks transcript richness.   | Measured empirical benchmark                                                                        |
-| **Data Residency Support** | Full support on `api.in.deepgram.com` with `mip_opt_out=true`.                     | Available on regional endpoints, but subject to experimental API changes.                                          | Viable for future voice-agent subcomponents, but not core meeting STT. | [Deepgram Regional Endpoints, August 2024](https://developers.deepgram.com/docs/regional-endpoints) |
+| Capability / Criterion     | Nova-3 (`/v1/listen`)                                                              | Flux (`/v2/listen`)                                                                                               | Evaluation Verdict                                                  | Official Documentation                                                                       |
+| :------------------------- | :--------------------------------------------------------------------------------- | :---------------------------------------------------------------------------------------------------------------- | :------------------------------------------------------------------ | :------------------------------------------------------------------------------------------- |
+| **Speaker Diarization**    | Native multi-speaker diarization (`diarize=true`, `diarize_version=2024-01-11`).   | **Not supported**. Flux is designed primarily for single-speaker turn-taking conversational voice bots.           | **Incompatible** with multi-party meeting transcription.            | [Deepgram Flux Feature Overview](https://developers.deepgram.com/docs/flux/feature-overview) |
+| **Keyterm Prompting**      | Supported via repeated `keyterm` query parameters (up to 100 terms).               | **Supported**. Flux supports keyterms at connect and dynamic mid-stream updates via `Configure` control messages. | **Compatible**. Both models support enterprise keyterms.            | [Deepgram Flux Feature Overview](https://developers.deepgram.com/docs/flux/feature-overview) |
+| **Interim Transcripts**    | Continuous word-by-word interim transcripts with timestamps and confidence scores. | Turn-based conversational endpointing (`TurnInfo`, `eot_threshold`). Emits turn segments rather than interims.    | **Incompatible** with real-time closed-caption streaming UI.        | [Deepgram Flux Feature Overview](https://developers.deepgram.com/docs/flux/feature-overview) |
+| **Turn Latency**           | Measured empirical P50 ~480-530ms finals, ~580-690ms interims.                     | Vendor claims lower turn-taking latency for voice bots; **unmeasured** locally on meeting fixtures.               | Turn-taking optimized, but lacks multi-speaker transcript richness. | Vendor product specifications (unverified on multi-speaker meetings)                         |
+| **Data Residency Support** | Full support on `api.in.deepgram.com` with `mip_opt_out=true`.                     | Supported on regional endpoints with `mip_opt_out=true`.                                                          | Viable for regional deployment, but blocked by lack of diarization. | [Deepgram Regional Endpoints](https://developers.deepgram.com/reference/regional-endpoints)  |
 
-**Conclusion**: Nova-3 on `/v1/listen` remains the pinned, mandatory production model for MeetMind AI Component #2. Flux lacks speaker diarization, continuous word-level interim results, and keyterm boosting required for enterprise multi-speaker meetings.
+**Conclusion**: Nova-3 on `/v1/listen` remains the pinned, mandatory production model for MeetMind AI Component #2. Flux lacks speaker diarization and continuous word-level interim transcripts required for multi-speaker enterprise meetings.
 
 ---
 
