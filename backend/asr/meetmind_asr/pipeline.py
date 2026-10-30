@@ -1047,15 +1047,14 @@ class MeetingPipeline:
                 self._is_catching_up or (audio_end_wall and (t_pub_wall - audio_end_wall) > 2.0)
             )
 
-            # Service-added latency: Deepgram message receipt to internal bus publish
-            svc_ms = 0.0
+            # Early service overhead estimate for provider latency calculation
+            svc_est_ms = 0.0
             if getattr(event, "recv_perf", 0.0) > 0:
-                svc_ms = max(0.1, (time.perf_counter() - event.recv_perf) * 1000.0)
-                self.metrics.record_service_added_latency(svc_ms)
+                svc_est_ms = max(0.1, (time.perf_counter() - event.recv_perf) * 1000.0)
 
             # Provider latency: audio end to provider message receipt
             if e2e_ms is not None:
-                prov_lat = max(0.1, e2e_ms - svc_ms)
+                prov_lat = max(0.1, e2e_ms - svc_est_ms)
                 self.metrics.record_provider_latency(prov_lat)
 
             # Stage 4: Serialization

@@ -229,7 +229,7 @@ class HealthServer:
     async def start(self) -> None:
         bench_mode = (
             self.service and getattr(self.service.settings, "asr_benchmark_mode", False)
-        ) or os.environ.get("ASR_BENCHMARK_MODE") == "1"
+        ) or str(os.environ.get("ASR_BENCHMARK_MODE", "")).lower() in ("1", "true")
         if bench_mode:
             self.metrics.benchmark_mode = True
         self._server = await asyncio.start_server(self._handle_client, self.host, self.port)

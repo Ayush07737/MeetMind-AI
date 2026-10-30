@@ -142,10 +142,11 @@ def compare_transcripts():
             f"Word Error Rate (WER) between earlier run and D2f run: {wer:.4f} ({wer * 100:.2f}%)"
         )
     else:
-        print("Ground truth corpus: 5min_meeting.wav looped 6x (30 minutes).")
-        print("Transcript texts are identical across repetitions.")
-        wer = 0.00
-        print(f"WER between runs: {wer:.4f} (0.00% semantic deviation)")
+        print(
+            "Transcript finals could not be fully extracted from one or both logs for direct "
+            "WER computation."
+        )
+        print("WER: Unmeasured (requires full utterance transcript text in logs).")
 
     # Check duplicate utterance overlap
     print("\nDuplicate / Overlap Check:")
@@ -155,38 +156,30 @@ def compare_transcripts():
     print()
 
     print("=" * 70)
-    print("4. EXPLANATION WITH EVIDENCE: WHY 511 FINALS VS 364-430")
+    print("4. BEHAVIORAL ANALYSIS: FINALS COUNT VARIATION (511 VS 364-430)")
     print("=" * 70)
     print(
-        """Evidence & Root Cause Analysis:
+        """Analysis & Status:
 1. URL Parameters & Model Invariance:
    The URL parameters are 100% IDENTICAL (model=nova-3, encoding=linear16,
    sample_rate=16000, channels=1, diarize=true, interim_results=true, mip_opt_out=true).
    No model flags, endpointing thresholds, or keyterm alterations were made.
 
-2. Audio Ingestion Cadence and VAD Segmentation:
-   - In earlier runs (e.g. asr_latency_bench_india_30min.log):
-     The ASR worker experienced severe pipeline queuing lag (buf=300 chunks,
-     E2E latency P50=37,488 ms). Audio was consumed and forwarded to Deepgram
-     in accelerated burst batches rather than real-time 100ms pacing.
-     When audio frames arrive faster than real-time, Deepgram's internal Voice
-     Activity Detector (VAD) silence timeout does not trigger between spoken
-     phrases because subsequent speech chunks arrive before the silence window
-     expires in wall time. Deepgram consequently merged adjacent phrases across
-     natural pauses into longer composite finals (364 to 430 finals, ~12-14/min).
-
-   - In the optimized D2f/D2g runs (bench30.log):
-     The ASR pipeline runs with zero buffer backlog (buf=0, service overhead P50=3.12ms),
-     forwarding audio to Deepgram in exact 100ms real-time cadence.
-     With real-time cadence, Deepgram's VAD silence detector observes the true
-     conversational pause durations in '5min_meeting.wav'. Every natural pause
-     (>300-500ms) cleanly triggers an utterance endpoint, producing 511 discrete
-     finals across 30 minutes (17.0 finals/min).
+2. Finals-Per-Minute Mechanism Status:
+   - Status: Unexplained empirical variation (Hypothesis, not a proven finding).
+   - Initial Hypothesis: Bursty ingestion was hypothesized to prevent Deepgram VAD endpointing
+     from triggering between phrases.
+   - Critique & Reality: Deepgram's endpointing evaluates acoustic silence embedded within
+     the PCM audio signal itself, not wall-clock socket frame arrival times. Bursting
+     audio packets over a socket does not alter the acoustic silence duration between spoken words.
+   - Conclusion: The exact mechanism for the final utterance count variation (from ~12-14 finals/min
+     to ~17 finals/min) across runs remains unexplained. It may relate to server-side model
+     inference batching or non-deterministic endpointing heuristics within Deepgram cloud,
+     but is not proven to be caused by network pacing.
 
 3. Transcription Fidelity:
-   The total words uttered and the resulting transcript text are identical.
-   The increased final count represents higher temporal resolution and lower
-   per-utterance latency, not duplicate or hallucinated speech.
+   Word Error Rate (WER) across runs is unmeasured without offline ground-truth alignment.
+   Claims of 'identical transcript accuracy' are unproven without explicit WER measurement.
 """
     )
 
