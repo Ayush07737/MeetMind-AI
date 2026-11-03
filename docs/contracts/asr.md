@@ -17,6 +17,14 @@
 | `mm:{tenant}:asr_owner:{meeting}` | Distributed worker ownership lease (holds `worker_id`)                                            | N/A (string)    | 15 s (heartbeat every 5 s)     |
 | `mm:{tenant}:meeting:{meeting}`   | Meeting session hash (contains `local_user_name`, `attendees`, `origin_capture_ts`)               | N/A (hash)      | 86,400 s (24 h)                |
 
+### 1.1 Stream Routing, Consumers & Retention Invariants (C3)
+
+| Stream | Allowed Event Types | Target Consumers & Purpose | History & Retention Invariant |
+| :----- | :------------------ | :------------------------- | :---------------------------- |
+| `mm:{tenant}:events:{meeting}` | `transcript_final`, `transcript_service_degraded`, `audio_gap` | **Internal Bus Only**: Downstream intelligence services (classification engine §6, Decision Genome §8, entity extractor §7, summary generator). **Never forwarded directly to clients.** | `MAXLEN ~5000` (approximate), 24h TTL. At ~17.0 finals/min, cap is reached after ~4.9 hours of continuous speech. Downstream consumers rely on stream history for replay and catchup. |
+| `mm:{tenant}:out:{meeting}` | `transcript_interim`, `transcript_service_degraded` | **Client WebSocket Listeners**: Consumed by Gateway forwarder tasks and dispatched to connected frontend sidepanels and extensions for live display. | `MAXLEN ~5000`, 24h TTL. Ephemeral UI display. Interims are **strictly excluded** from `events` to preserve history capacity. |
+
+
 ---
 
 ## 2. Event Envelope & Schemas
@@ -56,6 +64,9 @@ Published to `mm:{tenant}:events:{meeting}` only. Never forwarded directly to cl
 ### 2.2. `transcript_interim` (Client Out Stream Only)
 
 Published to `mm:{tenant}:out:{meeting}` only. Dropped under backpressure.
+
+> **Stream Isolation Invariant (C3)**: Interim transcripts are published exclusively to the client outbound stream (`mm:{tenant}:out:{meeting}`) and are **never written to the internal bus (`mm:{tenant}:events:{meeting}`)**. This guarantees that high-rate interim text hypotheses do not displace final transcripts in the bounded 5,000-entry `events` stream, ensuring ~4.9 hours of durable meeting event history for downstream intelligence consumers.
+
 
 | Field            | Type          | Description                                      |
 | :--------------- | :------------ | :----------------------------------------------- |

@@ -339,6 +339,9 @@ class HealthServer:
                                             "xadd",
                                         )
                                     },
+                                    "raw_samples": {
+                                        k: list(v) for k, v in self.metrics.bench_samples.items()
+                                    },
                                 }
                                 if self.metrics.benchmark_mode
                                 else None
@@ -397,10 +400,22 @@ class HealthServer:
                         ):
                             p_info = {}
                             for m_id, pipe in self.service._active_pipelines.items():
+                                dedupe = getattr(pipe, "_dedupe", None)
+                                seen_ids = getattr(dedupe, "_seen_utterance_ids", {})
                                 p_info[m_id] = {
+                                    "dispatched_seqs_size": len(
+                                        getattr(pipe, "_dispatched_seqs_set", set())
+                                    ),
+                                    "dispatched_seqs_cap": getattr(
+                                        getattr(pipe, "_dispatched_seqs_window", None),
+                                        "maxlen",
+                                        5000,
+                                    )
+                                    or 5000,
+                                    "dedupe_lru_size": len(seen_ids),
+                                    "dedupe_lru_cap": getattr(dedupe, "_lru_capacity", 1000),
                                     "reconnect_buffer_depth": len(pipe._reconnect_buffer),
                                     "pending_acks_depth": len(pipe._pending_acks),
-                                    "dedupe_lru_size": len(pipe._dedupe._seen_utterance_ids),
                                     "reconnect_attempts": getattr(pipe, "_reconnect_attempts", []),
                                 }
                             resp_data["metrics"]["pipelines"] = p_info

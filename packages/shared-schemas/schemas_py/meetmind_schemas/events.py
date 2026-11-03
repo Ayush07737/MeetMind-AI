@@ -70,6 +70,9 @@ class ControlAction(StrEnum):
     MEETING_START = "meeting_start"
     MEETING_END = "meeting_end"
     CONSENT_CONFIRMED = "consent_confirmed"
+    CLOCK_SYNC = "clock_sync"
+    CLOCK_SYNC_REPLY = "clock_sync_reply"
+    CLOCK_REPORT = "clock_report"
 
 
 class MeetingStatus(StrEnum):
@@ -160,6 +163,14 @@ class ControlFrame(BaseModel):
     consent_text_version: str | None = None
     client_version: str | None = None
 
+    # Fields for clock sync & report (Q1)
+    t1: int | None = None
+    t2: int | None = None
+    t3: int | None = None
+    offset_ms: int | None = None
+    rtt_ms: int | None = None
+    samples: int | None = None
+
     @model_validator(mode="after")
     def validate_action_fields(self) -> Self:
         if self.action == ControlAction.CONSENT_CONFIRMED:
@@ -169,15 +180,60 @@ class ControlFrame(BaseModel):
                 raise ValueError("consent_text_version is required for consent_confirmed")
             if not self.client_version or not self.client_version.strip():
                 raise ValueError("client_version is required for consent_confirmed")
+        elif self.action == ControlAction.CLOCK_SYNC:
+            if self.t1 is None:
+                raise ValueError("t1 is required for clock_sync")
+        elif self.action == ControlAction.CLOCK_SYNC_REPLY:
+            if self.t1 is None or self.t2 is None or self.t3 is None:
+                raise ValueError("t1, t2, and t3 are required for clock_sync_reply")
+        elif self.action == ControlAction.CLOCK_REPORT:
+            if self.offset_ms is None or self.rtt_ms is None:
+                raise ValueError("offset_ms and rtt_ms are required for clock_report")
         else:
-            # For meeting_start and meeting_end, consent fields should not be populated
+            # For meeting_start and meeting_end, specialized fields should not be populated
             if (
                 self.external_participants is not None
                 or self.consent_text_version is not None
                 or self.client_version is not None
+                or self.t1 is not None
+                or self.offset_ms is not None
             ):
-                raise ValueError(f"Consent fields not allowed for action '{self.action}'")
+                raise ValueError(f"Specialized fields not allowed for action '{self.action}'")
         return self
+
+
+class ClockSyncControlFrame(BaseModel):
+    """Client clock sync request frame (t1 = client send timestamp)."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    type: Literal["control"] = "control"
+    action: Literal[ControlAction.CLOCK_SYNC] = ControlAction.CLOCK_SYNC
+    t1: int
+
+
+class ClockSyncReplyFrame(BaseModel):
+    """Server clock sync reply frame (t1 = client send, t2 = server recv, t3 = server send)."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    type: Literal["control"] = "control"
+    action: Literal[ControlAction.CLOCK_SYNC_REPLY] = ControlAction.CLOCK_SYNC_REPLY
+    t1: int
+    t2: int
+    t3: int
+
+
+class ClockReportControlFrame(BaseModel):
+    """Client clock report frame reporting computed offset and RTT."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    type: Literal["control"] = "control"
+    action: Literal[ControlAction.CLOCK_REPORT] = ControlAction.CLOCK_REPORT
+    offset_ms: int
+    rtt_ms: int
+    samples: int = 3
 
 
 class TranscriptChunkFrame(BaseModel):
@@ -490,6 +546,22 @@ class AudioGapPayload(BaseModel):
     capture_end_ms: int
 
 
+class EventTiming(BaseModel):
+    """Monotonic server-epoch millisecond timestamps tracking end-to-end pipeline stages (Q1)."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    t0_capture: int | None = None
+    gw_recv: int | None = None
+    asr_recv: int | None = None
+    provider_msg: int | None = None
+    asr_pub: int | None = None
+    classify_pub: int | None = None
+    retrieval_done: int | None = None
+    card_pub: int | None = None
+    ui_render: int | None = None
+
+
 class EventEnvelope(BaseModel):
     """Standardized event envelope across internal events and client out streams."""
 
@@ -500,6 +572,7 @@ class EventEnvelope(BaseModel):
     tenant_id: str
     ts_ms: int
     trace_id: str | None = None
+    timing: EventTiming | None = None
     payload: dict[str, Any]
 
 

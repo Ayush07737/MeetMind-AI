@@ -130,3 +130,51 @@ async def audit_meeting_end(
             "total_chunks": total_chunks,
         },
     )
+
+
+async def audit_clock_sync_established(
+    *,
+    tenant_id: str,
+    user_id: str,
+    meeting_id: str,
+    clock_offset_ms: int,
+    rtt_ms: int,
+    samples: int = 3,
+) -> None:
+    """Log initial clock synchronization establishment (fail-closed, Q1)."""
+    await write_audit_event(
+        tenant_id=tenant_id,
+        user_id=user_id,
+        event_type="clock_sync_established",
+        payload={
+            "meeting_id": meeting_id,
+            "clock_offset_ms": clock_offset_ms,
+            "rtt_ms": rtt_ms,
+            "samples": samples,
+        },
+    )
+
+
+async def audit_clock_skew_detected(
+    *,
+    tenant_id: str,
+    user_id: str,
+    meeting_id: str,
+    previous_offset_ms: int,
+    new_offset_ms: int,
+    delta_ms: int,
+    rtt_ms: int,
+) -> None:
+    """Log clock skew shift > 500ms warning (retried, Q1)."""
+    await _retry_audit_write(
+        tenant_id=tenant_id,
+        user_id=user_id,
+        event_type="clock_skew_detected",
+        payload={
+            "meeting_id": meeting_id,
+            "previous_offset_ms": previous_offset_ms,
+            "new_offset_ms": new_offset_ms,
+            "delta_ms": delta_ms,
+            "rtt_ms": rtt_ms,
+        },
+    )

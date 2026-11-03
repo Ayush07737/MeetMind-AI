@@ -68,9 +68,25 @@ async def write_audit_event(
     Returns:
         The created AuditEvent with server-assigned id and timestamp.
     """
-    delay_s = float(os.environ.get("TEST_AUDIT_STATEMENT_DELAY_SECONDS", "0"))
-    if delay_s > 0:
-        await asyncio.sleep(delay_s)
+    delay_raw = os.environ.get("TEST_AUDIT_STATEMENT_DELAY_SECONDS")
+    if delay_raw is not None:
+        is_prod = os.environ.get("APP_ENV", "development").lower() in ("prod", "production") or (
+            os.environ.get("ENVIRONMENT", "").lower() in ("prod", "production")
+        )
+        if is_prod:
+            raise RuntimeError(
+                "TEST_AUDIT_STATEMENT_DELAY_SECONDS is strictly forbidden in production"
+            )
+        test_hooks_enabled = os.environ.get("ASR_TEST_HOOKS", "false").lower() in (
+            "true",
+            "1",
+            "yes",
+        )
+        if not test_hooks_enabled:
+            raise RuntimeError("TEST_AUDIT_STATEMENT_DELAY_SECONDS requires ASR_TEST_HOOKS=true")
+        delay_s = float(delay_raw)
+        if delay_s > 0:
+            await asyncio.sleep(delay_s)
 
     event = AuditEvent(
         tenant_id=tenant_id,
