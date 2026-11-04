@@ -95,7 +95,8 @@ async def test_gateway_clock_synchronization_and_skew_correction(
         # Verify Redis session hash carries clock_offset_ms
         redis_offset = await real_redis.hget(session_key, "clock_offset_ms")
         assert redis_offset is not None
-        assert int(redis_offset.decode() if isinstance(redis_offset, bytes) else redis_offset) == skew_offset
+        offset_val = redis_offset.decode() if isinstance(redis_offset, bytes) else redis_offset
+        assert int(offset_val) == skew_offset
 
         # Verify initial audit record in Neon
         async with h.tenant_conn(tenant_id) as conn:
@@ -104,7 +105,8 @@ async def test_gateway_clock_synchronization_and_skew_correction(
                 f"WHERE event_type = 'clock_sync_established' ORDER BY id DESC LIMIT 1"
             )
             assert len(rows) == 1
-            payload = json.loads(rows[0]["payload"]) if isinstance(rows[0]["payload"], str) else rows[0]["payload"]
+            raw_payload = rows[0]["payload"]
+            payload = json.loads(raw_payload) if isinstance(raw_payload, str) else raw_payload
             assert payload["meeting_id"] == meeting_id
             assert payload["clock_offset_ms"] == skew_offset
             assert payload["rtt_ms"] == 36
@@ -144,12 +146,15 @@ async def test_gateway_clock_synchronization_and_skew_correction(
         entry_fields = entries[0][1]
 
         raw_cap_ts = entry_fields.get(b"capture_ts_ms") or entry_fields.get("capture_ts_ms")
-        raw_cap_srv = entry_fields.get(b"capture_server_ms") or entry_fields.get("capture_server_ms")
+        raw_cap_srv = entry_fields.get(b"capture_server_ms") or entry_fields.get(
+            "capture_server_ms"
+        )
         cap_ts = int(raw_cap_ts.decode() if isinstance(raw_cap_ts, bytes) else raw_cap_ts)
         cap_srv = int(raw_cap_srv.decode() if isinstance(raw_cap_srv, bytes) else raw_cap_srv)
 
         assert cap_ts == client_capture_ts
-        # capture_server_ms = capture_ts_ms + clock_offset_ms = (server_now + 2500) - 2500 = server_now
+        # capture_server_ms = capture_ts_ms + clock_offset_ms
+        # = (server_now + 2500) - 2500 = server_now
         assert abs(cap_srv - server_now_ms) <= 100
 
         # Step 6: Trigger skew detection (> 500ms shift from -2500ms to -1800ms)
@@ -175,9 +180,9 @@ async def test_gateway_clock_synchronization_and_skew_correction(
                 f"WHERE event_type = 'clock_skew_detected' ORDER BY id DESC LIMIT 1"
             )
             assert len(rows) == 1
-            payload = json.loads(rows[0]["payload"]) if isinstance(rows[0]["payload"], str) else rows[0]["payload"]
+            raw_payload = rows[0]["payload"]
+            payload = json.loads(raw_payload) if isinstance(raw_payload, str) else raw_payload
             assert payload["meeting_id"] == meeting_id
             assert payload["previous_offset_ms"] == -2500
             assert payload["new_offset_ms"] == -1800
             assert payload["delta_ms"] == 700
-

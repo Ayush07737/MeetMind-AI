@@ -140,4 +140,3 @@ def load_budget(path: Path | str | None = None) -> LatencyBudget:
     with open(budget_path, encoding="utf-8") as f:
         raw_data = yaml.safe_load(f)
     return LatencyBudget.model_validate(raw_data)
-

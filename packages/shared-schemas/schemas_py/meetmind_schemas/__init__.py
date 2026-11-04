@@ -4,6 +4,19 @@ Pydantic models that mirror the Zod schemas in src/index.ts.
 These are the canonical Python-side contracts shared across backend services.
 """
 
+from .budget import (
+    BudgetConstraints,
+    ClassificationConstraints,
+    HistoryEntry,
+    LatencyBudget,
+    MemoryConstraints,
+    ObservedMetrics,
+    OverheadConstraints,
+    SimulatedDelays,
+    StageBudget,
+    find_budget_yaml_path,
+    load_budget,
+)
 from .events import (
     BINARY_HEADER_FORMAT,
     BINARY_HEADER_SIZE,
@@ -58,19 +71,6 @@ from .keys import (
     validate_tenant_segment,
     writer_lease_key,
     ws_ticket_key,
-)
-from .budget import (
-    BudgetConstraints,
-    ClassificationConstraints,
-    HistoryEntry,
-    LatencyBudget,
-    MemoryConstraints,
-    ObservedMetrics,
-    OverheadConstraints,
-    SimulatedDelays,
-    StageBudget,
-    find_budget_yaml_path,
-    load_budget,
 )
 from .timing import (
     TIMING_STAGES,

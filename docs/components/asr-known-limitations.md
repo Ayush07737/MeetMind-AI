@@ -93,4 +93,3 @@ This document records the empirical constraints, platform quirks, and architectu
 
 - **Observation**: Two earlier 30-minute runs reported near-identical interim P50 latencies (597.24 ms and 597.19 ms).
 - **Status: UNEXPLAINED**: The earlier explanation claiming this match was "governed by base network RTT (~123.5ms) and identical chunk cadence" is retracted as speculative. A subsequent owner run on the identical endpoint (`api.in.deepgram.com`) recorded an interim P50 of 585.38 ms with a ping RTT of 61.0 ms. The sub-millisecond match between the earlier runs was coincidental and is officially marked **UNEXPLAINED**.
-

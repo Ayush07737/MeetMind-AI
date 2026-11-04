@@ -91,4 +91,3 @@ export type LatencyBudget = z.infer<typeof LatencyBudgetSchema>;
 export function parseLatencyBudget(raw: unknown): LatencyBudget {
   return LatencyBudgetSchema.parse(raw);
 }
-

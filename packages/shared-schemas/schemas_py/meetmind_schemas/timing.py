@@ -142,4 +142,3 @@ class ClockEstimator:
         if not probes:
             raise ValueError("No probes provided")
         return min(probes, key=lambda p: p["rtt_ms"])
-

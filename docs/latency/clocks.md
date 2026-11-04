@@ -154,6 +154,7 @@ Every internal event envelope optionally carries a `timing` object tracking the 
 ```
 
 ### Stage Field Specifications
+
 - `t0_capture`: Monotonic capture server time of the triggering audio sample.
 - `gw_recv`: Timestamp when the Gateway completed reading the audio frame from the client WebSocket.
 - `asr_recv`: Timestamp when the ASR pipeline read the audio chunk from Redis Streams.
@@ -163,4 +164,3 @@ Every internal event envelope optionally carries a `timing` object tracking the 
 - `retrieval_done`: Timestamp when vector/graph retrieval completed.
 - `card_pub`: Timestamp when the insight card was validated and published to the outbound stream.
 - `ui_render`: Client-reported timestamp when the card rendered in the user's viewport.
-

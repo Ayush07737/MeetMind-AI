@@ -10,12 +10,10 @@ Tests clock offset estimation under simulated network conditions:
 from __future__ import annotations
 
 import random
-from typing import Any
 
 import pytest
 from meetmind_schemas.events import EventEnvelope, EventTiming
 from meetmind_schemas.timing import (
-    TIMING_STAGES,
     ClockEstimator,
     compute_stage_latencies,
     stamp,
@@ -116,7 +114,10 @@ def test_validate_monotonic_detects_inversion():
     )
     violations = validate_monotonic(timing)
     assert len(violations) == 1
-    assert "Monotonic violation: stage 'gw_recv' (1950ms) preceded by 't0_capture' (2000ms)" in violations[0]
+    assert (
+        "Monotonic violation: stage 'gw_recv' (1950ms) preceded by 't0_capture' (2000ms)"
+        in violations[0]
+    )
 
 
 def test_stamp_and_compute_stage_latencies():
