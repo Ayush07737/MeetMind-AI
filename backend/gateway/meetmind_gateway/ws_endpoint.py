@@ -140,6 +140,11 @@ class ConnectionContext:
         # Gateway added latency tracker (spans frame receipt to awaited XADD completion)
         self.gateway_latencies_ms: list[float] = []
 
+        # Clock synchronization state (Q1 Spec §3, §4)
+        self.clock_offset_ms: int = 0
+        self.clock_rtt_ms: int = 0
+        self.has_clock_sync: bool = False
+
     def mark_closed(self) -> None:
         self.is_closed = True
         if self.idle_task and not self.idle_task.done():
@@ -356,6 +361,76 @@ async def _handle_control_frame(
         )
         await ctx.ws.send_text(ack.model_dump_json())
 
+    elif frame.action == ControlAction.CLOCK_SYNC:
+        # SNTP handshake Step 2: immediate reply with t1, t2 (recv), t3 (send)
+        t2 = int(datetime.now(UTC).timestamp() * 1000)
+        t3 = int(datetime.now(UTC).timestamp() * 1000)
+        reply = {
+            "type": "control",
+            "action": "clock_sync_reply",
+            "t1": frame.t1,
+            "t2": t2,
+            "t3": t3,
+        }
+        await ctx.ws.send_text(json.dumps(reply))
+
+    elif frame.action == ControlAction.CLOCK_REPORT:
+        # Client reports calculated offset and RTT
+        offset_ms = int(frame.offset_ms or 0)
+        rtt_ms = int(frame.rtt_ms or 0)
+        prev_offset = ctx.clock_offset_ms
+        is_initial = not ctx.has_clock_sync
+
+        ctx.clock_offset_ms = offset_ms
+        ctx.clock_rtt_ms = rtt_ms
+        ctx.has_clock_sync = True
+
+        # Store in Redis session hash mm:{tenant}:meeting:{meeting}
+        from .keys import meeting_session_key
+
+        session_k = meeting_session_key(ctx.session.tenant_id, ctx.meeting_id)
+        with contextlib.suppress(Exception):
+            await ctx.redis_client.hset(
+                session_k,
+                mapping={
+                    "clock_offset_ms": str(offset_ms),
+                    "clock_rtt_ms": str(rtt_ms),
+                },
+            )
+
+        # Audit events: clock_sync_established or clock_skew_detected
+        from .audit import audit_clock_skew_detected, audit_clock_sync_established
+
+        if is_initial:
+            with contextlib.suppress(Exception):
+                await audit_clock_sync_established(
+                    tenant_id=ctx.session.tenant_id,
+                    user_id=ctx.session.user_id,
+                    meeting_id=ctx.meeting_id,
+                    clock_offset_ms=offset_ms,
+                    rtt_ms=rtt_ms,
+                    samples=frame.samples or 3,
+                )
+        elif abs(offset_ms - prev_offset) > 500:
+            with contextlib.suppress(Exception):
+                await audit_clock_skew_detected(
+                    tenant_id=ctx.session.tenant_id,
+                    user_id=ctx.session.user_id,
+                    meeting_id=ctx.meeting_id,
+                    previous_offset_ms=prev_offset,
+                    new_offset_ms=offset_ms,
+                    delta_ms=offset_ms - prev_offset,
+                    rtt_ms=rtt_ms,
+                )
+
+        ack = AckFrame(
+            seq=0,
+            frame_type="control",
+            status="accepted",
+            timestamp=datetime.now(UTC),
+        )
+        await ctx.ws.send_text(ack.model_dump_json())
+
 
 async def _handle_audio_chunk(
     ctx: ConnectionContext,
@@ -418,6 +493,7 @@ async def _handle_audio_chunk(
 
     # 3. Publish to Redis stream mm:{tenant}:audio:{meeting}
     t_recv = recv_ns if recv_ns is not None else time.perf_counter_ns()
+    capture_server_ms = capture_ts_ms + ctx.clock_offset_ms
     try:
         await ctx.stream_producer.publish_audio(
             meeting_id=ctx.meeting_id,
@@ -429,6 +505,7 @@ async def _handle_audio_chunk(
             timestamp_ms=int(datetime.now(UTC).timestamp() * 1000),
             client_seq=client_seq,
             capture_ts_ms=capture_ts_ms,
+            capture_server_ms=capture_server_ms,
             recv_ns=t_recv,
             gap_size=gap_size,
             trace_id=ctx.trace_id,

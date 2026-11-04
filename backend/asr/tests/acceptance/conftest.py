@@ -270,23 +270,35 @@ async def real_db_tenants() -> AsyncGenerator[tuple[TenantConfig, TenantConfig],
     db._router.register(cfg_a)
     db._router.register(cfg_b)
 
-    admin_conn = await _connect_db_with_retry(dsn)
-    try:
-        await admin_conn.execute(f'CREATE SCHEMA IF NOT EXISTS "{cfg_a.pg_schema}"')
-        await admin_conn.execute(f'CREATE SCHEMA IF NOT EXISTS "{cfg_b.pg_schema}"')
-        await apply_migrations_conn(admin_conn, cfg_a.pg_schema)
-        await apply_migrations_conn(admin_conn, cfg_b.pg_schema)
-    finally:
-        await admin_conn.close()
+    for attempt in range(1, 4):
+        admin_conn = await _connect_db_with_retry(dsn)
+        try:
+            await admin_conn.execute(f'CREATE SCHEMA IF NOT EXISTS "{cfg_a.pg_schema}"')
+            await admin_conn.execute(f'CREATE SCHEMA IF NOT EXISTS "{cfg_b.pg_schema}"')
+            await apply_migrations_conn(admin_conn, cfg_a.pg_schema)
+            await apply_migrations_conn(admin_conn, cfg_b.pg_schema)
+            break
+        except (ConnectionResetError, OSError):
+            if attempt == 3:
+                raise
+            await asyncio.sleep(1.0 * attempt)
+        finally:
+            await admin_conn.close()
 
     yield (cfg_a, cfg_b)
 
-    teardown_conn = await _connect_db_with_retry(dsn)
-    try:
-        await teardown_conn.execute(f'DROP SCHEMA IF EXISTS "{cfg_a.pg_schema}" CASCADE')
-        await teardown_conn.execute(f'DROP SCHEMA IF EXISTS "{cfg_b.pg_schema}" CASCADE')
-    finally:
-        await teardown_conn.close()
+    for attempt in range(1, 4):
+        teardown_conn = await _connect_db_with_retry(dsn)
+        try:
+            await teardown_conn.execute(f'DROP SCHEMA IF EXISTS "{cfg_a.pg_schema}" CASCADE')
+            await teardown_conn.execute(f'DROP SCHEMA IF EXISTS "{cfg_b.pg_schema}" CASCADE')
+            break
+        except (ConnectionResetError, OSError):
+            if attempt == 3:
+                raise
+            await asyncio.sleep(1.0 * attempt)
+        finally:
+            await teardown_conn.close()
 
 
 @pytest.fixture(scope="module")

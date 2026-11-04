@@ -476,9 +476,10 @@ class AsrService:
         self, tenant: str, meeting_id: str, pipeline: MeetingPipeline
     ) -> None:
         try:
-            await pipeline.stop(is_ended=True)
-        finally:
             await self._release_lease(tenant, meeting_id)
+            await pipeline.stop(is_ended=True)
+        except Exception as exc:
+            logger.warning("Error stopping pipeline %s/%s: %s", tenant, meeting_id, exc)
 
     async def stop(self) -> None:
         """Gracefully stop worker daemon on SIGTERM."""

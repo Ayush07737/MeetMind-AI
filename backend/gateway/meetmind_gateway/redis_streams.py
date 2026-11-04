@@ -98,13 +98,15 @@ class StreamProducer:
         timestamp_ms: int,
         client_seq: int | None = None,
         capture_ts_ms: int | None = None,
+        capture_server_ms: int | None = None,
         recv_ns: int | None = None,
         gap_size: int = 0,
         trace_id: str | None = None,
     ) -> str:
         """Publish an audio chunk to the meeting's audio stream.
 
-        Carries client_seq, capture_ts_ms, recv_ns, published_ns, gap_size, and trace_id.
+        Carries client_seq, capture_ts_ms, capture_server_ms, recv_ns, published_ns,
+        gap_size, and trace_id.
         """
         stream_key = audio_stream_key(tenant_id, meeting_id)
         recv_val = recv_ns if recv_ns is not None else time.perf_counter_ns()
@@ -119,6 +121,11 @@ class StreamProducer:
             "audio_data": audio_data,
             "timestamp_ms": str(timestamp_ms),
             "capture_ts_ms": str(capture_ts_ms if capture_ts_ms is not None else timestamp_ms),
+            "capture_server_ms": str(
+                capture_server_ms
+                if capture_server_ms is not None
+                else (capture_ts_ms if capture_ts_ms is not None else timestamp_ms)
+            ),
             "recv_ns": str(recv_val),
             "published_ns": str(published_val),
         }

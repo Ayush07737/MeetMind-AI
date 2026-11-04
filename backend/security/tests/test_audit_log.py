@@ -12,6 +12,7 @@ docker-compose.dev.yml infrastructure.
 
 import inspect
 
+import pytest
 from meetmind_security.audit_log import AuditEvent, write_audit_event
 
 
@@ -81,3 +82,33 @@ class TestAuditLogAPISurface:
 
     def test_write_audit_event_is_async(self):
         assert inspect.iscoroutinefunction(write_audit_event)
+
+
+class TestAuditHookGuards:
+    """Verify test-hook guards on the append-only audit path (Q-0 P0-3)."""
+
+    @pytest.mark.asyncio
+    async def test_delay_hook_refused_without_asr_test_hooks(self, monkeypatch):
+        monkeypatch.setenv("TEST_AUDIT_STATEMENT_DELAY_SECONDS", "1.0")
+        monkeypatch.delenv("ASR_TEST_HOOKS", raising=False)
+        monkeypatch.setenv("APP_ENV", "development")
+
+        with pytest.raises(RuntimeError, match="requires ASR_TEST_HOOKS=true"):
+            await write_audit_event(
+                tenant_id="test_tenant",
+                user_id="user_1",
+                event_type="test_event",
+            )
+
+    @pytest.mark.asyncio
+    async def test_delay_hook_refused_in_production(self, monkeypatch):
+        monkeypatch.setenv("TEST_AUDIT_STATEMENT_DELAY_SECONDS", "1.0")
+        monkeypatch.setenv("ASR_TEST_HOOKS", "true")
+        monkeypatch.setenv("APP_ENV", "production")
+
+        with pytest.raises(RuntimeError, match="strictly forbidden in production"):
+            await write_audit_event(
+                tenant_id="test_tenant",
+                user_id="user_1",
+                event_type="test_event",
+            )

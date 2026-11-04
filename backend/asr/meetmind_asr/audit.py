@@ -141,6 +141,7 @@ class AsrAuditor:
                         retries,
                         meeting_id,
                         exc,
+                        exc_info=True,
                     )
                     if attempt < retries:
                         await asyncio.sleep(delay)

@@ -75,3 +75,21 @@ This document records the empirical constraints, platform quirks, and architectu
 - **Active TTL Refreshed Per Frame**: In `meetmind_gateway/redis_streams.py`, each `XADD` to `mm:{tenant}:audio:{meeting}` refreshes the key expiration to **900 seconds (15 minutes)**. Because the TTL is refreshed on every individual audio frame received, active streams never expire during transmission.
 - **Retraction**: We explicitly retract the earlier hypothesis that 900s stream TTL expiration or burst ingestion caused the two pipeline freezes observed during early exploratory testing. Later 30-minute benchmark runs (18,000+ frames) repeatedly crossed the 900s mark with zero frame loss, zero stream expiration, and continuous transcript processing. The root cause of the earlier freezes is unknown (two isolated occurrences, both observed prior to disabling incremental sleep).
 - **Inactivity Purging**: The Gateway Janitor task (`janitor.py`) scans for idle meetings where active streaming has halted or listener count drops to 0. If a meeting approaches 900 seconds without activity, it is transitioned to `abandoned`, writing an audit record and purging expired Redis streams.
+
+---
+
+## 7. Finals Cadence and Replay Utterance Count (P0-4a)
+
+### 7.1 Historical Finals Rate Variations Marked UNEXPLAINED
+
+- **Observation**: Early exploratory runs showed ~12.0 finals/minute, whereas standard 30-minute runs replay the 5-minute fixture (`5min_meeting.wav`, 85 finals) 6 times to produce exactly 510 finals (17.0 finals/min).
+- **Status: UNEXPLAINED**: Earlier hypotheses that attributed the ~12.0 rate to "burst ingestion" or "VAD parameter shifts" are unsubstantiated and retracted. Deepgram's streaming endpointing operates on acoustic energy and silence intervals in the audio data, not on wall-clock frame dispatch cadence. Without acoustic comparisons against identical audio fixtures, the historical discrepancy is officially classified as **UNEXPLAINED**.
+
+---
+
+## 8. Interim P50 Latency Match (P0-4a)
+
+### 8.1 Coincidental P50 Latency Across Independent Runs Marked UNEXPLAINED
+
+- **Observation**: Two earlier 30-minute runs reported near-identical interim P50 latencies (597.24 ms and 597.19 ms).
+- **Status: UNEXPLAINED**: The earlier explanation claiming this match was "governed by base network RTT (~123.5ms) and identical chunk cadence" is retracted as speculative. A subsequent owner run on the identical endpoint (`api.in.deepgram.com`) recorded an interim P50 of 585.38 ms with a ping RTT of 61.0 ms. The sub-millisecond match between the earlier runs was coincidental and is officially marked **UNEXPLAINED**.

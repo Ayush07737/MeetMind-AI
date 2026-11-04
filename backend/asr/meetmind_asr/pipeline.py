@@ -544,6 +544,25 @@ class MeetingPipeline:
                 else:
                     self._timeline.meeting_origin_capture_ts = hdr.capture_ts_ms
 
+        # Extract clock sync timing metadata from stream fields (Q1)
+        raw_cap_server = fields.get(b"capture_server_ms") or fields.get("capture_server_ms")
+        capture_server_ms = (
+            int(raw_cap_server.decode() if isinstance(raw_cap_server, bytes) else raw_cap_server)
+            if raw_cap_server
+            else hdr.capture_ts_ms
+        )
+        raw_ts_ms = fields.get(b"timestamp_ms") or fields.get("timestamp_ms")
+        gw_recv_ms = (
+            int(raw_ts_ms.decode() if isinstance(raw_ts_ms, bytes) else raw_ts_ms)
+            if raw_ts_ms
+            else None
+        )
+        if gw_recv_ms is not None and capture_server_ms is not None:
+            gw_recv_ms = max(capture_server_ms, gw_recv_ms)
+        asr_recv_ms = int(time.time() * 1000)
+        if gw_recv_ms is not None:
+            asr_recv_ms = max(gw_recv_ms, asr_recv_ms)
+
         # Create AudioChunk (payload is raw PCM audio bytes)
         chunk = AudioChunk(
             data=payload,
@@ -563,6 +582,9 @@ class MeetingPipeline:
             time.time(),
             time.perf_counter(),
             0.0,
+            capture_server_ms,
+            gw_recv_ms,
+            asr_recv_ms,
         ]
         self._chunk_history.append(hist_entry)
 
@@ -927,25 +949,37 @@ class MeetingPipeline:
                 break
             await asyncio.sleep(0.02)
 
-    def _find_chunk_for_end_ms(self, end_ms: int) -> tuple[int, float, float, float] | None:
-        """Find (client_seq, t_recv_wall, t_recv_perf, t_send_perf) for chunk containing end_ms."""
+    def _find_chunk_for_end_ms(
+        self, end_ms: int
+    ) -> tuple[int, float, float, float, int | None, int | None, int | None] | None:
+        """Find chunk containing or nearest to end_ms.
+
+        Returns (client_seq, t_recv_wall, t_recv_perf, t_send_perf,
+        capture_server_ms, gw_recv_ms, asr_recv_ms).
+        """
         if not self._chunk_history:
             return None
         best_match = None
         min_distance = float("inf")
         for entry in reversed(self._chunk_history):
-            client_seq, c_start, c_end, t_r_wall, t_r_perf, t_s_perf = entry
+            client_seq, c_start, c_end, t_r_wall, t_r_perf, t_s_perf = entry[:6]
+            cap_srv = entry[6] if len(entry) > 6 else None
+            gw_r = entry[7] if len(entry) > 7 else None
+            asr_r = entry[8] if len(entry) > 8 else None
+            match_tuple = (client_seq, t_r_wall, t_r_perf, t_s_perf, cap_srv, gw_r, asr_r)
             if c_start <= end_ms <= c_end:
-                return client_seq, t_r_wall, t_r_perf, t_s_perf
+                return match_tuple
             dist = abs(c_end - end_ms)
             if dist < min_distance:
                 min_distance = dist
-                best_match = (client_seq, t_r_wall, t_r_perf, t_s_perf)
+                best_match = match_tuple
         return best_match
 
     async def _handle_transcript_event(self, event: ProviderEvent) -> None:
         if not event.text or not event.text.strip():
             return
+
+        provider_recv_ms = int(time.time() * 1000)
 
         if getattr(event, "recv_perf", 0.0) > 0 and event.is_final:
             parse_ms = max(0.001, (time.perf_counter() - event.recv_perf) * 1000.0)
@@ -1000,7 +1034,7 @@ class MeetingPipeline:
             )
         self.metrics.record_stage_timing("speaker", (time.perf_counter() - t_spk_0) * 1000.0)
 
-        now_ms = int(time.time() * 1000)
+        now_ms = max(provider_recv_ms, int(time.time() * 1000))
 
         if event.is_final:
             ch = event.channel if event.channel is not None else 0
@@ -1061,6 +1095,9 @@ class MeetingPipeline:
             t_ser_0 = time.perf_counter()
             chunk_match = self._find_chunk_for_end_ms(end_ms)
             chunk_seq = chunk_match[0] if chunk_match else None
+            cap_srv_ms = chunk_match[4] if chunk_match and len(chunk_match) > 4 else None
+            gw_recv_ms = chunk_match[5] if chunk_match and len(chunk_match) > 5 else None
+            asr_recv_ms = chunk_match[6] if chunk_match and len(chunk_match) > 6 else None
             payload = {
                 "utterance_id": uid,
                 "speaker_id": spk_id,
@@ -1083,11 +1120,26 @@ class MeetingPipeline:
                 "late": is_late,
             }
 
+            t0_cap = cap_srv_ms or start_epoch_ms
+            if gw_recv_ms is not None and t0_cap is not None:
+                gw_recv_ms = max(t0_cap, gw_recv_ms)
+            if asr_recv_ms is not None and gw_recv_ms is not None:
+                asr_recv_ms = max(gw_recv_ms, asr_recv_ms)
+            prov_m = max(asr_recv_ms or t0_cap or 0, provider_recv_ms)
+            pub_m = max(prov_m, int(time.time() * 1000))
+            timing = {
+                "t0_capture": t0_cap,
+                "gw_recv": gw_recv_ms,
+                "asr_recv": asr_recv_ms,
+                "provider_msg": prov_m,
+                "asr_pub": pub_m,
+            }
             envelope = {
                 "event_type": "transcript_final",
                 "meeting_id": self.meeting_id,
                 "tenant_id": self.tenant_id,
                 "ts_ms": now_ms,
+                "timing": timing,
                 "payload": payload,
             }
             raw_env = json.dumps(envelope)
@@ -1159,11 +1211,21 @@ class MeetingPipeline:
                 "is_stable": event.is_stable,
             }
 
+            prov_m = max(start_epoch_ms, provider_recv_ms)
+            pub_m = max(prov_m, int(time.time() * 1000))
+            timing = {
+                "t0_capture": start_epoch_ms,
+                "asr_recv": prov_m,
+                "provider_msg": prov_m,
+                "asr_pub": pub_m,
+            }
+
             envelope = {
                 "event_type": "transcript_interim",
                 "meeting_id": self.meeting_id,
                 "tenant_id": self.tenant_id,
                 "ts_ms": now_ms,
+                "timing": timing,
                 "payload": payload,
             }
 

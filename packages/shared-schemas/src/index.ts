@@ -93,6 +93,9 @@ export enum ControlAction {
   MEETING_START = "meeting_start",
   MEETING_END = "meeting_end",
   CONSENT_CONFIRMED = "consent_confirmed",
+  CLOCK_SYNC = "clock_sync",
+  CLOCK_SYNC_REPLY = "clock_sync_reply",
+  CLOCK_REPORT = "clock_report",
 }
 
 export enum MeetingStatus {
@@ -145,10 +148,41 @@ export const ConsentConfirmedControlFrameSchema = z
   })
   .strict();
 
+export const ClockSyncControlFrameSchema = z
+  .object({
+    type: z.literal("control"),
+    action: z.literal("clock_sync"),
+    t1: z.number().int(),
+  })
+  .strict();
+
+export const ClockSyncReplyFrameSchema = z
+  .object({
+    type: z.literal("control"),
+    action: z.literal("clock_sync_reply"),
+    t1: z.number().int(),
+    t2: z.number().int(),
+    t3: z.number().int(),
+  })
+  .strict();
+
+export const ClockReportControlFrameSchema = z
+  .object({
+    type: z.literal("control"),
+    action: z.literal("clock_report"),
+    offset_ms: z.number().int(),
+    rtt_ms: z.number().int(),
+    samples: z.number().int().default(3),
+  })
+  .strict();
+
 export const ControlFrameSchema = z.discriminatedUnion("action", [
   MeetingStartControlFrameSchema,
   MeetingEndControlFrameSchema,
   ConsentConfirmedControlFrameSchema,
+  ClockSyncControlFrameSchema,
+  ClockSyncReplyFrameSchema,
+  ClockReportControlFrameSchema,
 ]);
 export type ControlFrame = z.infer<typeof ControlFrameSchema>;
 
@@ -430,12 +464,42 @@ export const AudioGapPayloadSchema = z.object({
 });
 export type AudioGapPayload = z.infer<typeof AudioGapPayloadSchema>;
 
+export const TIMING_STAGES = [
+  "t0_capture",
+  "gw_recv",
+  "asr_recv",
+  "provider_msg",
+  "asr_pub",
+  "classify_pub",
+  "retrieval_done",
+  "card_pub",
+  "ui_render",
+] as const;
+
+export type TimingStage = (typeof TIMING_STAGES)[number];
+
+export const EventTimingSchema = z
+  .object({
+    t0_capture: z.number().int().optional(),
+    gw_recv: z.number().int().optional(),
+    asr_recv: z.number().int().optional(),
+    provider_msg: z.number().int().optional(),
+    asr_pub: z.number().int().optional(),
+    classify_pub: z.number().int().optional(),
+    retrieval_done: z.number().int().optional(),
+    card_pub: z.number().int().optional(),
+    ui_render: z.number().int().optional(),
+  })
+  .strict();
+export type EventTiming = z.infer<typeof EventTimingSchema>;
+
 export const EventEnvelopeSchema = z.object({
   event_type: z.string(),
   meeting_id: z.string(),
   tenant_id: z.string(),
   ts_ms: z.number().int(),
   trace_id: z.string().optional(),
+  timing: EventTimingSchema.optional(),
   payload: z.record(z.unknown()),
 });
 export type EventEnvelope = z.infer<typeof EventEnvelopeSchema>;
@@ -457,3 +521,5 @@ export const ACTIVE_MEETINGS_SET_KEY = "mm:system:active_meetings";
 export function activeMeetingsSetKey(): string {
   return ACTIVE_MEETINGS_SET_KEY;
 }
+
+export * from "./budget.js";

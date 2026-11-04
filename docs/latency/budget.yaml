@@ -1,0 +1,126 @@
+# MeetMind AI — Latency Budget Specification as Code (Q2)
+#
+# Defines platform quality contracts, stage SLA ceilings, observed cloud measurements,
+# simulated delays for test harnesses, and memory stability limits.
+
+version: "1.0.0"
+
+metadata:
+  title: "MeetMind AI End-to-End Latency & Stability Quality Budget"
+  status: "Accepted Contract"
+  enforcement: "Automated via scripts/budget_check.py and acceptance tests"
+
+constraints:
+  classification:
+    max_p50_ms: 200
+    max_p95_ms: 300
+    technology_constraint: >-
+      Rule-based pattern matching, regex cascades, or lightweight local embeddings (<50ms).
+      Generative LLM API calls strictly prohibited in this stage due to 800ms+ round-trip delays.
+  memory:
+    tracemalloc_headroom_mb: 10.0
+    private_bytes_headroom_mb: 40.0
+    soak_max_meeting_seconds: 3600
+  overhead:
+    max_own_overhead_per_stage_ms: 25.0
+
+stages:
+  interim_text_visible:
+    name: "Interim Transcript Text Visible"
+    owner: "Component #2 (meetmind_asr) + Chrome Extension / Frontend"
+    clock: "t0_capture -> ui_render (interim)"
+    target_p50_ms: 1000
+    target_p95_ms: 2000
+    aspirational_goal_ms: 500
+    status: "Accepted with 500ms aspirational target"
+    observed:
+      p50_ms: 585.38
+      p95_ms: 1596.37
+      date: "2026-11-01"
+      log_path: "logs/bench30.log"
+      note: "Measured on 30-minute Nova-3 stream via India cloud endpoint (api.in.deepgram.com) with 61.0ms WS RTT"
+
+  stable_trigger_text:
+    name: "Stable Trigger Final Transcript Available"
+    owner: "Component #2 (meetmind_asr)"
+    clock: "t0_capture -> asr_pub"
+    target_p50_ms: 1000
+    target_p95_ms: 2000
+    status: "Accepted"
+    observed:
+      p50_ms: 433.57
+      p95_ms: 1929.22
+      service_p95_ms: 4.93
+      date: "2026-11-01"
+      log_path: "logs/bench30.log"
+      note: "Measured on 30-minute run; P95 tail driven by acoustic sentence accumulation before endpointing"
+
+  intent_classification:
+    name: "Real-Time Intent & Category Classification"
+    owner: "Component #6 (meetmind_classifier)"
+    clock: "asr_pub -> classify_pub"
+    target_p50_ms: 200
+    target_p95_ms: 300
+    status: "Contract Ceiling"
+    technology_requirement: "Must execute in <=200ms P50 via deterministic rules or local embedding model; external LLM calls prohibited"
+
+  first_card_tier1:
+    name: "Tier 1 Insight Card Visible (Retrieval Only, Zero LLM)"
+    owner: "Component #7 (meetmind_retrieval) + Client UI"
+    clock: "t0_capture -> card_pub (tier 1)"
+    target_p50_ms: 2000
+    target_p95_ms: 3500
+    status: "Contract Ceiling"
+    description: "Instantaneous factual grounding / verified snippet card delivered directly from vector / graph index without generative synthesis"
+
+  reasoned_card_tier2:
+    name: "Tier 2 Reasoned Insight Card Visible"
+    owner: "Component #8 (meetmind_reasoning) + Client UI"
+    clock: "first_card_pub -> card_pub (tier 2)"
+    target_p50_ms: 2000
+    target_p95_ms: 3000
+    status: "Contract Ceiling"
+    description: "Synthesized multi-turn analytical card following tier 1 card publication"
+
+  action_recommendation:
+    name: "Tier 3 Action Recommendation Card"
+    owner: "Component #9 (meetmind_actions)"
+    clock: "t0_capture -> card_pub (tier 3)"
+    target_p50_ms: 3500
+    target_p95_ms: 5000
+    status: "Contract Ceiling"
+    description: "Prescriptive task/workflow action card presented for user approval"
+
+  external_action_execution:
+    name: "External System Mutation (Jira, Linear, Slack, CRM)"
+    owner: "Component #10 (meetmind_connectors)"
+    clock: "user_approval -> external_api_ack"
+    target_p50_ms: null
+    target_p95_ms: null
+    status: "User-Gated"
+    description: "Explicitly user-approved and visible; zero latency target enforced"
+
+simulated:
+  network_rtt_ms: 60.0
+  gateway_overhead_ms: 5.0
+  asr_provider_delay_ms: 200.0
+  asr_pipeline_overhead_ms: 10.0
+  classifier_delay_ms: 50.0
+  retrieval_delay_ms: 150.0
+  card_publisher_overhead_ms: 10.0
+
+history:
+  - date: "2026-10-31"
+    source: "logs/bench_5min_initial.log"
+    interim_p50_ms: 597.24
+    e2e_p50_ms: 480.12
+    service_p95_ms: 6.54
+    ws_rtt_ms: 73.5
+    note: "Historical initial India 5-minute benchmark"
+  - date: "2026-11-01"
+    source: "logs/bench30.log"
+    interim_p50_ms: 585.38
+    e2e_p50_ms: 433.57
+    service_p95_ms: 4.93
+    ws_rtt_ms: 61.03
+    note: "Authoritative 30-minute continuous run on India cloud endpoint"

@@ -49,7 +49,8 @@ async def test_b13_audit_durability_slow_db(
     schema = gateway_harness.schema_a
     meeting_id = f"mtg_b13_slow_{uuid.uuid4().hex[:8]}"
 
-    # Configure artificial 2.0s delay per audit statement via environment
+    # Configure artificial 2.0s delay per audit statement via environment (behind ASR_TEST_HOOKS)
+    os.environ["ASR_TEST_HOOKS"] = "true"
     os.environ["TEST_AUDIT_STATEMENT_DELAY_SECONDS"] = "2.0"
     try:
         settings = AsrSettings(
@@ -117,12 +118,20 @@ async def test_b13_audit_durability_slow_db(
                 assert ack.get("status") in ("accepted", "acked")
                 await asyncio.sleep(0.04)
 
-            # Ensure worker has activated pipeline before meeting_end
+            # Ensure worker has activated pipeline and processed all chunks before meeting_end
             for _ in range(50):
                 if meeting_id in worker._active_pipelines:
                     break
                 await asyncio.sleep(0.1)
             assert meeting_id in worker._active_pipelines, "Worker did not activate pipeline"
+
+            pipeline = worker._active_pipelines[meeting_id]
+            for _ in range(50):
+                if getattr(pipeline, "_chunks_sent", 0) >= 5:
+                    break
+                await asyncio.sleep(0.1)
+            cnt = getattr(pipeline, "_chunks_sent", 0)
+            assert cnt >= 5, f"Expected chunks_sent >= 5 before meeting_end, got {cnt}"
 
             # End meeting cleanly
             await ws_ingest.send(json.dumps({"type": "control", "action": "meeting_end"}))
@@ -156,18 +165,22 @@ async def test_b13_audit_durability_slow_db(
         assert p["chunks_sent"] >= 5
     finally:
         os.environ.pop("TEST_AUDIT_STATEMENT_DELAY_SECONDS", None)
+        os.environ.pop("ASR_TEST_HOOKS", None)
 
 
 @pytest.mark.asyncio
 async def test_b13_audit_durability_sigterm_flush(
     gateway_harness: ServerHarness,
     real_redis,
+    caplog: pytest.LogCaptureFixture,
 ) -> None:
     """Verify active meeting summary lands in Neon when worker receives SIGTERM mid-stream."""
+    caplog.set_level("WARNING")
     schema = gateway_harness.schema_a
     meeting_id = f"mtg_b13_sigterm_{uuid.uuid4().hex[:8]}"
 
-    # Configure artificial 2.0s delay per audit statement via environment
+    # Configure artificial 2.0s delay per audit statement via environment (behind ASR_TEST_HOOKS)
+    os.environ["ASR_TEST_HOOKS"] = "true"
     os.environ["TEST_AUDIT_STATEMENT_DELAY_SECONDS"] = "2.0"
     try:
         settings = AsrSettings(
@@ -242,6 +255,18 @@ async def test_b13_audit_durability_sigterm_flush(
                 await asyncio.sleep(0.1)
             assert meeting_id in worker._active_pipelines, "Meeting pipeline should be active"
 
+            # Bounded poll on pipeline chunks-sent counter to ensure chunks_sent >= 5 (K1.2)
+            pipeline = worker._active_pipelines[meeting_id]
+            for _ in range(50):
+                if getattr(pipeline, "_chunks_sent", 0) >= 5:
+                    break
+                await asyncio.sleep(0.1)
+            cnt = getattr(pipeline, "_chunks_sent", 0)
+            assert cnt >= 5, f"Expected chunks_sent >= 5 before stop, got {cnt}"
+
+            audio_stream = f"mm:{gateway_harness.tenant_a}:audio:{meeting_id}"
+            pending_before = await real_redis.xlen(audio_stream)
+
             # Simulate SIGTERM by triggering graceful worker.stop() mid-stream
             t_term_start = time.perf_counter()
             await worker.stop()
@@ -251,6 +276,8 @@ async def test_b13_audit_durability_sigterm_flush(
         assert t_term_dur >= 1.9, (
             f"Expected SIGTERM flush >= 2.0s due to slow DB, got {t_term_dur:.2f}s"
         )
+
+        pending_after = await real_redis.xlen(audio_stream)
 
         pool = await db.get_pool()
         rows = await pool.fetch(
@@ -269,5 +296,22 @@ async def test_b13_audit_durability_sigterm_flush(
         assert p["meeting_id"] == meeting_id
         assert p["provider"] == "stub"
         assert p["chunks_sent"] >= 5
+
+        # Diagnostic output for unprocessed stream entries after stop (K1.2)
+        print(
+            f"\n[K1_DIAG] chunks_sent={p['chunks_sent']}, "
+            f"pending_stream_before_stop={pending_before}, "
+            f"pending_stream_after_stop={pending_after}, "
+            f"gaps={p.get('gaps')}"
+        )
+
+        # Assert summary row landed on attempt 1 with NO retry warnings (K1.1)
+        assert "Attempt 1/3 failed writing asr_session_summary" not in caplog.text, (
+            f"Summary writing failed on attempt 1: {caplog.text}"
+        )
+        assert worker.auditor.failed_audit_count == 0, (
+            f"Expected 0 failed audit attempts, got {worker.auditor.failed_audit_count}"
+        )
     finally:
         os.environ.pop("TEST_AUDIT_STATEMENT_DELAY_SECONDS", None)
+        os.environ.pop("ASR_TEST_HOOKS", None)

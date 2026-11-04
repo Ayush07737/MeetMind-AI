@@ -105,10 +105,10 @@ async def test_b9_speaker_names_two_channel_mapping(
         await ws.send(json.dumps({"type": "control", "action": "meeting_end"}))
         assert (await recv_ack())["status"] == "accepted"
 
-    # Wait for processing
+    # Wait for processing (bounded 10s: 100 * 0.1s) until both channel 0 and channel 1 have finals
     ev_key_1 = events_stream_key(gateway_harness.tenant_a, mtg_with_meta)
     finals_1 = []
-    for _ in range(40):
+    for _ in range(100):
         raw_1 = await real_redis.xrange(ev_key_1)
         finals_1 = []
         for _, fields in raw_1:
@@ -117,7 +117,9 @@ async def test_b9_speaker_names_two_channel_mapping(
                 parsed = json.loads(p_raw.decode() if isinstance(p_raw, bytes) else p_raw)
                 if parsed.get("event_type") == "transcript_final":
                     finals_1.append(parsed["payload"])
-        if len(finals_1) >= 2:
+        has_ch0 = any(f.get("channel") == 0 for f in finals_1)
+        has_ch1 = any(f.get("channel") == 1 for f in finals_1)
+        if has_ch0 and has_ch1:
             break
         await asyncio.sleep(0.1)
 

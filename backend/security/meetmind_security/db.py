@@ -29,7 +29,24 @@ logger = logging.getLogger(__name__)
 # Shared singleton router and pool
 _router = TenantRouter()
 _shared_pool: asyncpg.Pool | None = None
-_pool_lock = asyncio.Lock()
+_pool_lock: asyncio.Lock | None = None
+
+
+def _get_pool_lock() -> asyncio.Lock:
+    """Return an asyncio.Lock bound to the current running event loop.
+
+    Prevents cross-event-loop lock contamination across pytest tests or worker restarts.
+    """
+    global _pool_lock
+    try:
+        current_loop = asyncio.get_running_loop()
+    except RuntimeError:
+        current_loop = None
+
+    if _pool_lock is None or getattr(_pool_lock, "_loop", None) is not current_loop:
+        _pool_lock = asyncio.Lock()
+    return _pool_lock
+
 
 # Deprecated module variable kept for test patching backward-compatibility
 _UNSET_SENTINEL = object()
@@ -198,7 +215,7 @@ async def init_db(
 ) -> asyncpg.Pool:
     """Initialize the global shared connection pool using the app role DSN."""
     global _shared_pool
-    async with _pool_lock:
+    async with _get_pool_lock():
         if _shared_pool is not None and not _shared_pool._closed:
             return _shared_pool
 
@@ -242,7 +259,7 @@ async def get_pool(tenant_id: str = "default") -> asyncpg.Pool:
 async def close_db() -> None:
     """Gracefully close the shared connection pool."""
     global _shared_pool
-    async with _pool_lock:
+    async with _get_pool_lock():
         if _shared_pool is not None:
             try:
                 if (

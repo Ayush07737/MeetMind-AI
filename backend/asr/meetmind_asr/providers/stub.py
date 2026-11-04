@@ -182,6 +182,15 @@ class StubProvider(ASRProvider):
 
         # Provider offsets in ms relative to this session
         offset_ms = (self._chunk_count - 1) * 100
+        raw_words = [
+            {
+                "word": w,
+                "start": (offset_ms + idx * 20) / 1000.0,
+                "end": (offset_ms + (idx + 1) * 20) / 1000.0,
+                "confidence": 0.92,
+            }
+            for idx, w in enumerate(words[:interim_word_count])
+        ]
         await self._event_queue.put(
             ProviderEvent(
                 event_type="interim",
@@ -193,6 +202,10 @@ class StubProvider(ASRProvider):
                 channel=interim_ch,
                 is_final=False,
                 is_stable=False,
+                recv_perf=time.perf_counter(),
+                raw={
+                    "channel": {"alternatives": [{"transcript": interim_text, "words": raw_words}]}
+                },
             )
         )
 
@@ -231,6 +244,7 @@ class StubProvider(ASRProvider):
                     channel=final_ch,
                     is_final=True,
                     is_stable=True,
+                    recv_perf=time.perf_counter(),
                 )
             )
 
@@ -258,6 +272,7 @@ class StubProvider(ASRProvider):
                     channel=0,
                     is_final=True,
                     is_stable=True,
+                    recv_perf=time.perf_counter(),
                 )
             )
         self._is_finished = True
