@@ -145,4 +145,3 @@ def test_stamp_and_compute_stage_latencies():
     assert latencies["gw_recv_to_asr_recv"] == 5
     assert latencies["asr_recv_to_asr_pub"] == 70
     assert latencies["e2e_total"] == 100
-
