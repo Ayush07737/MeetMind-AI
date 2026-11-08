@@ -145,3 +145,129 @@ def test_stamp_and_compute_stage_latencies():
     assert latencies["gw_recv_to_asr_recv"] == 5
     assert latencies["asr_recv_to_asr_pub"] == 70
     assert latencies["e2e_total"] == 100
+
+
+def test_clock_clamping_logic():
+    """R6: Gateway clamps capture_server_ms to [gw_recv - max_age, gw_recv] on +-60s errors."""
+    gw_recv_ms = 1_730_000_000_000
+    max_age_ms = 15_000
+
+    def clamp(capture_ts_ms: int, offset_ms: int) -> tuple[int, bool, str]:
+        raw = capture_ts_ms + offset_ms
+        min_allowed = gw_recv_ms - max_age_ms
+        max_allowed = gw_recv_ms
+        if raw < min_allowed:
+            return min_allowed, True, "past_clamp"
+        if raw > max_allowed:
+            return max_allowed, True, "future_clamp"
+        return raw, False, "none"
+
+    # Case 1: Client lies by +60s into the future (offset_ms = +60_000)
+    clamped_val, is_clamped, reason = clamp(capture_ts_ms=gw_recv_ms, offset_ms=60_000)
+    assert is_clamped is True
+    assert reason == "future_clamp"
+    assert clamped_val == gw_recv_ms
+    assert clamped_val <= gw_recv_ms
+
+    # Case 2: Client lies by -60s into the past (offset_ms = -60_000)
+    clamped_val, is_clamped, reason = clamp(capture_ts_ms=gw_recv_ms, offset_ms=-60_000)
+    assert is_clamped is True
+    assert reason == "past_clamp"
+    assert clamped_val == gw_recv_ms - max_age_ms
+    assert clamped_val == gw_recv_ms - 15_000
+
+    # Case 3: Legitimate offset within bounds (-1200ms)
+    legit_ts = gw_recv_ms + 1200
+    clamped_val, is_clamped, reason = clamp(capture_ts_ms=legit_ts, offset_ms=-1200)
+    assert is_clamped is False
+    assert reason == "none"
+    assert clamped_val == gw_recv_ms
+
+
+def test_clock_resync_drift_100ppm():
+    """R6: Client clock drifting 100 ppm over several 60-second resync cycles."""
+    # 100 ppm = 100 microseconds per second = 6 ms per 60 seconds
+    drift_rate_ppm = 100
+    resync_interval_s = 60
+    drift_per_cycle_ms = int(drift_rate_ppm * resync_interval_s / 1000)  # 6ms
+    t_server_start = 1_730_000_000_000
+
+    initial_offset = 500  # Client starts 500ms ahead
+    current_true_offset = initial_offset
+    offset_errors: list[int] = []
+
+    print("\n--- 60-SECOND RESYNC SIMULATION (100 PPM DRIFT) ---")
+    for cycle in range(1, 6):
+        # Time advanced by 60s
+        t_server = t_server_start + (cycle * resync_interval_s * 1000)
+        # Client clock accumulated drift
+        current_true_offset += drift_per_cycle_ms
+
+        # Run 3-probe handshake with simulated 35ms symmetric network delay
+        probes = []
+        for p_idx in range(3):
+            t1 = t_server + current_true_offset + (p_idx * 50)
+            t2 = t_server + (p_idx * 50) + 18
+            t3 = t2 + 2  # 2ms processing
+            t4 = t3 + current_true_offset + 18
+            probes.append(ClockEstimator.compute_probe(t1, t2, t3, t4))
+
+        best = ClockEstimator.select_best_probe(probes)
+        estimated_offset = best["offset_ms"]
+        # Error between estimated offset and negative of true client offset
+        error = abs(estimated_offset - (-current_true_offset))
+        offset_errors.append(error)
+        print(
+            f"Cycle {cycle} (T+{cycle * 60}s): TrueOffset={current_true_offset}ms | "
+            f"EstOffset={estimated_offset}ms | Error={error}ms | RTT={best['rtt_ms']}ms"
+        )
+        assert error <= 2, f"Resync error {error}ms exceeds 2ms tolerance"
+
+    print("----------------------------------------------------\n")
+
+
+def test_clock_estimator_asymmetric_and_jitter_data():
+    """R6: Worst-case offset error with asymmetric delays and jitter against 50ms target."""
+    rng = random.Random(12345)
+    t_server = 1_730_000_000_000
+
+    # 1. Asymmetric: 20ms up / 120ms down (RTT = 140ms)
+    d_up = 20
+    d_down = 120
+    true_offset = 2500
+    t1 = t_server + true_offset
+    t2 = t_server + d_up
+    t3 = t2 + 3
+    t4 = t3 + true_offset + d_down
+    probe_asym = ClockEstimator.compute_probe(t1, t2, t3, t4)
+    # Theoretical error: (d_up - d_down) / 2 = (20 - 120) / 2 = -50ms
+    asym_error = probe_asym["offset_ms"] - (-true_offset)
+
+    print("\n--- ASYMMETRIC DELAY AND JITTER ACCURACY DATA ---")
+    print(f"Asymmetric Delays: Up={d_up}ms, Down={d_down}ms, RTT={probe_asym['rtt_ms']}ms")
+    print(f"Worst-Case Offset Error: {asym_error:+d}ms (Contract target: <= 50ms)")
+    assert abs(asym_error) <= 50
+
+    # 2. Jitter range: 20ms to 150ms over +-3s offsets with 5 probes
+    max_observed_error = 0
+    for test_offset in [-3000, -1500, 0, 1500, 3000]:
+        probes = []
+        for _ in range(5):
+            up = rng.randint(20, 150)
+            down = rng.randint(20, 150)
+            p_t1 = t_server + test_offset
+            p_t2 = t_server + up
+            p_t3 = p_t2 + rng.randint(1, 5)
+            p_t4 = p_t3 + test_offset + down
+            probes.append(ClockEstimator.compute_probe(p_t1, p_t2, p_t3, p_t4))
+
+        best = ClockEstimator.select_best_probe(probes)
+        err = abs(best["offset_ms"] - (-test_offset))
+        max_observed_error = max(max_observed_error, err)
+        print(
+            f"Offset {test_offset:+d}ms: Best RTT={best['rtt_ms']}ms | "
+            f"Est Error={err}ms (MaxErrorBound={best['max_error_ms']}ms)"
+        )
+
+    print(f"Max Error Observed Across Jitter: {max_observed_error}ms")
+    print("-------------------------------------------------\n")

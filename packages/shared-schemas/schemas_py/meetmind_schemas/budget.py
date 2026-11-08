@@ -56,7 +56,9 @@ class MemoryConstraints(BaseModel):
     model_config = ConfigDict(extra="ignore")
 
     tracemalloc_headroom_mb: float = 10.0
+    tracemalloc_reason: str = ""
     private_bytes_headroom_mb: float = 40.0
+    private_bytes_reason: str = ""
     soak_max_meeting_seconds: int = 3600
 
 

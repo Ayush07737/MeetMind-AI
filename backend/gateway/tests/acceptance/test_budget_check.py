@@ -25,12 +25,13 @@ pytestmark = [pytest.mark.integration, pytest.mark.timeout(90)]
 
 @pytest.mark.asyncio
 async def test_budget_check_simulated_pipeline() -> None:
-    """Run live simulated pipeline check through real Gateway and Stub ASR."""
+    """Run live simulated pipeline check through real Gateway and Stub ASR (N=200 utterances)."""
     redis_url = os.environ.get("ACCEPTANCE_REDIS_URL", "redis://127.0.0.1:6379/0")
     passed = await run_budget_check(
-        audio_chunks=15,
+        audio_chunks=1000,
+        target_utterances=200,
         redis_url=redis_url,
-        verbose=False,
+        verbose=True,
     )
     assert passed is True, "Live simulated pipeline budget check failed"
 

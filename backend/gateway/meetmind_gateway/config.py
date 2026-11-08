@@ -56,7 +56,7 @@ class GatewaySettings(BaseSettings):
     # -- Gateway-specific ------------------------------------------------------
     ws_max_frame_bytes: int = 64 * 1024  # 64 KB max per WS frame
     redis_stream_maxlen: int = 6_000  # cap stream length per meeting (10m @ 10 chunk/s, ~19.2 MB)
-    allow_token_in_dev: bool = True
+    allow_token_in_dev: bool = False
     idle_timeout_seconds: float = 30.0
     max_connections_per_user: int = 10
     max_connections_per_tenant: int = 100
@@ -65,6 +65,7 @@ class GatewaySettings(BaseSettings):
     byte_rate_limit: int = 512 * 1024  # 512 KB per sec (sustained)
     burst_byte_limit: int = 1024 * 1024  # 1 MB burst capacity
     ticket_ttl_seconds: int = 30  # K9: ticket expiration TTL
+    clock_max_age_ms: int = 15_000  # R6: Max allowed age for client audio frames (15s)
     gateway_bench_endpoints: bool = False  # P0-1: system benchmark endpoints disabled by default
     gateway_admin_key: str = ""  # P0-1: shared secret admin key for benchmark endpoints
 
@@ -166,6 +167,18 @@ class GatewaySettings(BaseSettings):
             raise ValueError(
                 f"ticket_ttl_seconds must be <= 30 per K9 security invariant, "
                 f"got {self.ticket_ttl_seconds}"
+            )
+
+        env_allowed = self.app_env.strip().lower() in ("dev", "test", "development")
+        if self.gateway_bench_endpoints and not env_allowed:
+            raise ValueError(
+                f"GATEWAY_BENCH_ENDPOINTS is forbidden when APP_ENV={self.app_env!r}. "
+                "Only explicit allowlist ('dev', 'test') environments are permitted."
+            )
+        if self.allow_token_in_dev and not env_allowed:
+            raise ValueError(
+                f"ALLOW_TOKEN_IN_DEV is forbidden when APP_ENV={self.app_env!r}. "
+                "Only explicit allowlist ('dev', 'test') environments are permitted."
             )
 
         return self

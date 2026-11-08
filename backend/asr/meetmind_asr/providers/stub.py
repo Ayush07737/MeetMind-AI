@@ -78,6 +78,15 @@ class StubProvider(ASRProvider):
         self._current_text_idx = 0
         self._chunk_buffer: list[AudioChunk] = []
 
+    def _get_phrase(self, idx: int) -> str:
+        """Get phrase for utterance idx, generating diverse phrases past the initial script."""
+        if self._scripted_phrases and idx < len(self._scripted_phrases):
+            return self._scripted_phrases[idx]
+        return (
+            f"Meeting agenda topic_{idx} review_{idx} target_{idx} milestone_{idx} "
+            f"deliverable_{idx} schedule_{idx} budget_{idx} team_{idx} status_{idx}"
+        )
+
     def _load_env_faults(self) -> None:
         """Allow configuring faults via env or JSON string."""
         raw_json = os.environ.get("ASR_STUB_FAULT_CONFIG")
@@ -170,7 +179,7 @@ class StubProvider(ASRProvider):
         if self._fault_config.latency_ms > 0:
             await asyncio.sleep(self._fault_config.latency_ms / 1000.0)
 
-        phrase = self._scripted_phrases[self._current_text_idx % len(self._scripted_phrases)]
+        phrase = self._get_phrase(self._current_text_idx)
         words = phrase.split()
 
         # Emit interim event on every chunk
@@ -282,3 +291,13 @@ class StubProvider(ASRProvider):
     async def close(self) -> None:
         self._is_open = False
         await self._event_queue.put(ProviderEvent(event_type="closed"))
+
+    def _debug_drop_connection(self) -> None:
+        """Testing hook for fault injection (matches DeepgramProvider interface)."""
+        self._is_open = False
+        self._event_queue.put_nowait(
+            ProviderEvent(
+                event_type="closed",
+                error="Simulated provider connection dropped",
+            )
+        )

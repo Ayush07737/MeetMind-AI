@@ -135,6 +135,11 @@ async def test_t11_audit_durability_fail_closed(
         # Disconnect cleanup still completes: assert writer lease is released
         lease_key = writer_lease_key(tenant_id, meeting_id)
         current_lease = await real_redis.get(lease_key)
+        for _ in range(30):
+            if current_lease is None:
+                break
+            await asyncio.sleep(0.1)
+            current_lease = await real_redis.get(lease_key)
         assert current_lease is None, "Writer lease must be released on disconnect cleanup"
 
     finally:

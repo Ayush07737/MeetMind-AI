@@ -39,7 +39,9 @@ export type ClassificationConstraints = z.infer<typeof ClassificationConstraints
 
 export const MemoryConstraintsSchema = z.object({
   tracemalloc_headroom_mb: z.number().default(10.0),
+  tracemalloc_reason: z.string().default(""),
   private_bytes_headroom_mb: z.number().default(40.0),
+  private_bytes_reason: z.string().default(""),
   soak_max_meeting_seconds: z.number().default(3600),
 });
 export type MemoryConstraints = z.infer<typeof MemoryConstraintsSchema>;

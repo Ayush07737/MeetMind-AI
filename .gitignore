@@ -64,4 +64,8 @@ scratch/
 logs/
 tests/fixtures/audio/generated/
 ml/asr_eval/recordings/
+ml/eval/audio/synthetic/**/*.wav
+ml/eval/audio/synthetic/*.wav
+ml/eval/audio/real/**/*.wav
+ml/eval/audio/real/*.wav
 .scratch_py313/

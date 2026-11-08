@@ -1,0 +1,123 @@
+{
+  "valid_clock_sync": [
+    {
+      "type": "control",
+      "action": "clock_sync",
+      "t1": 1793880000000
+    }
+  ],
+  "invalid_clock_sync": [
+    {
+      "description": "Missing t1 field",
+      "frame": {
+        "type": "control",
+        "action": "clock_sync"
+      }
+    },
+    {
+      "description": "Extra unexpected field in clock_sync",
+      "frame": {
+        "type": "control",
+        "action": "clock_sync",
+        "t1": 1793880000000,
+        "unexpected": "bad"
+      }
+    }
+  ],
+  "valid_clock_sync_reply": [
+    {
+      "type": "control",
+      "action": "clock_sync_reply",
+      "t1": 1793880000000,
+      "t2": 1793880000010,
+      "t3": 1793880000015
+    }
+  ],
+  "invalid_clock_sync_reply": [
+    {
+      "description": "Missing t3 field",
+      "frame": {
+        "type": "control",
+        "action": "clock_sync_reply",
+        "t1": 1793880000000,
+        "t2": 1793880000010
+      }
+    }
+  ],
+  "valid_clock_report": [
+    {
+      "type": "control",
+      "action": "clock_report",
+      "offset_ms": 2500,
+      "rtt_ms": 42
+    }
+  ],
+  "invalid_clock_report": [
+    {
+      "description": "Missing offset_ms",
+      "frame": {
+        "type": "control",
+        "action": "clock_report",
+        "rtt_ms": 42
+      }
+    },
+    {
+      "description": "Missing rtt_ms",
+      "frame": {
+        "type": "control",
+        "action": "clock_report",
+        "offset_ms": 2500
+      }
+    }
+  ],
+  "valid_event_timing": [
+    {
+      "t0_capture": 1793880000000,
+      "gw_recv": 1793880000020,
+      "asr_recv": 1793880000030,
+      "provider_msg": 1793880000150,
+      "asr_pub": 1793880000160,
+      "classify_pub": 1793880000200,
+      "retrieval_done": 1793880000350,
+      "card_pub": 1793880000360,
+      "ui_render": 1793880000400
+    },
+    {
+      "t0_capture": 1793880000000,
+      "gw_recv": 1793880000020,
+      "asr_pub": 1793880000160
+    }
+  ],
+  "invalid_event_timing_monotonic": [
+    {
+      "description": "gw_recv earlier than t0_capture",
+      "timing": {
+        "t0_capture": 1793880000100,
+        "gw_recv": 1793880000050,
+        "asr_recv": 1793880000200
+      },
+      "violating_stage": "gw_recv"
+    },
+    {
+      "description": "asr_pub earlier than provider_msg",
+      "timing": {
+        "t0_capture": 1793880000000,
+        "gw_recv": 1793880000010,
+        "asr_recv": 1793880000020,
+        "provider_msg": 1793880000200,
+        "asr_pub": 1793880000180
+      },
+      "violating_stage": "asr_pub"
+    }
+  ],
+  "invalid_event_timing_extra_field": [
+    {
+      "description": "Extra unexpected field violates strict schema",
+      "timing": {
+        "t0_capture": 1793880000000,
+        "gw_recv": 1793880000020,
+        "unknown_stage": 1793880000050
+      }
+    }
+  ]
+}

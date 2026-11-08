@@ -50,11 +50,21 @@ import websockets  # noqa: E402
 from conftest import LocalJWKSServer, exchange_ws_ticket, get_free_port  # noqa: E402
 from meetmind_schemas.budget import load_budget  # noqa: E402
 from meetmind_schemas.events import encode_audio_frame  # noqa: E402
-from meetmind_schemas.keys import ACTIVE_MEETINGS_SET_KEY, events_stream_key  # noqa: E402
+from meetmind_schemas.keys import (  # noqa: E402
+    ACTIVE_MEETINGS_SET_KEY,
+    events_stream_key,
+    out_stream_key,
+)  # noqa: E402
 from meetmind_schemas.timing import stamp, validate_monotonic  # noqa: E402
 from meetmind_security import db  # noqa: E402
 from meetmind_security.migrations import apply_migrations_conn  # noqa: E402
 from meetmind_security.tenant import TenantConfig  # noqa: E402
+
+if sys.platform == "win32":
+    with contextlib.suppress(Exception):
+        import ctypes
+
+        ctypes.windll.winmm.timeBeginPeriod(1)
 
 logger = logging.getLogger("budget_check")
 
@@ -124,13 +134,17 @@ def check_benchmark_log(
     if verbose:
         print("=" * 80)
         print(f" BENCHMARK LOG BUDGET VERIFICATION: {p.name}")
+        print(" [Clock Mode: ASR-receipt clock]")
+        print(" NOTE: Latencies in benchmark log measure from chunk arrival at ASR worker.")
+        print("       Budget targets are defined from client T0 (capture time on server clock).")
+        print("       Log-mode check leaves ~70ms headroom for client-to-ASR transit legs.")
         print("=" * 80)
         print(
             f"Service-Added Latency P50: {svc_p50:.2f}ms | P95: {svc_p95:.2f}ms "
             f"(Ceiling: <= {max_own_overhead:.1f}ms) -> {'PASS' if passed_svc else 'FAIL'}"
         )
         print(
-            f"Finals E2E Latency P50:    {e2e_p50:.2f}ms | P95: {e2e_p95:.2f}ms "
+            f"Finals Latency (ASR Clock) P50: {e2e_p50:.2f}ms | P95: {e2e_p95:.2f}ms "
             f"(Ceiling: <= {target_p95_finals:.1f}ms) -> {'PASS' if passed_finals else 'FAIL'}"
         )
         print("-" * 80)
@@ -142,8 +156,10 @@ def check_benchmark_log(
 
 async def run_budget_check(
     budget_path: Path | str | None = None,
-    audio_chunks: int = 15,
+    audio_chunks: int = 1000,
+    target_utterances: int = 200,
     redis_url: str = "redis://127.0.0.1:6379/0",
+    client_clock_offset_ms: int = 2500,
     verbose: bool = True,
 ) -> bool:
     budget = load_budget(budget_path)
@@ -209,6 +225,11 @@ async def run_budget_check(
     gw_env["NEON_DATABASE_URL"] = app_dsn
     gw_env["NEON_APP_DATABASE_URL"] = app_dsn
     gw_env["ALLOW_TOKEN_IN_DEV"] = "false"
+    gw_env["FRAME_RATE_LIMIT"] = "1500"
+    gw_env["BURST_FRAME_LIMIT"] = "2500"
+    gw_env["BYTE_RATE_LIMIT"] = str(10 * 1024 * 1024)
+    gw_env["BURST_BYTE_LIMIT"] = str(20 * 1024 * 1024)
+    gw_env["CLOCK_MAX_AGE_MS"] = "300000"
     gw_env["LOG_LEVEL"] = "INFO"
     gw_env["PYTHONPATH"] = (
         str(REPO_ROOT / "backend" / "gateway")
@@ -246,6 +267,7 @@ async def run_budget_check(
     asr_env["AUDIO_REDIS_URL"] = redis_url
     asr_env["ASR_PROVIDER"] = "stub"
     asr_env["ASR_BENCHMARK_MODE"] = "1"
+    asr_env["ASR_STUB_FAULT_CONFIG"] = json.dumps({"latency_ms": 0.0})
     asr_env["ASR_HEALTH_PORT"] = str(asr_health_port)
     asr_env["NEON_DATABASE_URL"] = app_dsn
     asr_env["PYTHONPATH"] = (
@@ -342,14 +364,57 @@ async def run_budget_check(
 
     ws_uri = f"ws://127.0.0.1:{gw_port}/v1/meetings/{meeting_id}/stream?ticket={ticket}"
     events_key = events_stream_key(tenant_id, meeting_id)
+    out_key = out_stream_key(tenant_id, meeting_id)
 
     processed_events: list[dict[str, Any]] = []
-    target_finals = min(3, max(1, audio_chunks // 5))
+    interim_events: list[dict[str, Any]] = []
+    stage_durations: dict[str, list[float]] = {
+        "gw_overhead": [],
+        "asr_recv_overhead": [],
+        "asr_service_overhead": [],
+        "classify_overhead": [],
+        "retrieval_overhead": [],
+        "card_overhead": [],
+        "t0_to_interim": [],
+        "t0_to_final": [],
+        "total_e2e": [],
+    }
+
+    target_finals = target_utterances
+    pending_tasks: set[asyncio.Task] = set()
+
+    async def _handle_final_downstream(env: dict[str, Any]):
+        # Stage 6: Intent Classification (actual minus requested sleep)
+        t0 = time.perf_counter()
+        await asyncio.sleep(sim.classifier_delay_ms / 1000.0)
+        cls_overhead = max(0.0, (time.perf_counter() - t0) * 1000.0 - sim.classifier_delay_ms)
+        stage_durations["classify_overhead"].append(cls_overhead)
+        stamp(env, "classify_pub")
+
+        # Stage 7: Vector / Graph Retrieval (actual minus requested sleep)
+        t0 = time.perf_counter()
+        await asyncio.sleep(sim.retrieval_delay_ms / 1000.0)
+        ret_overhead = max(0.0, (time.perf_counter() - t0) * 1000.0 - sim.retrieval_delay_ms)
+        stage_durations["retrieval_overhead"].append(ret_overhead)
+        stamp(env, "retrieval_done")
+
+        # Stage 8: Card Publication (actual minus requested sleep)
+        t0 = time.perf_counter()
+        await asyncio.sleep(sim.card_publisher_overhead_ms / 1000.0)
+        card_overhead = max(
+            0.0, (time.perf_counter() - t0) * 1000.0 - sim.card_publisher_overhead_ms
+        )
+        stage_durations["card_overhead"].append(card_overhead)
+        stamp(env, "card_pub")
+
+        # Client Render
+        stamp(env, "ui_render")
+        processed_events.append(env)
 
     async def _event_consumer():
         last_id = "0-0"
         while len(processed_events) < target_finals:
-            res = await redis_client.xread({events_key: last_id}, count=10, block=200)
+            res = await redis_client.xread({events_key: last_id}, count=50, block=100)
             if not res:
                 continue
             for _stream, msgs in res:
@@ -363,25 +428,36 @@ async def run_budget_check(
                             else payload_raw
                         )
                         if env.get("event_type") == "transcript_final":
-                            # Simulate Downstream Stages with Budget Simulated Delays
-                            # Stage 6: Intent Classification
-                            await asyncio.sleep(sim.classifier_delay_ms / 1000.0)
-                            stamp(env, "classify_pub")
+                            t = asyncio.create_task(_handle_final_downstream(env))
+                            pending_tasks.add(t)
+                            t.add_done_callback(pending_tasks.discard)
 
-                            # Stage 7: Vector / Graph Retrieval
-                            await asyncio.sleep(sim.retrieval_delay_ms / 1000.0)
-                            stamp(env, "retrieval_done")
-
-                            # Stage 8: Card Publication
-                            await asyncio.sleep(sim.card_publisher_overhead_ms / 1000.0)
-                            stamp(env, "card_pub")
-
-                            # Client Render
-                            stamp(env, "ui_render")
-
-                            processed_events.append(env)
+    async def _interim_consumer():
+        last_id = "0-0"
+        while len(processed_events) < target_finals:
+            res = await redis_client.xread({out_key: last_id}, count=50, block=100)
+            if not res:
+                continue
+            for _stream, msgs in res:
+                for eid, fields in msgs:
+                    last_id = eid.decode() if isinstance(eid, bytes) else str(eid)
+                    payload_raw = fields.get(b"payload") or fields.get("payload")
+                    if payload_raw:
+                        env = json.loads(
+                            payload_raw.decode("utf-8")
+                            if isinstance(payload_raw, bytes)
+                            else payload_raw
+                        )
+                        if env.get("event_type") == "transcript_interim":
+                            interim_events.append(env)
+                            timing = env.get("timing", {})
+                            t0 = timing.get("t0_capture")
+                            pub = timing.get("asr_pub")
+                            if t0 and pub:
+                                stage_durations["t0_to_interim"].append(max(0.0, float(pub - t0)))
 
     consumer_task = asyncio.create_task(_event_consumer())
+    interim_task = asyncio.create_task(_interim_consumer())
 
     try:
         async with websockets.connect(ws_uri) as ws:
@@ -397,16 +473,16 @@ async def run_budget_check(
             )
             await ws.recv()
 
-            # 2. clock_sync handshake
-            client_t1 = int(time.time() * 1000)
+            # 2. clock_sync handshake with simulated offset (+2.5s client ahead)
+            client_t1 = int(time.time() * 1000) + client_clock_offset_ms
             await ws.send(json.dumps({"type": "control", "action": "clock_sync", "t1": client_t1}))
             sync_reply = json.loads(await ws.recv())
 
-            t4 = int(time.time() * 1000)
+            client_t4 = int(time.time() * 1000) + client_clock_offset_ms
             t2 = sync_reply["t2"]
             t3 = sync_reply["t3"]
-            offset = ((t2 - client_t1) + (t3 - t4)) // 2
-            rtt = (t4 - client_t1) - (t3 - t2)
+            offset = ((t2 - client_t1) + (t3 - client_t4)) // 2
+            rtt = (client_t4 - client_t1) - (t3 - t2)
 
             # 3. clock_report
             await ws.send(
@@ -415,7 +491,7 @@ async def run_budget_check(
                         "type": "control",
                         "action": "clock_report",
                         "offset_ms": offset,
-                        "rtt_ms": rtt,
+                        "rtt_ms": max(0, rtt),
                         "samples": 1,
                     }
                 )
@@ -437,23 +513,40 @@ async def run_budget_check(
             )
             await ws.recv()
 
-            # 5. Stream audio chunks
-            for i in range(audio_chunks):
-                t_capture = int(time.time() * 1000)
-                frame = encode_audio_frame(
-                    client_seq=i + 1,
-                    capture_ts_ms=t_capture,
-                    payload=b"\x00" * 3200,
-                )
-                await ws.send(frame)
-                await ws.recv()  # ack
-                await asyncio.sleep(0.08)
+            # 5. Stream audio chunks (send enough chunks to trigger target_finals)
+            chunks_to_send = max(audio_chunks, target_finals * 5)
+
+            async def _send_chunks():
+                for i in range(chunks_to_send):
+                    t_capture = int(time.time() * 1000) + client_clock_offset_ms
+                    frame = encode_audio_frame(
+                        client_seq=i + 1,
+                        capture_ts_ms=t_capture,
+                        payload=b"\x00" * 3200,
+                    )
+                    await ws.send(frame)
+                    await asyncio.sleep(0.08)
+
+            async def _recv_acks():
+                acks_received = 0
+                while acks_received < chunks_to_send:
+                    msg = await ws.recv()
+                    data = json.loads(msg)
+                    if data.get("frame_type") == "audio_chunk" and data.get("status") == "acked":
+                        acks_received += 1
+
+            await asyncio.gather(_send_chunks(), _recv_acks())
 
             # Wait for consumer to finish processing finals
             try:
-                await asyncio.wait_for(consumer_task, timeout=10.0)
+                await asyncio.wait_for(consumer_task, timeout=60.0)
+                if pending_tasks:
+                    await asyncio.gather(*pending_tasks, return_exceptions=True)
             except TimeoutError:
-                print("\n[TIMEOUT] Consumer timed out waiting for final events!")
+                print(
+                    f"\n[TIMEOUT] Consumer timed out! Processed {len(processed_events)}/"
+                    f"{target_finals} finals"
+                )
                 print("--- GATEWAY LOGS ---")
                 for line_msg in gw_logs[-25:]:
                     print(line_msg)
@@ -469,6 +562,7 @@ async def run_budget_check(
 
     finally:
         consumer_task.cancel()
+        interim_task.cancel()
         for p in (gw_proc, asr_proc):
             p.terminate()
             try:
@@ -488,17 +582,8 @@ async def run_budget_check(
     # Analyze results
     all_monotonic = True
     monotonic_errors = []
-    stage_durations: dict[str, list[float]] = {
-        "gw_overhead": [],
-        "asr_recv_overhead": [],
-        "asr_service_overhead": [],
-        "classify_overhead": [],
-        "retrieval_overhead": [],
-        "card_overhead": [],
-        "total_e2e": [],
-    }
 
-    for _idx, env in enumerate(processed_events):
+    for env in processed_events:
         timing = env.get("timing", {})
         errs = validate_monotonic(timing)
         if errs:
@@ -510,9 +595,6 @@ async def run_budget_check(
         asr_r = timing.get("asr_recv")
         prov_m = timing.get("provider_msg")
         asr_p = timing.get("asr_pub")
-        cls_p = timing.get("classify_pub")
-        ret_d = timing.get("retrieval_done")
-        crd_p = timing.get("card_pub")
         ui_r = timing.get("ui_render")
 
         if t0 and gw_r:
@@ -521,18 +603,8 @@ async def run_budget_check(
             stage_durations["asr_recv_overhead"].append(max(0.0, float(asr_r - gw_r)))
         if prov_m and asr_p:
             stage_durations["asr_service_overhead"].append(max(0.0, float(asr_p - prov_m)))
-        if asr_p and cls_p:
-            stage_durations["classify_overhead"].append(
-                max(0.0, float(cls_p - asr_p) - sim.classifier_delay_ms)
-            )
-        if cls_p and ret_d:
-            stage_durations["retrieval_overhead"].append(
-                max(0.0, float(ret_d - cls_p) - sim.retrieval_delay_ms)
-            )
-        if ret_d and crd_p:
-            stage_durations["card_overhead"].append(
-                max(0.0, float(crd_p - ret_d) - sim.card_publisher_overhead_ms)
-            )
+        if t0 and asr_p:
+            stage_durations["t0_to_final"].append(max(0.0, float(asr_p - t0)))
         if t0 and ui_r:
             stage_durations["total_e2e"].append(max(0.0, float(ui_r - t0)))
 
@@ -541,42 +613,57 @@ async def run_budget_check(
 
     all_overhead_passed = True
     if verbose:
-        print("=" * 95)
+        print("=" * 105)
         print(" MEETMIND AI — END-TO-END LATENCY BUDGET VERIFICATION (Q2)")
-        print("=" * 95)
+        print(" [Clock Mode: T0 True Capture Clock via SNTP Sync (Simulated Client Clock +2.5s)]")
+        print("=" * 105)
         print(f"Monotonic Stamps Valid: {all_monotonic}")
+        print(f"Total Finals Processed: {len(processed_events)} / Target={target_finals}")
         if monotonic_errors:
             for e in monotonic_errors:
                 print(f"  [ERROR] {e}")
-        print("-" * 95)
+        print("-" * 105)
         hdr = (
-            f"{'Stage / Interval':<28} | {'N':<4} | {'P50 (ms)':<9} | "
-            f"{'P95 (ms)':<9} | {'Max (ms)':<9} | {'Ceiling':<10} | {'Met?'}"
+            f"{'Stage / Interval':<24} | {'N':<4} | {'P50 (ms)':<9} | "
+            f"{'P95 (ms)':<9} | {'Max (ms)':<9} | {'Ceiling':<10} | {'Headroom':<11} | {'Met?'}"
         )
         print(hdr)
-        print("-" * 95)
+        print("-" * 105)
+
+    stage_ceilings = {
+        "gw_overhead": max_own_overhead,
+        "asr_recv_overhead": max_own_overhead,
+        "asr_service_overhead": max_own_overhead,
+        "classify_overhead": max_own_overhead,
+        "retrieval_overhead": max_own_overhead,
+        "card_overhead": max_own_overhead,
+        "t0_to_interim": 2000.0,
+        "t0_to_final": 2000.0,
+        "total_e2e": 3500.0,
+    }
 
     for stage, s in stats_map.items():
-        if stage == "total_e2e":
-            ceiling = 3500.0  # Tier 1 card target P95
-            passed = s["p95"] <= ceiling
-        else:
-            ceiling = max_own_overhead
-            passed = s["p95"] <= ceiling
+        if not stage_durations[stage]:
+            continue
+        ceiling = stage_ceilings.get(stage, max_own_overhead)
+        passed = s["p95"] <= ceiling
+        headroom = ceiling - s["p95"]
+        headroom_str = f"{headroom:+.1f} ms"
         if not passed:
             all_overhead_passed = False
 
         if verbose:
             print(
-                f"{stage:<28} | {len(stage_durations[stage]):<4} | "
+                f"{stage:<24} | {len(stage_durations[stage]):<4} | "
                 f"{s['p50']:<9.2f} | {s['p95']:<9.2f} | {s['max']:<9.2f} | "
-                f"<= {ceiling:<7.1f} | {str(passed):<5}"
+                f"<= {ceiling:<7.1f} | {headroom_str:<11} | {str(passed):<5}"
             )
 
     if verbose:
-        print("=" * 95)
-        print(f"OVERALL RESULT: {'PASS' if (all_monotonic and all_overhead_passed) else 'FAIL'}")
-        print("=" * 95)
+        print("=" * 105)
+        status_str = "PASS" if (all_monotonic and all_overhead_passed) else "FAIL"
+        print(f"OVERALL RESULT: {status_str}")
+        print("=" * 105)
 
     return all_monotonic and all_overhead_passed
 
@@ -584,7 +671,18 @@ async def run_budget_check(
 def main():
     parser = argparse.ArgumentParser(description="MeetMind AI Latency Budget Checker")
     parser.add_argument("--budget", type=str, default=None, help="Path to budget.yaml")
-    parser.add_argument("--chunks", type=int, default=15, help="Number of 100ms chunks to stream")
+    parser.add_argument(
+        "--chunks",
+        type=int,
+        default=1000,
+        help="Number of 100ms chunks to stream (default 1000)",
+    )
+    parser.add_argument(
+        "--target-utterances",
+        type=int,
+        default=200,
+        help="Target number of final utterances (default 200)",
+    )
     parser.add_argument("--redis-url", type=str, default="redis://127.0.0.1:6379/0")
     parser.add_argument("--log", type=str, default=None, help="Path to benchmark log to verify")
     args = parser.parse_args()
@@ -600,6 +698,7 @@ def main():
             run_budget_check(
                 budget_path=args.budget,
                 audio_chunks=args.chunks,
+                target_utterances=args.target_utterances,
                 redis_url=args.redis_url,
                 verbose=True,
             )

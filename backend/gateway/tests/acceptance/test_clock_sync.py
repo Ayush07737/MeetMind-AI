@@ -186,3 +186,82 @@ async def test_gateway_clock_synchronization_and_skew_correction(
             assert payload["previous_offset_ms"] == -2500
             assert payload["new_offset_ms"] == -1800
             assert payload["delta_ms"] == 700
+
+        # Step 7: Send audio frame with extreme offset (+60s into future, R6)
+        await ws.send(
+            json.dumps(
+                {
+                    "type": "control",
+                    "action": "clock_report",
+                    "offset_ms": 60_000,
+                    "rtt_ms": 40,
+                    "samples": 3,
+                }
+            )
+        )
+        await ws.recv()
+
+        t_send_future = int(datetime.now(UTC).timestamp() * 1000)
+        frame_future = encode_audio_frame(
+            client_seq=2,
+            capture_ts_ms=t_send_future,
+            payload=b"\x00" * 3200,
+        )
+        await ws.send(frame_future)
+        await ws.recv()
+
+        # Verify Redis stream entry 2 has capture_server_ms clamped to <= gw_recv
+        entries = await real_redis.xrange(stream_key, "-", "+")
+        assert len(entries) == 2
+        entry_2_fields = entries[1][1]
+        raw_cap_srv_2 = entry_2_fields.get(b"capture_server_ms") or entry_2_fields.get(
+            "capture_server_ms"
+        )
+        cap_srv_2 = int(
+            raw_cap_srv_2.decode() if isinstance(raw_cap_srv_2, bytes) else raw_cap_srv_2
+        )
+        assert cap_srv_2 < t_send_future + 50_000
+        assert abs(cap_srv_2 - t_send_future) <= 2000
+
+        # Step 8: Send audio frame with extreme offset (-60s into past, R6)
+        await ws.send(
+            json.dumps(
+                {
+                    "type": "control",
+                    "action": "clock_report",
+                    "offset_ms": -60_000,
+                    "rtt_ms": 40,
+                    "samples": 3,
+                }
+            )
+        )
+        await ws.recv()
+
+        t_send_past = int(datetime.now(UTC).timestamp() * 1000)
+        frame_past = encode_audio_frame(
+            client_seq=3,
+            capture_ts_ms=t_send_past,
+            payload=b"\x00" * 3200,
+        )
+        await ws.send(frame_past)
+        await ws.recv()
+
+        entries = await real_redis.xrange(stream_key, "-", "+")
+        assert len(entries) == 3
+        entry_3_fields = entries[2][1]
+        raw_cap_srv_3 = entry_3_fields.get(b"capture_server_ms") or entry_3_fields.get(
+            "capture_server_ms"
+        )
+        cap_srv_3 = int(
+            raw_cap_srv_3.decode() if isinstance(raw_cap_srv_3, bytes) else raw_cap_srv_3
+        )
+        assert cap_srv_3 > t_send_past - 30_000
+        assert abs(cap_srv_3 - (t_send_past - 15_000)) <= 2000
+
+        # Verify clock_clamped audit event in Neon
+        async with h.tenant_conn(tenant_id) as conn:
+            rows = await conn.fetch(
+                f'SELECT event_type, payload FROM "{h.schema_a}".audit_events '
+                f"WHERE event_type = 'clock_clamped' ORDER BY id DESC"
+            )
+            assert len(rows) >= 1
