@@ -13,10 +13,12 @@ from __future__ import annotations
 
 from unittest.mock import AsyncMock, MagicMock, patch
 
+import pytest
 from fastapi.testclient import TestClient
 from meetmind_gateway.app import create_app
 from meetmind_gateway.auth import AuthenticatedUser
 from meetmind_gateway.config import GatewaySettings
+from pydantic import ValidationError
 
 
 def test_bench_endpoints_disabled_by_default() -> None:
@@ -43,7 +45,20 @@ def test_bench_endpoints_disabled_by_default() -> None:
 
 
 def test_bench_endpoints_production_forces_off() -> None:
-    settings = GatewaySettings(
+    # Per S0-6, GatewaySettings refuses to instantiate when benchmark endpoints
+    # are enabled in production
+    with pytest.raises(ValidationError):
+        GatewaySettings(
+            app_env="production",
+            clerk_jwks_url="https://clerk.meetmind.ai/.well-known/jwks.json",
+            clerk_issuer="https://clerk.meetmind.ai",
+            allowed_origins=["https://meetmind.ai"],
+            gateway_bench_endpoints=True,
+            gateway_admin_key="supersecret",
+        )
+
+    # Even if constructed directly bypassing validation, endpoint handler returns 404
+    settings = GatewaySettings.model_construct(
         app_env="production",
         clerk_jwks_url="https://clerk.meetmind.ai/.well-known/jwks.json",
         clerk_issuer="https://clerk.meetmind.ai",

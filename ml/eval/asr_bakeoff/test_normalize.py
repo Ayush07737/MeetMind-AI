@@ -1,6 +1,5 @@
 """Unit tests for shared ASR evaluation normalizer (B4)."""
 
-import pytest
 from ml.eval.asr_bakeoff.normalize import (
     compute_normalized_wer,
     compute_numeric_token_error_rate,
@@ -16,7 +15,9 @@ def test_lowercase_and_punctuation():
 
 
 def test_currency_and_fused_tokens():
-    text = "The ARR is INR 12 crore, whereas Rs. 150 crore was projected. Inr12 and rs150 are valid."
+    text = (
+        "The ARR is INR 12 crore, whereas Rs. 150 crore was projected. Inr12 and rs150 are valid."
+    )
     norm = normalize_text(text)
     assert "inr 12 crore" in norm
     assert "inr 150 crore" in norm
@@ -74,4 +75,3 @@ def test_nter_mismatch():
     assert res["nter"] == 1.0
     assert res["correct"] == 0
     assert res["missing"] == 1
-

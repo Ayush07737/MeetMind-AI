@@ -24,12 +24,6 @@
       "role": "Legal Counsel / Director"
     }
   },
-  "variants": [
-    "clean",
-    "noise_15db",
-    "telephony_8khz",
-    "speed_1_15x",
-    "two_channel"
-  ],
+  "variants": ["clean", "noise_15db", "telephony_8khz", "speed_1_15x", "two_channel"],
   "owner_verified_count": 0
 }

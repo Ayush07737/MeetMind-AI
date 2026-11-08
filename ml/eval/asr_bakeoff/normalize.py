@@ -14,7 +14,8 @@ Rules:
 4. Spoken to Digits Number Normalization:
    - "zero".."nineteen", "twenty".."ninety" mapped to integer strings.
    - Compound words: "twenty five" -> "25".
-   - Indian denominations: "lakh", "lakhs", "lac", "lacs" -> "lakh"; "crore", "crores", "cr" -> "crore".
+   - Indian denominations: "lakh", "lakhs", "lac", "lacs" -> "lakh";
+     "crore", "crores", "cr" -> "crore".
    - Western denominations: "thousand", "million", "billion" preserved or canonicalized.
    - Percentages: "percent", "pct", "%" -> "percent".
    - Basis points: "basis points", "bps" -> "bps".
@@ -175,16 +176,17 @@ def extract_canonical_numbers(text: str) -> list[dict[str, Any]]:
                     i += 1
 
             # Look ahead for trailing currency if not set
-            if unit == "COUNT" and i + 1 < len(tokens):
-                if tokens[i + 1] in ("inr", "usd"):
-                    unit = tokens[i + 1].upper()
-                    i += 1
+            if unit == "COUNT" and i + 1 < len(tokens) and tokens[i + 1] in ("inr", "usd"):
+                unit = tokens[i + 1].upper()
+                i += 1
 
-            numbers.append({
-                "raw_token": tok,
-                "canonical_value": val * mult,
-                "unit": unit,
-            })
+            numbers.append(
+                {
+                    "raw_token": tok,
+                    "canonical_value": val * mult,
+                    "unit": unit,
+                }
+            )
         except ValueError:
             pass
 
@@ -220,8 +222,8 @@ def compute_normalized_wer(reference: str, hypothesis: str) -> float:
             else:
                 dp[i][j] = min(
                     dp[i - 1][j - 1] + 1,  # substitution
-                    dp[i - 1][j] + 1,      # deletion
-                    dp[i][j - 1] + 1,      # insertion
+                    dp[i - 1][j] + 1,  # deletion
+                    dp[i][j - 1] + 1,  # insertion
                 )
 
     return float(dp[r_len][h_len]) / float(r_len)
@@ -233,7 +235,13 @@ def compute_numeric_token_error_rate(reference: str, hypothesis: str) -> dict[st
     hyp_nums = extract_canonical_numbers(hypothesis)
 
     if not ref_nums:
-        return {"nter": 0.0, "total_ref_numbers": 0, "correct": 0, "missing": 0, "extra": len(hyp_nums)}
+        return {
+            "nter": 0.0,
+            "total_ref_numbers": 0,
+            "correct": 0,
+            "missing": 0,
+            "extra": len(hyp_nums),
+        }
 
     # Match based on (canonical_value, unit)
     matched = 0
@@ -265,4 +273,3 @@ def compute_numeric_token_error_rate(reference: str, hypothesis: str) -> dict[st
         "missing": total_ref - matched,
         "extra": len(hyp_copy),
     }
-

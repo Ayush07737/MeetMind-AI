@@ -801,8 +801,11 @@ async def _authenticate_ws(
     authenticator: ClerkAuthenticator,
     redis_client: Any,
     expected_role: str,
+    settings: GatewaySettings | None = None,
 ) -> AuthenticatedUser | None:
     """Authenticate WebSocket connection via one-time ticket or dev token."""
+    if settings is None:
+        settings = getattr(ws.app.state, "settings", None) or get_settings()
     ticket = ws.query_params.get("ticket")
     if ticket:
         ticket_key = ws_ticket_key(ticket)
@@ -873,7 +876,10 @@ async def _authenticate_ws(
             await ws.accept()
             await ws.close(
                 code=WSCloseCode.UNAUTHORIZED,
-                reason="Direct token authentication forbidden outside dev/test with allow_token_in_dev=True",
+                reason=(
+                    "Direct token authentication forbidden outside dev/test "
+                    "with allow_token_in_dev=True"
+                ),
             )
             return None
         try:
@@ -924,7 +930,12 @@ async def websocket_ingest(
 
     # 1. Authenticate
     user = await _authenticate_ws(
-        ws, meeting_id, authenticator, redis_client, expected_role="ingest"
+        ws,
+        meeting_id,
+        authenticator,
+        redis_client,
+        expected_role="ingest",
+        settings=settings,
     )
     if not user:
         return
@@ -1211,7 +1222,12 @@ async def websocket_listen(
 
     # 1. Authenticate (must have role="listen" or valid dev token)
     user = await _authenticate_ws(
-        ws, meeting_id, authenticator, redis_client, expected_role="listen"
+        ws,
+        meeting_id,
+        authenticator,
+        redis_client,
+        expected_role="listen",
+        settings=settings,
     )
     if not user:
         return

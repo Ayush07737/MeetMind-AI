@@ -510,7 +510,8 @@ class MeetingPipeline:
             return
 
         # Beyond the backlog limit: detect client_seq jump and publish ONE audio_gap event
-        # Sequence tracking must be strictly monotonic across provider reconnects and retransmits (S0-12)
+        # Sequence tracking must be strictly monotonic across provider reconnects and
+        # retransmits (S0-12)
         if self._last_seen_seq is None:
             self._last_seen_seq = hdr.client_seq
             self._last_seen_capture_ts_ms = hdr.capture_ts_ms
@@ -519,7 +520,9 @@ class MeetingPipeline:
                 gap_chunks = hdr.client_seq - (self._last_seen_seq + 1)
                 from_seq = self._last_seen_seq + 1
                 to_seq = hdr.client_seq - 1
-                cap_start = self._last_seen_capture_ts_ms or (hdr.capture_ts_ms - (gap_chunks * 100))
+                cap_start = self._last_seen_capture_ts_ms or (
+                    hdr.capture_ts_ms - (gap_chunks * 100)
+                )
                 cap_end = hdr.capture_ts_ms
                 gap_info = {
                     "from_seq": from_seq,

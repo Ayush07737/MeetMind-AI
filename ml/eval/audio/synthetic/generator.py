@@ -21,9 +21,7 @@ import asyncio
 import hashlib
 import json
 import math
-import os
 import random
-import sys
 import wave
 from pathlib import Path
 from typing import Any
@@ -31,12 +29,12 @@ from typing import Any
 import edge_tts
 import miniaudio
 
-# Ensure local imports work
+try:
+    from ml.eval.audio.synthetic.scenarios import SCENARIOS, VOICE_MAP
+except ImportError:
+    from scenarios import SCENARIOS, VOICE_MAP  # type: ignore
+
 SCRIPT_DIR = Path(__file__).resolve().parent
-sys.path.insert(0, str(SCRIPT_DIR))
-
-from scenarios import SCENARIOS, VOICE_MAP
-
 DATA_DIR = SCRIPT_DIR / "data"
 MANIFEST_PATH = SCRIPT_DIR / "manifest.jsonl"
 SHA256_MANIFEST_PATH = SCRIPT_DIR / "MANIFEST_SHA256.json"
@@ -70,7 +68,9 @@ def read_pcm16_samples(wav_path: Path) -> list[int]:
         return list(arr)
 
 
-def write_pcm16_samples(samples: list[int], wav_path: Path, sample_rate: int = 16000, nchannels: int = 1) -> None:
+def write_pcm16_samples(
+    samples: list[int], wav_path: Path, sample_rate: int = 16000, nchannels: int = 1
+) -> None:
     wav_path.parent.mkdir(parents=True, exist_ok=True)
     clamped = [max(-32768, min(32767, int(s))) for s in samples]
     arr = array.array("h", clamped)

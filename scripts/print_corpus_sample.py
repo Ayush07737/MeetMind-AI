@@ -19,7 +19,7 @@ def main():
         print(f"[ERROR] Manifest not found at {MANIFEST_PATH}. Run generator.py first.")
         return
 
-    with open(MANIFEST_PATH, "r", encoding="utf-8") as f:
+    with open(MANIFEST_PATH, encoding="utf-8") as f:
         records = [json.loads(line) for line in f if line.strip()]
 
     print("=" * 80)
@@ -32,11 +32,12 @@ def main():
     sampled = rng.sample(records, sample_size)
 
     for i, r in enumerate(sampled, 1):
-        print(f"\n[{i:02d}/20] Variant: {r.get('variant')} | Speaker: {r.get('speaker')} ({r.get('voice')})")
+        spk_str = f"Speaker: {r.get('speaker')} ({r.get('voice')})"
+        print(f"\n[{i:02d}/20] Variant: {r.get('variant')} | {spk_str}")
         print(f"      Scenario: {r.get('scenario')} | Turn #{r.get('turn_index')}")
         print(f"      Audio Path: {r.get('audio_path')}")
         print(f"      Timing: [{r.get('start_ms')}ms -> {r.get('end_ms')}ms]")
-        print(f"      Text: \"{r.get('spoken_text')}\"")
+        print(f'      Text: "{r.get("spoken_text")}"')
         if r.get("canonical_numbers"):
             print(f"      Canonical Numbers: {r.get('canonical_numbers')}")
         if r.get("entities"):
@@ -49,4 +50,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-

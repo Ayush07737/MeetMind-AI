@@ -5,7 +5,8 @@ Official Documentation References:
 - Official URL: https://docs.sarvam.ai/api-reference/audio-streaming
 - Access Date: 2026-11-06
 - WebSocket Endpoint: wss://api.sarvam.ai/v1/audio/transcribe/stream
-- Languages: Hindi, English, Bengali, Gujarati, Kannada, Malayalam, Marathi, Odia, Punjabi, Tamil, Telugu
+- Languages: Hindi, English, Bengali, Gujarati, Kannada, Malayalam, Marathi,
+  Odia, Punjabi, Tamil, Telugu
 - Regional Processing: India (ap-south-1 / Mumbai local infrastructure)
 - Pricing Source A: Official website (₹0.25/min = ~$0.0030/min = ~$0.18/audio hour)
 - Pricing Source B: Marketplace/Cloud listing ($0.0050/min = ~$0.30/audio hour)
@@ -15,8 +16,8 @@ from __future__ import annotations
 
 import asyncio
 import logging
-from typing import Any
 from collections.abc import AsyncIterator
+from typing import Any
 
 from ..base import (
     ASRProvider,
@@ -51,7 +52,11 @@ class SarvamProvider(ASRProvider):
         self.session = session
         self._is_open = True
         self._is_finished = False
-        logger.info("SarvamProvider session opened for %s (language=%s)", session.meeting_id, session.language)
+        logger.info(
+            "SarvamProvider session opened for %s (language=%s)",
+            session.meeting_id,
+            session.language,
+        )
 
     async def send_audio(self, chunk: AudioChunk) -> None:
         if not self._is_open:
@@ -72,4 +77,3 @@ class SarvamProvider(ASRProvider):
     async def close(self) -> None:
         self._is_open = False
         await self._event_queue.put(ProviderEvent(event_type="closed"))
-

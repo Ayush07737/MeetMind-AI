@@ -18,7 +18,6 @@ Metrics:
 from __future__ import annotations
 
 import argparse
-import asyncio
 import json
 import os
 import random
@@ -26,8 +25,6 @@ from pathlib import Path
 from typing import Any
 
 from normalize import (
-    compute_normalized_wer,
-    compute_numeric_token_error_rate,
     normalize_text,
 )
 
@@ -84,24 +81,33 @@ def compute_entity_error_rate(ref_entities: list[str], hypothesis: str) -> dict[
 
 def main():
     parser = argparse.ArgumentParser(description="MeetMind AI ASR Bake-off Evaluation Runner")
-    parser.add_argument("--provider", type=str, default="stub", choices=["stub", "deepgram_nova3", "flux", "sarvam", "openai"])
-    parser.add_argument("--variant", type=str, default="clean", choices=["all", "clean", "noise_15db", "telephony_8khz", "speed_1_15x", "two_channel"])
-    parser.add_argument("--limit", type=int, default=None, help="Limit number of segments evaluated")
+    parser.add_argument(
+        "--provider",
+        type=str,
+        default="stub",
+        choices=["stub", "deepgram_nova3", "flux", "sarvam", "openai"],
+    )
+    parser.add_argument(
+        "--variant",
+        type=str,
+        default="clean",
+        choices=["all", "clean", "noise_15db", "telephony_8khz", "speed_1_15x", "two_channel"],
+    )
+    parser.add_argument(
+        "--limit", type=int, default=None, help="Limit number of segments evaluated"
+    )
     args = parser.parse_args()
 
     if not MANIFEST_PATH.exists():
         print(f"[ERROR] Manifest not found at {MANIFEST_PATH}. Run generator.py first.")
         return
 
-    with open(MANIFEST_PATH, "r", encoding="utf-8") as f:
+    with open(MANIFEST_PATH, encoding="utf-8") as f:
         all_records = [json.loads(line) for line in f if line.strip()]
 
-    records = [
-        r for r in all_records
-        if args.variant == "all" or r.get("variant") == args.variant
-    ]
+    records = [r for r in all_records if args.variant == "all" or r.get("variant") == args.variant]
     if args.limit:
-        records = records[:args.limit]
+        records = records[: args.limit]
 
     print("=" * 80)
     print(" PRELIMINARY (SYNTHETIC ONLY) — ASR PROVIDER BAKE-OFF BENCHMARK")
@@ -121,9 +127,11 @@ def main():
         print("[STATUS: NOT RUN] DEEPGRAM_API_KEY environment variable is not set.")
         return
 
-    print("Harness ready. Awaiting owner confirmation of 30-minute stats run before live API execution.")
+    print(
+        "Harness ready. Awaiting owner confirmation of 30-minute stats run "
+        "before live API execution."
+    )
 
 
 if __name__ == "__main__":
     main()
-

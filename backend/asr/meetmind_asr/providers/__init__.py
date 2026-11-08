@@ -21,7 +21,7 @@ def get_provider(name: str, **kwargs: Any) -> ASRProvider:
     import os
 
     if name in ("flux", "sarvam", "openai"):
-        if not (os.environ.get("ASR_EXPERIMENTAL_PROVIDERS", "").lower() in ("true", "1")):
+        if os.environ.get("ASR_EXPERIMENTAL_PROVIDERS", "").lower() not in ("true", "1"):
             raise RuntimeError(
                 f"Provider '{name}' is experimental and requires ASR_EXPERIMENTAL_PROVIDERS=true"
             )

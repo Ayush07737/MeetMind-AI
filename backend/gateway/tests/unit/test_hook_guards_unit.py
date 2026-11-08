@@ -15,11 +15,10 @@ import os
 from unittest.mock import patch
 
 import pytest
-from pydantic import ValidationError
-
 from meetmind_asr.config import AsrSettings
 from meetmind_gateway.config import GatewaySettings
 from meetmind_security.audit_log import write_audit_event
+from pydantic import ValidationError
 
 
 def test_hook_defaults_are_safe_by_default() -> None:
@@ -42,7 +41,7 @@ def test_hook_defaults_are_safe_by_default() -> None:
 
 @pytest.mark.parametrize("forbidden_env", ["production", "prod", "staging", "", "qa", "preview"])
 def test_gateway_bench_endpoints_forbidden_outside_allowlist(forbidden_env: str) -> None:
-    """GatewaySettings must raise ValidationError if gateway_bench_endpoints is enabled outside allowlist."""
+    """GatewaySettings must raise ValidationError if bench endpoints are enabled outside."""
     with pytest.raises(ValidationError) as exc:
         GatewaySettings(
             app_env=forbidden_env,
@@ -57,7 +56,7 @@ def test_gateway_bench_endpoints_forbidden_outside_allowlist(forbidden_env: str)
 
 @pytest.mark.parametrize("forbidden_env", ["production", "prod", "staging", "", "qa", "preview"])
 def test_gateway_allow_token_in_dev_forbidden_outside_allowlist(forbidden_env: str) -> None:
-    """GatewaySettings must raise ValidationError if allow_token_in_dev is enabled outside allowlist."""
+    """GatewaySettings must raise ValidationError if allow_token_in_dev is enabled outside."""
     with pytest.raises(ValidationError) as exc:
         GatewaySettings(
             app_env=forbidden_env,

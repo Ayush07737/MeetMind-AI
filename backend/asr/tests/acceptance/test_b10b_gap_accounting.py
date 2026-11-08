@@ -2,7 +2,8 @@
 
 Verifies three real-Redis compliance invariants:
 1. Mid-stream provider reconnect with no client skip produces asr_session_summary gaps == [].
-2. A genuine client skip of N chunks produces exactly one gap with correct bounds and gap_chunks == N.
+2. A genuine client skip of N chunks produces exactly one gap with correct bounds and
+   gap_chunks == N.
 3. Two separate client skips produce two non-overlapping, strictly ordered gap ranges.
 """
 
@@ -35,7 +36,8 @@ async def _fetch_summary_payload(meeting_id: str, schema: str) -> dict | None:
             conn = await asyncpg.connect(dsn, timeout=10.0)
             try:
                 rows = await conn.fetch(
-                    f"SELECT payload FROM {schema}.audit_events WHERE event_type = 'asr_session_summary' AND payload->>'meeting_id' = $1",
+                    f"SELECT payload FROM {schema}.audit_events "
+                    "WHERE event_type = 'asr_session_summary' AND payload->>'meeting_id' = $1",
                     meeting_id,
                 )
                 if rows:
@@ -56,11 +58,10 @@ async def test_b10b_gap_accounting_reconnect_zero_loss(
     real_redis,
 ) -> None:
     """Invariant 1: Provider reconnect with no client skips must produce gaps == []."""
-    tenant_id = gateway_harness.tenant_a
     meeting_id = f"mtg_gap1_{uuid.uuid4().hex[:8]}"
 
     # Start ASR worker with test hooks enabled so we can trigger provider reconnect
-    worker = await asr_worker_factory(
+    await asr_worker_factory(
         provider="stub",
         extra_env={"ASR_TEST_HOOKS": "true", "APP_ENV": "test"},
     )
@@ -71,7 +72,9 @@ async def test_b10b_gap_accounting_reconnect_zero_loss(
     _, ticket_resp = await exchange_ws_ticket(
         gateway_harness.http_url, token, meeting_id, role="ingest"
     )
-    ws_uri = f"{gateway_harness.ws_url}/v1/meetings/{meeting_id}/stream?ticket={ticket_resp['ticket']}"
+    ws_uri = (
+        f"{gateway_harness.ws_url}/v1/meetings/{meeting_id}/stream?ticket={ticket_resp['ticket']}"
+    )
 
     async with websockets.connect(ws_uri) as ws:
         await ws.send(
@@ -108,7 +111,9 @@ async def test_b10b_gap_accounting_reconnect_zero_loss(
             await asyncio.sleep(0.02)
 
         # Trigger mid-stream provider reconnect via control loop hook
-        await real_redis.xadd("mm:system:asr_control", {"action": "drop_provider", "meeting_id": meeting_id})
+        await real_redis.xadd(
+            "mm:system:asr_control", {"action": "drop_provider", "meeting_id": meeting_id}
+        )
         await asyncio.sleep(0.5)
 
         # Stream chunks 11..20 continuously
@@ -128,7 +133,9 @@ async def test_b10b_gap_accounting_reconnect_zero_loss(
     assert summary_payload["chunks_sent"] >= 20
     assert summary_payload["reconnects"] >= 1
     # INVARIANT: zero client skips means gaps must be strictly empty!
-    assert summary_payload["gaps"] == [], f"Expected zero gaps on provider reconnect, got: {summary_payload['gaps']}"
+    assert summary_payload["gaps"] == [], (
+        f"Expected zero gaps on provider reconnect, got: {summary_payload['gaps']}"
+    )
 
 
 @pytest.mark.asyncio
@@ -138,7 +145,6 @@ async def test_b10b_gap_accounting_single_client_skip(
     real_redis,
 ) -> None:
     """Invariant 2: A genuine client skip of N chunks produces exactly one gap."""
-    tenant_id = gateway_harness.tenant_a
     meeting_id = f"mtg_gap2_{uuid.uuid4().hex[:8]}"
 
     await asr_worker_factory(provider="stub")
@@ -149,7 +155,9 @@ async def test_b10b_gap_accounting_single_client_skip(
     _, ticket_resp = await exchange_ws_ticket(
         gateway_harness.http_url, token, meeting_id, role="ingest"
     )
-    ws_uri = f"{gateway_harness.ws_url}/v1/meetings/{meeting_id}/stream?ticket={ticket_resp['ticket']}"
+    ws_uri = (
+        f"{gateway_harness.ws_url}/v1/meetings/{meeting_id}/stream?ticket={ticket_resp['ticket']}"
+    )
 
     async with websockets.connect(ws_uri) as ws:
         await ws.send(
@@ -210,7 +218,6 @@ async def test_b10b_gap_accounting_two_non_overlapping_skips(
     real_redis,
 ) -> None:
     """Invariant 3: Two separate client skips produce two non-overlapping, ordered ranges."""
-    tenant_id = gateway_harness.tenant_a
     meeting_id = f"mtg_gap3_{uuid.uuid4().hex[:8]}"
 
     await asr_worker_factory(provider="stub")
@@ -221,7 +228,9 @@ async def test_b10b_gap_accounting_two_non_overlapping_skips(
     _, ticket_resp = await exchange_ws_ticket(
         gateway_harness.http_url, token, meeting_id, role="ingest"
     )
-    ws_uri = f"{gateway_harness.ws_url}/v1/meetings/{meeting_id}/stream?ticket={ticket_resp['ticket']}"
+    ws_uri = (
+        f"{gateway_harness.ws_url}/v1/meetings/{meeting_id}/stream?ticket={ticket_resp['ticket']}"
+    )
 
     async with websockets.connect(ws_uri) as ws:
         await ws.send(
@@ -286,4 +295,6 @@ async def test_b10b_gap_accounting_two_non_overlapping_skips(
     assert gaps[1]["to_seq"] == 14
     assert gaps[1]["gap_chunks"] == 5
 
-    assert gaps[0]["to_seq"] < gaps[1]["from_seq"], "Gaps must be strictly non-overlapping and sorted"
+    assert gaps[0]["to_seq"] < gaps[1]["from_seq"], (
+        "Gaps must be strictly non-overlapping and sorted"
+    )

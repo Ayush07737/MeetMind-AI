@@ -13,8 +13,6 @@ import argparse
 import array
 import hashlib
 import json
-import math
-import sys
 import wave
 from pathlib import Path
 
@@ -90,16 +88,19 @@ def main():
     parser = argparse.ArgumentParser(description="Prepare & Ingest Real Audio for MeetMind AI Eval")
     parser.add_argument("--input-audio", type=Path, required=True, help="Path to raw audio file")
     parser.add_argument("--scenario", type=str, required=True, help="Scenario name")
-    parser.add_argument("--variant", type=str, default="real_quiet", choices=["real_quiet", "real_noisy"])
-    parser.add_argument("--speaker", type=str, required=True, help="Speaker identifier (speaker_0, etc.)")
-    parser.add_argument("--transcript", type=str, required=True, help="Reference transcript text or text file path")
+    parser.add_argument(
+        "--variant", type=str, default="real_quiet", choices=["real_quiet", "real_noisy"]
+    )
+    parser.add_argument(
+        "--speaker", type=str, required=True, help="Speaker identifier (speaker_0, etc.)"
+    )
+    parser.add_argument(
+        "--transcript", type=str, required=True, help="Reference transcript text or text file path"
+    )
     args = parser.parse_args()
 
     t_path = Path(args.transcript)
-    if t_path.exists():
-        text = t_path.read_text(encoding="utf-8")
-    else:
-        text = args.transcript
+    text = t_path.read_text(encoding="utf-8") if t_path.exists() else args.transcript
 
     ingest_audio(
         input_path=args.input_audio,
@@ -112,4 +113,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-

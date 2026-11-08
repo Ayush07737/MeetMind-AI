@@ -31,6 +31,7 @@ def test_settings() -> GatewaySettings:
         clerk_publishable_key="pk_test_key",
         default_tenant_id="test_tenant",
         app_env="development",
+        allow_token_in_dev=True,
     )
 
 

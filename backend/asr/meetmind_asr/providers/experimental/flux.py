@@ -13,11 +13,9 @@ Official Documentation References:
 from __future__ import annotations
 
 import asyncio
-import json
 import logging
-import time
-from typing import Any
 from collections.abc import AsyncIterator
+from typing import Any
 
 from ..base import (
     ASRProvider,
@@ -75,4 +73,3 @@ class FluxProvider(ASRProvider):
     async def close(self) -> None:
         self._is_open = False
         await self._event_queue.put(ProviderEvent(event_type="closed"))
-

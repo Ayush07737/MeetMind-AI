@@ -4,7 +4,6 @@ Verifies that experimental adapters under backend/asr/meetmind_asr/providers/exp
 cannot be selected unless ASR_EXPERIMENTAL_PROVIDERS=true.
 """
 
-import os
 import pytest
 from meetmind_asr.providers import get_provider
 
@@ -40,4 +39,3 @@ def test_experimental_providers_instantiate_with_flag(monkeypatch):
     openai_p = get_provider("openai")
     assert openai_p is not None
     assert openai_p.__class__.__name__ == "OpenAIStreamingProvider"
-

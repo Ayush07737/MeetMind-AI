@@ -73,7 +73,8 @@ async def write_audit_event(
         app_env = (os.environ.get("APP_ENV") or os.environ.get("ENVIRONMENT", "")).strip().lower()
         if app_env not in ("dev", "test", "development"):
             raise RuntimeError(
-                f"TEST_AUDIT_STATEMENT_DELAY_SECONDS is forbidden when APP_ENV={app_env!r}. "
+                f"TEST_AUDIT_STATEMENT_DELAY_SECONDS is forbidden "
+                f"(strictly forbidden in production) when APP_ENV={app_env!r}. "
                 "Only explicit allowlist ('dev', 'test') environments are permitted."
             )
         test_hooks_enabled = os.environ.get("ASR_TEST_HOOKS", "false").lower() in (
