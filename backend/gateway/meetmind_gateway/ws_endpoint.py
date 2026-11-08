@@ -140,10 +140,11 @@ class ConnectionContext:
         # Gateway added latency tracker (spans frame receipt to awaited XADD completion)
         self.gateway_latencies_ms: list[float] = []
 
-        # Clock synchronization state (Q1 Spec §3, §4)
+        # Clock synchronization state (Q1 Spec §3, §4, R6)
         self.clock_offset_ms: int = 0
         self.clock_rtt_ms: int = 0
         self.has_clock_sync: bool = False
+        self.clock_clamped_count: int = 0
 
     def mark_closed(self) -> None:
         self.is_closed = True
@@ -493,7 +494,41 @@ async def _handle_audio_chunk(
 
     # 3. Publish to Redis stream mm:{tenant}:audio:{meeting}
     t_recv = recv_ns if recv_ns is not None else time.perf_counter_ns()
-    capture_server_ms = capture_ts_ms + ctx.clock_offset_ms
+    gw_recv_ms = int(datetime.now(UTC).timestamp() * 1000)
+    raw_capture_server_ms = capture_ts_ms + ctx.clock_offset_ms
+    max_age_ms = getattr(ctx.settings, "clock_max_age_ms", 15_000)
+    min_allowed = gw_recv_ms - max_age_ms
+    max_allowed = gw_recv_ms
+
+    clamped = False
+    clamp_reason = ""
+    if raw_capture_server_ms < min_allowed:
+        capture_server_ms = min_allowed
+        clamped = True
+        clamp_reason = "past_clamp"
+    elif raw_capture_server_ms > max_allowed:
+        capture_server_ms = max_allowed
+        clamped = True
+        clamp_reason = "future_clamp"
+    else:
+        capture_server_ms = raw_capture_server_ms
+
+    if clamped:
+        ctx.clock_clamped_count += 1
+        if ctx.clock_clamped_count <= 5 or ctx.clock_clamped_count % 100 == 0:
+            from .audit import audit_clock_clamped
+
+            await audit_clock_clamped(
+                tenant_id=ctx.session.tenant_id,
+                user_id=ctx.session.user_id,
+                meeting_id=ctx.meeting_id,
+                raw_capture_server_ms=raw_capture_server_ms,
+                clamped_capture_server_ms=capture_server_ms,
+                gw_recv_ms=gw_recv_ms,
+                max_age_ms=max_age_ms,
+                reason=clamp_reason,
+            )
+
     try:
         await ctx.stream_producer.publish_audio(
             meeting_id=ctx.meeting_id,
@@ -509,6 +544,7 @@ async def _handle_audio_chunk(
             recv_ns=t_recv,
             gap_size=gap_size,
             trace_id=ctx.trace_id,
+            clock_clamped=clamped,
         )
         t_pub = time.perf_counter_ns()
         ctx.gateway_latencies_ms.append((t_pub - t_recv) / 1_000_000.0)
@@ -829,9 +865,17 @@ async def _authenticate_ws(
             )
             return None
 
-    # Fallback to token query param (dev/test only)
+    # Fallback to token query param (dev/test only, strictly gated)
     token = ws.query_params.get("token", "")
     if token:
+        env_allowed = settings.app_env.strip().lower() in ("dev", "test", "development")
+        if not (settings.allow_token_in_dev and env_allowed):
+            await ws.accept()
+            await ws.close(
+                code=WSCloseCode.UNAUTHORIZED,
+                reason="Direct token authentication forbidden outside dev/test with allow_token_in_dev=True",
+            )
+            return None
         try:
             user = await authenticator.authenticate(token)
             cid = ws.query_params.get("client_instance_id") or str(uuid.uuid4())

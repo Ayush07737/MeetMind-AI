@@ -178,3 +178,30 @@ async def audit_clock_skew_detected(
             "rtt_ms": rtt_ms,
         },
     )
+
+
+async def audit_clock_clamped(
+    *,
+    tenant_id: str,
+    user_id: str,
+    meeting_id: str,
+    raw_capture_server_ms: int,
+    clamped_capture_server_ms: int,
+    gw_recv_ms: int,
+    max_age_ms: int,
+    reason: str,
+) -> None:
+    """Log clock clamping event (retried, R6)."""
+    await _retry_audit_write(
+        tenant_id=tenant_id,
+        user_id=user_id,
+        event_type="clock_clamped",
+        payload={
+            "meeting_id": meeting_id,
+            "raw_capture_server_ms": raw_capture_server_ms,
+            "clamped_capture_server_ms": clamped_capture_server_ms,
+            "gw_recv_ms": gw_recv_ms,
+            "max_age_ms": max_age_ms,
+            "reason": reason,
+        },
+    )

@@ -510,24 +510,31 @@ class MeetingPipeline:
             return
 
         # Beyond the backlog limit: detect client_seq jump and publish ONE audio_gap event
-        if self._last_seen_seq is not None and hdr.client_seq > self._last_seen_seq + 1:
-            gap_chunks = hdr.client_seq - (self._last_seen_seq + 1)
-            from_seq = self._last_seen_seq + 1
-            to_seq = hdr.client_seq - 1
-            cap_start = self._last_seen_capture_ts_ms or (hdr.capture_ts_ms - (gap_chunks * 100))
-            cap_end = hdr.capture_ts_ms
-            gap_info = {
-                "from_seq": from_seq,
-                "to_seq": to_seq,
-                "gap_chunks": gap_chunks,
-                "capture_start_ms": cap_start,
-                "capture_end_ms": cap_end,
-            }
-            self._detected_gaps.append(gap_info)
-            await self._emit_audio_gap_event(gap_info)
+        # Sequence tracking must be strictly monotonic across provider reconnects and retransmits (S0-12)
+        if self._last_seen_seq is None:
+            self._last_seen_seq = hdr.client_seq
+            self._last_seen_capture_ts_ms = hdr.capture_ts_ms
+        elif hdr.client_seq > self._last_seen_seq:
+            if hdr.client_seq > self._last_seen_seq + 1:
+                gap_chunks = hdr.client_seq - (self._last_seen_seq + 1)
+                from_seq = self._last_seen_seq + 1
+                to_seq = hdr.client_seq - 1
+                cap_start = self._last_seen_capture_ts_ms or (hdr.capture_ts_ms - (gap_chunks * 100))
+                cap_end = hdr.capture_ts_ms
+                gap_info = {
+                    "from_seq": from_seq,
+                    "to_seq": to_seq,
+                    "gap_chunks": gap_chunks,
+                    "capture_start_ms": cap_start,
+                    "capture_end_ms": cap_end,
+                }
+                self._detected_gaps.append(gap_info)
+                await self._emit_audio_gap_event(gap_info)
 
-        self._last_seen_seq = hdr.client_seq
-        self._last_seen_capture_ts_ms = hdr.capture_ts_ms
+            self._last_seen_seq = hdr.client_seq
+            self._last_seen_capture_ts_ms = hdr.capture_ts_ms
+        # If hdr.client_seq <= self._last_seen_seq: retransmit or replay chunk.
+        # NEVER move self._last_seen_seq backwards.
 
         # Ensure meeting origin capture timestamp is anchored consistently across workers
         if self._timeline.meeting_origin_capture_ts is None:

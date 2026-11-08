@@ -814,6 +814,45 @@ async def run_benchmark(
 
     collector_task = asyncio.create_task(_internal_bus_collector())
 
+    # Continuous lightweight network probe (R7): TCP RTT every 5s to target_host
+    probe_log_path = Path("logs") / f"network_probe_{meeting_id}.jsonl"
+    probe_log_path.parent.mkdir(parents=True, exist_ok=True)
+
+    async def _network_probe_loop() -> None:
+        if provider != "deepgram":
+            return
+        with open(probe_log_path, "a", encoding="utf-8") as pf:
+            while not stop_bench.is_set():
+                t0_probe = time.perf_counter()
+                tcp_ms = 0.0
+                probe_ok = False
+                probe_err = None
+                try:
+                    _, pw = await asyncio.wait_for(
+                        asyncio.open_connection(target_host, 443),
+                        timeout=4.0,
+                    )
+                    tcp_ms = (time.perf_counter() - t0_probe) * 1000.0
+                    pw.close()
+                    await pw.wait_closed()
+                    probe_ok = True
+                except Exception as ex:
+                    tcp_ms = (time.perf_counter() - t0_probe) * 1000.0
+                    probe_err = str(ex)
+                rec = {
+                    "ts_epoch": time.time(),
+                    "host": target_host,
+                    "tcp_rtt_ms": round(tcp_ms, 2),
+                    "success": probe_ok,
+                    "error": probe_err,
+                }
+                pf.write(json.dumps(rec) + "\n")
+                pf.flush()
+                with contextlib.suppress(TimeoutError):
+                    await asyncio.wait_for(stop_bench.wait(), timeout=5.0)
+
+    probe_task = asyncio.create_task(_network_probe_loop())
+
     # Instrument Bench Process GC and Event Loop Lag
     import gc
     import traceback
@@ -1344,6 +1383,9 @@ async def run_benchmark(
     bench_lag_task.cancel()
     with contextlib.suppress(asyncio.CancelledError):
         await bench_lag_task
+    probe_task.cancel()
+    with contextlib.suppress(asyncio.CancelledError):
+        await probe_task
 
     # Query final in-process telemetry (with snapshot=1 off the sender loop)
     final_worker_metrics: dict[str, Any] = latest_worker_metrics.copy()

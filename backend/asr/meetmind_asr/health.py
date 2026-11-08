@@ -393,11 +393,7 @@ class HealthServer:
                             "top_diff_m5": top_diff_m5,
                         }
 
-                        if (
-                            self.metrics.benchmark_mode
-                            and self.service
-                            and hasattr(self.service, "_active_pipelines")
-                        ):
+                        if self.service and hasattr(self.service, "_active_pipelines"):
                             p_info = {}
                             for m_id, pipe in self.service._active_pipelines.items():
                                 dedupe = getattr(pipe, "_dedupe", None)

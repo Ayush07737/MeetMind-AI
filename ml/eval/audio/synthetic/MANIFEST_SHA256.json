@@ -1,0 +1,35 @@
+{
+  "manifest_path": "ml/eval/audio/synthetic/manifest.jsonl",
+  "manifest_sha256": "31636814d929e7cdf480d96ceea3b33ad1c3b6cdd3a905566a5aea82e7040bbc",
+  "total_segments": 160,
+  "voices": {
+    "speaker_0": {
+      "name": "en-IN-PrabhatNeural",
+      "gender": "Male",
+      "role": "Partner / Lead"
+    },
+    "speaker_1": {
+      "name": "en-IN-NeerjaNeural",
+      "gender": "Female",
+      "role": "Principal / CFO"
+    },
+    "speaker_2": {
+      "name": "hi-IN-MadhurNeural",
+      "gender": "Male",
+      "role": "Founder / CEO"
+    },
+    "speaker_3": {
+      "name": "hi-IN-SwaraNeural",
+      "gender": "Female",
+      "role": "Legal Counsel / Director"
+    }
+  },
+  "variants": [
+    "clean",
+    "noise_15db",
+    "telephony_8khz",
+    "speed_1_15x",
+    "two_channel"
+  ],
+  "owner_verified_count": 0
+}

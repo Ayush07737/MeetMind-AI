@@ -70,7 +70,7 @@ async def stream_flux(api_key: str, endpoint: str) -> dict[str, Any]:
                     t_recv = time.perf_counter()
                     if isinstance(raw, str):
                         data = json.loads(raw)
-                        ev_type = data.get("type")
+                        ev_type = data.get("event") or data.get("type")
                         events.append({"type": ev_type, "t_recv": t_recv, "data": data})
                         if ev_type == "Update":
                             t = data.get("transcript", "").strip()
@@ -106,7 +106,8 @@ async def stream_flux(api_key: str, endpoint: str) -> dict[str, Any]:
                 await ws.send(data)
 
         # Flush Flux stream
-        await ws.send(json.dumps({"type": "CloseStream"}))
+        await ws.send(b"")
+        await asyncio.sleep(2.0)
         with contextlib.suppress(Exception):
             await asyncio.wait_for(done_event.wait(), timeout=5.0)
         await ws.close()

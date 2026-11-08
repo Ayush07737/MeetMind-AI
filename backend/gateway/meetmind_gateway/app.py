@@ -265,8 +265,8 @@ def create_app(settings: GatewaySettings | None = None) -> FastAPI:
         Disabled unless GATEWAY_BENCH_ENDPOINTS=true AND environment is not production.
         Requires admin credentials (shared secret header or Clerk admin role).
         """
-        is_prod = settings.app_env.lower() in ("prod", "production")
-        if not settings.gateway_bench_endpoints or is_prod:
+        env_allowed = settings.app_env.strip().lower() in ("dev", "test", "development")
+        if not settings.gateway_bench_endpoints or not env_allowed:
             raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Not Found")
 
         # 1. Check shared-secret header X-Admin-Key

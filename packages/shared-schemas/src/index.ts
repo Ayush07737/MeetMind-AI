@@ -493,6 +493,27 @@ export const EventTimingSchema = z
   .strict();
 export type EventTiming = z.infer<typeof EventTimingSchema>;
 
+export function validateMonotonic(timing: EventTiming): string[] {
+  const violations: string[] = [];
+  let lastStage: string | null = null;
+  let lastVal: number | null = null;
+
+  for (const stage of TIMING_STAGES) {
+    const val = timing[stage];
+    if (val === undefined || val === null) {
+      continue;
+    }
+    if (lastVal !== null && val < lastVal) {
+      violations.push(
+        `Monotonic violation: stage '${stage}' (${val}ms) preceded by '${lastStage}' (${lastVal}ms) with delta ${val - lastVal}ms`,
+      );
+    }
+    lastStage = stage;
+    lastVal = val;
+  }
+  return violations;
+}
+
 export const EventEnvelopeSchema = z.object({
   event_type: z.string(),
   meeting_id: z.string(),

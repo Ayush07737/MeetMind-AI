@@ -19,7 +19,9 @@ constraints:
       Generative LLM API calls strictly prohibited in this stage due to 800ms+ round-trip delays.
   memory:
     tracemalloc_headroom_mb: 10.0
+    tracemalloc_reason: "Bounded collections with hard caps form cyclic allocation/deallocation in steady state; 10 MB accommodates steady-state Python runtime variance."
     private_bytes_headroom_mb: 40.0
+    private_bytes_reason: "Windows process commit charge tracking committed virtual pages; 40 MB accommodates C-extension runtime buffers (OpenSSL, hiredis, asyncpg) over a 60-minute session."
     soak_max_meeting_seconds: 3600
   overhead:
     max_own_overhead_per_stage_ms: 25.0

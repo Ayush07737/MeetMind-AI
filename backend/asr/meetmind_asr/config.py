@@ -58,9 +58,12 @@ class AsrSettings(BaseSettings):
 
     @model_validator(mode="after")
     def validate_provider_requirements(self) -> AsrSettings:
-        is_prod = self.app_env.lower() in ("prod", "production")
-        if is_prod and self.asr_test_hooks:
-            raise ValueError("ASR_TEST_HOOKS is forbidden in production environments")
+        env_allowed = self.app_env.strip().lower() in ("dev", "test", "development")
+        if self.asr_test_hooks and not env_allowed:
+            raise ValueError(
+                f"ASR_TEST_HOOKS is forbidden when APP_ENV={self.app_env!r}. "
+                "Only explicit allowlist ('dev', 'test') environments are permitted."
+            )
         if self.asr_provider == "deepgram" and (
             not self.deepgram_api_key or not self.deepgram_api_key.get_secret_value().strip()
         ):
