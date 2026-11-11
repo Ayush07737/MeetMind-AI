@@ -102,6 +102,7 @@ class ConnectionContext:
         session_manager: SessionManager,
         settings: GatewaySettings,
         redis_client: Any,
+        user: AuthenticatedUser | None = None,
     ) -> None:
         self.ws = ws
         self.meeting_id = meeting_id
@@ -113,6 +114,8 @@ class ConnectionContext:
         self.session_manager = session_manager
         self.settings = settings
         self.redis_client = redis_client
+        self.user = user
+        self.client_instance_id = user.client_instance_id if user else ""
 
         self.state = ProtocolState.CONNECTED
         self.frames_processed = 0
@@ -145,6 +148,7 @@ class ConnectionContext:
         self.clock_rtt_ms: int = 0
         self.has_clock_sync: bool = False
         self.clock_clamped_count: int = 0
+        self.audit_tasks: set[asyncio.Task[None]] = set()
 
     def mark_closed(self) -> None:
         self.is_closed = True
@@ -241,6 +245,15 @@ async def _handle_control_frame(
             )
         except Exception as exc:
             logger.error("Audit write failed on meeting_start: %s", exc)
+            if ctx.lease_task and not ctx.lease_task.done():
+                ctx.lease_task.cancel()
+            with contextlib.suppress(Exception):
+                await ctx.session_manager.release_writer_lease(
+                    meeting_id=ctx.meeting_id,
+                    tenant_id=ctx.user.tenant_id if ctx.user else ctx.session.tenant_id,
+                    user_id=ctx.user.user_id if ctx.user else ctx.session.user_id,
+                    client_instance_id=ctx.client_instance_id,
+                )
             await ctx.ws.close(code=WSCloseCode.AUDIT_UNAVAILABLE, reason="AUDIT_UNAVAILABLE")
             ctx.mark_closed()
             return
@@ -285,6 +298,15 @@ async def _handle_control_frame(
             )
         except Exception as exc:
             logger.error("Audit write failed on consent_confirmed: %s", exc)
+            if ctx.lease_task and not ctx.lease_task.done():
+                ctx.lease_task.cancel()
+            with contextlib.suppress(Exception):
+                await ctx.session_manager.release_writer_lease(
+                    meeting_id=ctx.meeting_id,
+                    tenant_id=ctx.user.tenant_id if ctx.user else ctx.session.tenant_id,
+                    user_id=ctx.user.user_id if ctx.user else ctx.session.user_id,
+                    client_instance_id=ctx.client_instance_id,
+                )
             await ctx.ws.close(code=WSCloseCode.AUDIT_UNAVAILABLE, reason="AUDIT_UNAVAILABLE")
             ctx.mark_closed()
             return
@@ -433,6 +455,32 @@ async def _handle_control_frame(
         await ctx.ws.send_text(ack.model_dump_json())
 
 
+def _clamp_capture_server_ms(
+    *,
+    raw_capture_server_ms: int,
+    gw_recv_ms: int,
+    max_age_ms: int,
+    rtt_ms: int = 0,
+) -> tuple[int, bool, str]:
+    """Clamp raw capture timestamp to [gw_recv_ms - max_age_ms, gw_recv_ms].
+
+    Monotonicity requires capture_server_ms <= gw_recv_ms on every frame.
+    Small positive residuals within SNTP estimation uncertainty
+    (<= max(100ms, rtt_ms)) are capped silently to gw_recv_ms without raising a
+    future_clamp audit event.
+    """
+    min_allowed = gw_recv_ms - max_age_ms
+    max_allowed = gw_recv_ms
+    future_audit_tolerance_ms = max(100, int(rtt_ms or 0))
+
+    if raw_capture_server_ms < min_allowed:
+        return min_allowed, True, "past_clamp"
+    if raw_capture_server_ms > max_allowed:
+        is_anomalous_future = (raw_capture_server_ms - max_allowed) > future_audit_tolerance_ms
+        return max_allowed, is_anomalous_future, "future_clamp" if is_anomalous_future else "none"
+    return raw_capture_server_ms, False, "none"
+
+
 async def _handle_audio_chunk(
     ctx: ConnectionContext,
     data: bytes,
@@ -497,37 +545,34 @@ async def _handle_audio_chunk(
     gw_recv_ms = int(datetime.now(UTC).timestamp() * 1000)
     raw_capture_server_ms = capture_ts_ms + ctx.clock_offset_ms
     max_age_ms = getattr(ctx.settings, "clock_max_age_ms", 15_000)
-    min_allowed = gw_recv_ms - max_age_ms
-    max_allowed = gw_recv_ms
-
-    clamped = False
-    clamp_reason = ""
-    if raw_capture_server_ms < min_allowed:
-        capture_server_ms = min_allowed
-        clamped = True
-        clamp_reason = "past_clamp"
-    elif raw_capture_server_ms > max_allowed:
-        capture_server_ms = max_allowed
-        clamped = True
-        clamp_reason = "future_clamp"
-    else:
-        capture_server_ms = raw_capture_server_ms
+    capture_server_ms, clamped, clamp_reason = _clamp_capture_server_ms(
+        raw_capture_server_ms=raw_capture_server_ms,
+        gw_recv_ms=gw_recv_ms,
+        max_age_ms=max_age_ms,
+        rtt_ms=ctx.clock_rtt_ms,
+    )
 
     if clamped:
         ctx.clock_clamped_count += 1
-        if ctx.clock_clamped_count <= 5 or ctx.clock_clamped_count % 100 == 0:
+        if (ctx.clock_clamped_count <= 5 or ctx.clock_clamped_count % 100 == 0) and len(
+            ctx.audit_tasks
+        ) < 50:
             from .audit import audit_clock_clamped
 
-            await audit_clock_clamped(
-                tenant_id=ctx.session.tenant_id,
-                user_id=ctx.session.user_id,
-                meeting_id=ctx.meeting_id,
-                raw_capture_server_ms=raw_capture_server_ms,
-                clamped_capture_server_ms=capture_server_ms,
-                gw_recv_ms=gw_recv_ms,
-                max_age_ms=max_age_ms,
-                reason=clamp_reason,
+            audit_task = asyncio.create_task(
+                audit_clock_clamped(
+                    tenant_id=ctx.session.tenant_id,
+                    user_id=ctx.session.user_id,
+                    meeting_id=ctx.meeting_id,
+                    raw_capture_server_ms=raw_capture_server_ms,
+                    clamped_capture_server_ms=capture_server_ms,
+                    gw_recv_ms=gw_recv_ms,
+                    max_age_ms=max_age_ms,
+                    reason=clamp_reason,
+                )
             )
+            ctx.audit_tasks.add(audit_task)
+            audit_task.add_done_callback(ctx.audit_tasks.discard)
 
     try:
         await ctx.stream_producer.publish_audio(
@@ -537,7 +582,7 @@ async def _handle_audio_chunk(
             user_id=ctx.session.user_id,
             adapter_type=ctx.session.adapter_type,
             audio_data=data,
-            timestamp_ms=int(datetime.now(UTC).timestamp() * 1000),
+            timestamp_ms=gw_recv_ms,
             client_seq=client_seq,
             capture_ts_ms=capture_ts_ms,
             capture_server_ms=capture_server_ms,
@@ -1059,6 +1104,7 @@ async def websocket_ingest(
         session_manager=session_manager,
         settings=settings,
         redis_client=redis_client,
+        user=user,
     )
     ctx.trace_id = trace_id
     if session.status == MeetingStatus.ENDED:
@@ -1165,6 +1211,11 @@ async def websocket_ingest(
         with contextlib.suppress(Exception):
             await redis_client.decr(uconn_key)
             await redis_client.decr(tconn_key)
+
+        # Drain any in-flight background audit tasks before final teardown
+        if ctx.audit_tasks:
+            with contextlib.suppress(Exception):
+                await asyncio.gather(*list(ctx.audit_tasks), return_exceptions=True)
 
         # Disconnect audit (always attempted)
         with contextlib.suppress(Exception):

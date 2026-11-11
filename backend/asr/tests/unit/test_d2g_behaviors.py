@@ -21,7 +21,7 @@ from meetmind_asr.config import (
 )
 from meetmind_asr.pipeline import MeetingPipeline
 from meetmind_asr.tenant_config import AsrTenantConfig
-from meetmind_schemas.events import EventEnvelope, TranscriptFinalPayload
+from meetmind_schemas.events import EventEnvelope, TranscriptFinalPayload, encode_audio_frame
 from pydantic import SecretStr
 
 # ── 1. AU Region Host Mapping & Resolution ───────────────────────────────────
@@ -235,3 +235,103 @@ async def test_catchup_pacing_and_late_flag():
     # Pacing speed check
     settings = AsrSettings(asr_provider="stub", asr_catchup_speed=4.0)
     assert settings.asr_catchup_speed == 4.0
+
+
+@pytest.mark.asyncio
+async def test_stop_drains_unprocessed_pel_before_new_entries():
+    """Verify stop(is_ended=True) drains unprocessed worker PEL entries before reading '>'."""
+    import asyncio
+
+    settings = AsrSettings(asr_provider="stub")
+    t_cfg = AsrTenantConfig(tenant_id="tenant_pel_stop", language="en", keyterms=[])
+
+    def _chunk_fields(seq: int) -> dict[bytes, bytes]:
+        frame = encode_audio_frame(
+            client_seq=seq,
+            capture_ts_ms=1792000000000 + seq * 100,
+            payload=b"\x00" * 3200,
+        )
+        return {b"audio_data": frame}
+
+    # Simulated state: chunks 7, 8 already processed; chunk 9 in PEL unprocessed; 15 in '>'
+    pel_entries = [
+        (b"1000-0", _chunk_fields(7)),
+        (b"1001-0", _chunk_fields(8)),
+        (b"1002-0", _chunk_fields(9)),
+    ]
+    new_entries = [
+        (b"1003-0", _chunk_fields(15)),
+    ]
+
+    redis = AsyncMock()
+    redis.hsetnx = AsyncMock(return_value=1)
+    redis.xadd = AsyncMock(return_value=b"2000-0")
+    redis.expire = AsyncMock(return_value=True)
+    redis.set = AsyncMock(return_value=True)
+    redis.xack = AsyncMock(return_value=1)
+    redis.xdel = AsyncMock(return_value=1)
+
+    class _FakePipe:
+        def xadd(self, *args, **kwargs):
+            return self
+
+        def expire(self, *args, **kwargs):
+            return self
+
+        async def execute(self):
+            return [b"2000-0", True]
+
+    redis.pipeline = MagicMock(return_value=_FakePipe())
+
+    async def _xreadgroup(group, consumer, streams, count=100, block=None):
+        cursor = next(iter(streams.values()))
+        if cursor == "0":
+            return [(b"mm:tenant_pel_stop:audio:mtg_pel_stop", pel_entries)]
+        if cursor == "1002-0":
+            return []
+        if cursor == ">":
+            if new_entries:
+                out = list(new_entries)
+                new_entries.clear()
+                return [(b"mm:tenant_pel_stop:audio:mtg_pel_stop", out)]
+            return []
+        return []
+
+    redis.xreadgroup = AsyncMock(side_effect=_xreadgroup)
+
+    provider = AsyncMock()
+    provider.is_open = True
+    provider._is_open = True
+    provider.send_audio = AsyncMock()
+    provider.finish = AsyncMock()
+
+    auditor = MagicMock()
+    auditor.record_session_summary_sync = AsyncMock()
+
+    pipeline = MeetingPipeline(
+        tenant_id="tenant_pel_stop",
+        meeting_id="mtg_pel_stop",
+        worker_id="w_pel_stop",
+        redis_client=redis,
+        provider=provider,
+        tenant_config=t_cfg,
+        settings=settings,
+        metrics=MagicMock(),
+        auditor=auditor,
+    )
+    pipeline._last_seen_seq = 8
+    pipeline._dispatched_seqs_set.update({7, 8})
+    pipeline._mark_processed_eid("1000-0")
+    pipeline._mark_processed_eid("1001-0")
+    pipeline._audio_read_task = asyncio.create_task(asyncio.sleep(0))
+    pipeline._tasks = [pipeline._audio_read_task]
+
+    await pipeline.stop(is_ended=True)
+
+    # Chunk 9 must be processed before chunk 15 so gap starts at 10 (not 9)
+    dispatched_seqs = [call.args[0].client_seq for call in provider.send_audio.call_args_list]
+    assert dispatched_seqs == [9, 15]
+    assert len(pipeline._detected_gaps) == 1
+    assert pipeline._detected_gaps[0]["from_seq"] == 10
+    assert pipeline._detected_gaps[0]["to_seq"] == 14
+    assert pipeline._detected_gaps[0]["gap_chunks"] == 5

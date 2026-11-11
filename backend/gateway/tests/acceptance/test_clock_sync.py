@@ -11,6 +11,7 @@ Verifies against real uvicorn, real Redis, and Neon:
 
 from __future__ import annotations
 
+import asyncio
 import json
 import time
 import uuid
@@ -258,10 +259,16 @@ async def test_gateway_clock_synchronization_and_skew_correction(
         assert cap_srv_3 > t_send_past - 30_000
         assert abs(cap_srv_3 - (t_send_past - 15_000)) <= 2000
 
-        # Verify clock_clamped audit event in Neon
+        # Verify clock_clamped audit event in Neon (dispatched non-blocking from audio handler)
         async with h.tenant_conn(tenant_id) as conn:
-            rows = await conn.fetch(
-                f'SELECT event_type, payload FROM "{h.schema_a}".audit_events '
-                f"WHERE event_type = 'clock_clamped' ORDER BY id DESC"
-            )
+            rows = []
+            deadline = time.monotonic() + 5.0
+            while time.monotonic() < deadline:
+                rows = await conn.fetch(
+                    f'SELECT event_type, payload FROM "{h.schema_a}".audit_events '
+                    f"WHERE event_type = 'clock_clamped' ORDER BY id DESC"
+                )
+                if len(rows) >= 1:
+                    break
+                await asyncio.sleep(0.1)
             assert len(rows) >= 1

@@ -62,13 +62,108 @@ TENS_NUMBERS = {
     "ninety": 90,
 }
 
+ALL_NUMBERS = {
+    "zero": "0",
+    "one": "1",
+    "two": "2",
+    "three": "3",
+    "four": "4",
+    "five": "5",
+    "six": "6",
+    "seven": "7",
+    "eight": "8",
+    "nine": "9",
+    "ten": "10",
+    "eleven": "11",
+    "twelve": "12",
+    "thirteen": "13",
+    "fourteen": "14",
+    "fifteen": "15",
+    "sixteen": "16",
+    "seventeen": "17",
+    "eighteen": "18",
+    "nineteen": "19",
+    "twenty": "20",
+    "thirty": "30",
+    "forty": "40",
+    "fifty": "50",
+    "sixty": "60",
+    "seventy": "70",
+    "eighty": "80",
+    "ninety": "90",
+}
+
+NUM_WORDS_PAT = "|".join(ALL_NUMBERS.keys())
+ID_PREFIXES = ["plat", "eng", "front", "infra", "data", "core", "tech", "sec", "inc", "adr", "pr"]
+ID_PREFIX_PAT = "|".join(ID_PREFIXES)
+
+
+def normalize_engineering_terms(text: str) -> str:
+    """Normalize spoken engineering identifiers, metrics, and versions."""
+    t = text.lower()
+
+    # 1. Percentiles
+    t = re.sub(r"\bp\s+ninety\s+nine\b", "p99", t)
+    t = re.sub(r"\bp\s+ninety\s+five\b", "p95", t)
+    t = re.sub(r"\bp\s+fifty\b", "p50", t)
+
+    # 2. Units and metrics
+    t = re.sub(r"\bmilli\s*seconds?\b", "ms", t)
+    t = re.sub(r"\bmillis\b", "ms", t)
+    t = re.sub(r"\brequests?\s+per\s+second\b", "rps", t)
+    t = re.sub(r"\bmegabytes?\b", "mb", t)
+    t = re.sub(r"\bgigabytes?\b", "gb", t)
+
+    # 3. Versions (e.g. python three point thirteen -> python 3.13)
+    ver_regex = (
+        r"\b(python|postgresql|postgres|version|v)\s+"
+        r"((?:(?:" + NUM_WORDS_PAT + r"|\d+)\s+)?point\s+(?:" + NUM_WORDS_PAT + r"|\d+)"
+        r"(?:\s+point\s+(?:" + NUM_WORDS_PAT + r"|\d+))?)\b"
+    )
+
+    def _repl_ver(m: re.Match) -> str:
+        pfx = m.group(1)
+        body = m.group(2).strip().split()
+        res = []
+        for w in body:
+            if w == "point":
+                res.append(".")
+            elif w in ALL_NUMBERS:
+                res.append(ALL_NUMBERS[w])
+            elif w.isdigit():
+                res.append(w)
+            else:
+                res.append(w)
+        return f"{pfx} " + "".join(res)
+
+    t = re.sub(ver_regex, _repl_ver, t)
+
+    # 4. Spoken identifiers (e.g. plat one zero one -> plat-101, pr four eight two -> pr-482)
+    id_regex = r"\b(" + ID_PREFIX_PAT + r")\s+((?:(?:" + NUM_WORDS_PAT + r"|\d+)\s*)+)"
+
+    def _repl_id(m: re.Match) -> str:
+        pfx = m.group(1)
+        raw_seq = m.group(2).strip().split()
+        digits = []
+        for w in raw_seq:
+            if w in ALL_NUMBERS:
+                digits.append(ALL_NUMBERS[w])
+            elif w.isdigit():
+                digits.append(w)
+        return f"{pfx}-" + "".join(digits) + " "
+
+    t = re.sub(id_regex, _repl_id, t)
+    t = re.sub(r"\b(" + ID_PREFIX_PAT + r")\s+(\d+)\b", r"\1-\2", t)
+    return t
+
 
 def normalize_text(text: str) -> str:
     """Normalize text into canonical token sequence."""
     if not text:
         return ""
 
-    t = text.lower()
+    # 0. Engineering terms, versions, identifiers, and percentiles
+    t = normalize_engineering_terms(text)
 
     # 1. Expand currency abbreviations and fused currency tokens
     t = re.sub(r"\brs\.?\s*", "inr ", t)
@@ -87,8 +182,12 @@ def normalize_text(text: str) -> str:
     t = re.sub(r"\bpct\b", "percent", t)
     t = re.sub(r"\bbasis\s+points?\b", "bps", t)
 
-    # 3. Strip punctuation
-    t = re.sub(r"[\.,;:!\?\"'\(\)\[\]\{\}\\\/\-_~`@#\^&\*\+=]", " ", t)
+    # 3. Strip punctuation, preserving hyphens inside identifiers and periods in numbers/versions
+    t = re.sub(r"(?<=\d),(?=\d)", "", t)
+    t = re.sub(r"(?<!\d)\.|\.(?!\d)", " ", t)
+    t = re.sub(r"[,;:!\?\"'\(\)\[\]\{\}\\\/_~`@#\^&\*\+=]", " ", t)
+    # Strip standalone hyphens not joining words/digits
+    t = re.sub(r"(?<![a-zA-Z0-9])-(?![a-zA-Z0-9])", " ", t)
 
     # 4. Canonicalize denomination spellings
     t = re.sub(r"\b(crores?|cr)\b", "crore", t)
@@ -272,4 +371,82 @@ def compute_numeric_token_error_rate(reference: str, hypothesis: str) -> dict[st
         "correct": matched,
         "missing": total_ref - matched,
         "extra": len(hyp_copy),
+    }
+
+
+def extract_identifiers(text: str) -> list[str]:
+    """Extract canonical identifiers (e.g. ['PLAT-101', 'PR-482', 'INC-409'])."""
+    norm = normalize_text(text)
+    matches = re.findall(
+        r"\b(" + ID_PREFIX_PAT + r")-(\d+)\b",
+        norm,
+    )
+    return [f"{pfx.upper()}-{num}" for pfx, num in matches]
+
+
+def compute_identifier_exact_match(reference: str, hypothesis: str) -> dict[str, Any]:
+    """Compute exact match rate and error rate for engineering identifiers."""
+    ref_ids = extract_identifiers(reference)
+    hyp_ids = extract_identifiers(hypothesis)
+
+    if not ref_ids:
+        return {
+            "iemr": 0.0,
+            "total_ref": 0,
+            "correct": 0,
+            "missing": 0,
+            "extra": len(hyp_ids),
+        }
+
+    hyp_copy = list(hyp_ids)
+    matched = 0
+
+    for r in ref_ids:
+        if r in hyp_copy:
+            matched += 1
+            hyp_copy.remove(r)
+
+    total_ref = len(ref_ids)
+    err_rate = (total_ref - matched) / total_ref
+
+    return {
+        "iemr": round(err_rate, 4),
+        "match_rate": round(matched / total_ref, 4) if total_ref > 0 else 1.0,
+        "total_ref": total_ref,
+        "correct": matched,
+        "missing": total_ref - matched,
+        "extra": len(hyp_copy),
+    }
+
+
+def compute_entity_error_rate(
+    reference: str, hypothesis: str, expected_entities: list[dict[str, Any]] | list[str]
+) -> dict[str, Any]:
+    """Compute error rate for domain named entities."""
+    ent_names: list[str] = []
+    for e in expected_entities:
+        if isinstance(e, dict):
+            ent_names.append(e.get("text", "").lower())
+        elif isinstance(e, str):
+            ent_names.append(e.lower())
+    ent_names = [e for e in ent_names if e]
+
+    if not ent_names:
+        return {"entity_error_rate": 0.0, "total_entities": 0, "correct": 0, "missing": 0}
+
+    norm_hyp = normalize_text(hypothesis)
+    matched = 0
+    for ent in ent_names:
+        norm_ent = normalize_text(ent)
+        if norm_ent and norm_ent in norm_hyp:
+            matched += 1
+
+    total = len(ent_names)
+    err_rate = (total - matched) / total
+
+    return {
+        "entity_error_rate": round(err_rate, 4),
+        "total_entities": total,
+        "correct": matched,
+        "missing": total - matched,
     }

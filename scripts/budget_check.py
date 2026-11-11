@@ -55,7 +55,7 @@ from meetmind_schemas.keys import (  # noqa: E402
     events_stream_key,
     out_stream_key,
 )  # noqa: E402
-from meetmind_schemas.timing import stamp, validate_monotonic  # noqa: E402
+from meetmind_schemas.timing import ClockEstimator, stamp, validate_monotonic  # noqa: E402
 from meetmind_security import db  # noqa: E402
 from meetmind_security.migrations import apply_migrations_conn  # noqa: E402
 from meetmind_security.tenant import TenantConfig  # noqa: E402
@@ -473,16 +473,24 @@ async def run_budget_check(
             )
             await ws.recv()
 
-            # 2. clock_sync handshake with simulated offset (+2.5s client ahead)
-            client_t1 = int(time.time() * 1000) + client_clock_offset_ms
-            await ws.send(json.dumps({"type": "control", "action": "clock_sync", "t1": client_t1}))
-            sync_reply = json.loads(await ws.recv())
-
-            client_t4 = int(time.time() * 1000) + client_clock_offset_ms
-            t2 = sync_reply["t2"]
-            t3 = sync_reply["t3"]
-            offset = ((t2 - client_t1) + (t3 - client_t4)) // 2
-            rtt = (client_t4 - client_t1) - (t3 - t2)
+            # 2. clock_sync handshake (3 probes per clocks.md §3.1 step 4, simulated +2.5s)
+            probes: list[dict[str, int]] = []
+            for _ in range(3):
+                client_t1 = int(time.time() * 1000) + client_clock_offset_ms
+                await ws.send(
+                    json.dumps({"type": "control", "action": "clock_sync", "t1": client_t1})
+                )
+                sync_reply = json.loads(await ws.recv())
+                client_t4 = int(time.time() * 1000) + client_clock_offset_ms
+                probes.append(
+                    ClockEstimator.compute_probe(
+                        client_t1,
+                        sync_reply["t2"],
+                        sync_reply["t3"],
+                        client_t4,
+                    )
+                )
+            best_probe = ClockEstimator.select_best_probe(probes)
 
             # 3. clock_report
             await ws.send(
@@ -490,9 +498,9 @@ async def run_budget_check(
                     {
                         "type": "control",
                         "action": "clock_report",
-                        "offset_ms": offset,
-                        "rtt_ms": max(0, rtt),
-                        "samples": 1,
+                        "offset_ms": best_probe["offset_ms"],
+                        "rtt_ms": best_probe["rtt_ms"],
+                        "samples": len(probes),
                     }
                 )
             )

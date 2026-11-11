@@ -1,0 +1,33 @@
+{
+  "card_id": "c5b6c7d8-e9f0-4a1b-2c3d-4e5f6a7b8c9d",
+  "revision": 1,
+  "supersedes": null,
+  "meeting_id": "meeting_eng_01",
+  "tenant_id": "tenant_default",
+  "trace_id": "trace_eng_12349",
+  "kind": "suggestion",
+  "tier": 2,
+  "title": "Restricted Card Missing Visible Roles",
+  "blocks": [],
+  "claims": [],
+  "confidence_band": "low",
+  "confidence_basis": {},
+  "origin": "internal",
+  "status": "inferred",
+  "restricted": true,
+  "visible_roles": [],
+  "timing": {
+    "trigger_ts_ms": 1793987130000,
+    "published_ts_ms": 1793987131500
+  },
+  "trigger": {
+    "utterance_id": "utt_abc123def45678901234",
+    "category": "security_check",
+    "trigger_confidence": 0.95,
+    "asr_confidence": 0.96,
+    "text_stability": 1.0
+  },
+  "late": false,
+  "abstain_reason": null,
+  "inferred_label": "Confidential Suggestion"
+}

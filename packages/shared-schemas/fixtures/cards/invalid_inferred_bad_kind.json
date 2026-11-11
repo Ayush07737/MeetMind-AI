@@ -1,0 +1,33 @@
+{
+  "card_id": "c4b5c6d7-e8f9-4a0b-1c2d-3e4f5a6b7c8d",
+  "revision": 1,
+  "supersedes": null,
+  "meeting_id": "meeting_eng_01",
+  "tenant_id": "tenant_default",
+  "trace_id": "trace_eng_12348",
+  "kind": "fact",
+  "tier": 2,
+  "title": "Inferred Card With Invalid Kind",
+  "blocks": [],
+  "claims": [],
+  "confidence_band": "low",
+  "confidence_basis": {},
+  "origin": "internal",
+  "status": "inferred",
+  "restricted": false,
+  "visible_roles": [],
+  "timing": {
+    "trigger_ts_ms": 1793987130000,
+    "published_ts_ms": 1793987131500
+  },
+  "trigger": {
+    "utterance_id": "utt_abc123def45678901234",
+    "category": "latency_spike",
+    "trigger_confidence": 0.95,
+    "asr_confidence": 0.96,
+    "text_stability": 1.0
+  },
+  "late": false,
+  "abstain_reason": null,
+  "inferred_label": "AI Generated Hypothesis"
+}

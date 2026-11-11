@@ -478,6 +478,18 @@ DegradedReason = Literal[
 ]
 
 
+class WordTiming(BaseModel):
+    """Timing and confidence metadata for an individual word (A1)."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    w: str
+    start_ms: int
+    end_ms: int
+    confidence: float
+    speaker: int | str | None = None
+
+
 class TranscriptFinalPayload(BaseModel):
     """Payload for transcript_final event (internal bus only)."""
 
@@ -502,6 +514,7 @@ class TranscriptFinalPayload(BaseModel):
     publish_wall: float | None = None
     e2e_ms: float | None = None
     late: bool = False
+    words: list[WordTiming] | None = None
 
 
 class TranscriptInterimPayload(BaseModel):
@@ -521,6 +534,38 @@ class TranscriptInterimPayload(BaseModel):
     provider: str
     model: str
     is_stable: bool = False
+    stable_prefix_words: int = 0
+
+
+class TriggerCandidatePayload(BaseModel):
+    """Payload for trigger_candidate event (internal bus only, Q5)."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    candidate_id: str
+    meeting_id: str
+    tenant_id: str
+    utterance_id: str
+    stable_prefix_words: int
+    text: str
+    confidence: float
+    trigger_category: str
+    created_ts_ms: int
+
+
+class TriggerConfirmedPayload(BaseModel):
+    """Payload for trigger_confirmed event (internal bus only, Q5)."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    candidate_id: str | None = None
+    meeting_id: str
+    tenant_id: str
+    utterance_id: str
+    text: str
+    confidence: float
+    trigger_category: str
+    confirmed_ts_ms: int
 
 
 class TranscriptServiceDegradedPayload(BaseModel):

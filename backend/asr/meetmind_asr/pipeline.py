@@ -133,6 +133,8 @@ class MeetingPipeline:
         # Bounded sequence dispatch deduplication (Requirement 4 & 5)
         self._dispatched_seqs_window: collections.deque[int] = collections.deque(maxlen=5000)
         self._dispatched_seqs_set: set[int] = set()
+        self._processed_entry_ids_window: collections.deque[str] = collections.deque(maxlen=5000)
+        self._processed_entry_ids: set[str] = set()
 
         # Audit stats
         self._chunks_sent = 0
@@ -153,6 +155,7 @@ class MeetingPipeline:
 
         # Background tasks
         self._tasks: list[asyncio.Task[None]] = []
+        self._audio_read_task: asyncio.Task[None] | None = None
         self._events_task: asyncio.Task[None] | None = None
 
     @property
@@ -201,7 +204,8 @@ class MeetingPipeline:
         )
 
         # Launch consumer loops
-        self._tasks.append(asyncio.create_task(self._audio_read_loop()))
+        self._audio_read_task = asyncio.create_task(self._audio_read_loop())
+        self._tasks.append(self._audio_read_task)
         self._tasks.append(asyncio.create_task(self._ack_flush_loop()))
         self._events_task = asyncio.create_task(self._provider_events_loop())
         self._tasks.append(self._events_task)
@@ -469,12 +473,24 @@ class MeetingPipeline:
                     logger.warning("Audio read loop error on %s: %s", self.meeting_id, exc)
                     await asyncio.sleep(0.1)
 
+    def _mark_processed_eid(self, eid_str: str) -> None:
+        if eid_str in self._processed_entry_ids:
+            return
+        if len(self._processed_entry_ids_window) >= (
+            self._processed_entry_ids_window.maxlen or 5000
+        ):
+            old_eid = self._processed_entry_ids_window.popleft()
+            self._processed_entry_ids.discard(old_eid)
+        self._processed_entry_ids_window.append(eid_str)
+        self._processed_entry_ids.add(eid_str)
+
     async def _process_raw_entry(self, entry_id: Any, fields: dict[Any, Any]) -> None:
         eid_str = entry_id.decode() if isinstance(entry_id, bytes) else str(entry_id)
         raw_data = fields.get(b"audio_data") or fields.get("audio_data")
         if not raw_data or not isinstance(raw_data, bytes):
             # Acknowledge corrupted entry immediately
             await self.redis.xack(self._audio_key, "asr", eid_str)
+            self._mark_processed_eid(eid_str)
             return
 
         self.metrics.chunks_in += 1
@@ -484,12 +500,14 @@ class MeetingPipeline:
         except Exception as exc:
             logger.warning("Invalid audio header in %s: %s", self.meeting_id, exc)
             await self.redis.xack(self._audio_key, "asr", eid_str)
+            self._mark_processed_eid(eid_str)
             return
 
         # Check Codec (Decision 1: v1 supports codec=1 PCM16 LE only)
         if hdr.codec != 1:
             # Codec 2 (Opus) is acked and dropped with single degraded event per meeting
             await self.redis.xack(self._audio_key, "asr", eid_str)
+            self._mark_processed_eid(eid_str)
             self.metrics.dropped_chunks += 1
             if not self._unsupported_codec_reported:
                 self._unsupported_codec_reported = True
@@ -507,6 +525,7 @@ class MeetingPipeline:
 
         # Sequence deduplication (Requirement 4: never re-stream duplicate chunks to provider)
         if hdr.client_seq in self._dispatched_seqs_set:
+            self._mark_processed_eid(eid_str)
             return
 
         # Beyond the backlog limit: detect client_seq jump and publish ONE audio_gap event
@@ -606,6 +625,7 @@ class MeetingPipeline:
         self._dispatched_seqs_set.add(chunk.client_seq)
 
         await self._dispatch_chunk(eid_str, chunk, hist_entry)
+        self._mark_processed_eid(eid_str)
 
     async def _dispatch_chunk(
         self, entry_id: str, chunk: AudioChunk, hist_entry: list[Any] | None = None
@@ -1365,8 +1385,47 @@ class MeetingPipeline:
 
         # 1. Drain ALL remaining audio from Redis (only if meeting ended)
         if is_ended:
+            # Stop the background audio reader first so stop() is the sole XREADGROUP consumer
+            # and no fetched batch is left stranded in the worker's PEL.
+            if self._audio_read_task and not self._audio_read_task.done():
+                with contextlib.suppress(Exception):
+                    try:
+                        await asyncio.wait_for(asyncio.shield(self._audio_read_task), timeout=2.0)
+                    except TimeoutError:
+                        self._audio_read_task.cancel()
+                        with contextlib.suppress(asyncio.CancelledError):
+                            await self._audio_read_task
+
             try:
                 with contextlib.suppress(Exception):
+                    # First drain any worker PEL entries fetched before exit but unprocessed
+                    pel_cursor = "0"
+                    while True:
+                        pending = await self.redis.xreadgroup(
+                            "asr",
+                            self.worker_id,
+                            {self._audio_key: pel_cursor},
+                            count=100,
+                        )
+                        if not pending:
+                            break
+                        found_pel = False
+                        for _, messages in pending:
+                            if messages:
+                                found_pel = True
+                                for entry_id, fields in messages:
+                                    eid_str = (
+                                        entry_id.decode()
+                                        if isinstance(entry_id, bytes)
+                                        else str(entry_id)
+                                    )
+                                    pel_cursor = eid_str
+                                    if eid_str not in self._processed_entry_ids:
+                                        await self._process_raw_entry(entry_id, fields)
+                        if not found_pel:
+                            break
+
+                    # Then drain all remaining unread entries from '>'
                     while True:
                         entries = await self.redis.xreadgroup(
                             "asr",

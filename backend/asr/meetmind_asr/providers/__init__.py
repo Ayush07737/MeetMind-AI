@@ -20,12 +20,18 @@ def get_provider(name: str, **kwargs: Any) -> ASRProvider:
     """Instantiate the configured ASR provider."""
     import os
 
-    if name in ("flux", "sarvam", "openai"):
+    if name in ("flux", "sarvam", "openai", "gladia", "assemblyai"):
         if os.environ.get("ASR_EXPERIMENTAL_PROVIDERS", "").lower() not in ("true", "1"):
             raise RuntimeError(
                 f"Provider '{name}' is experimental and requires ASR_EXPERIMENTAL_PROVIDERS=true"
             )
-        from .experimental import FluxProvider, OpenAIStreamingProvider, SarvamProvider
+        from .experimental import (
+            AssemblyAIProvider,
+            FluxProvider,
+            GladiaProvider,
+            OpenAIStreamingProvider,
+            SarvamProvider,
+        )
 
         if name == "flux":
             return FluxProvider(**kwargs)
@@ -33,6 +39,10 @@ def get_provider(name: str, **kwargs: Any) -> ASRProvider:
             return SarvamProvider(**kwargs)
         elif name == "openai":
             return OpenAIStreamingProvider(**kwargs)
+        elif name == "gladia":
+            return GladiaProvider(**kwargs)
+        elif name == "assemblyai":
+            return AssemblyAIProvider(**kwargs)
 
     if name == "stub":
         return StubProvider(**kwargs)

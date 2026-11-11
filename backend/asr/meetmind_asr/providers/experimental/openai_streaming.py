@@ -1,14 +1,16 @@
 """MeetMind AI — OpenAI Streaming Transcription Experimental Provider (B3).
 
 Official Documentation References:
-- Page Title: OpenAI Realtime API Audio Guide
+- Page Title: OpenAI Speech-to-Text / Realtime API Reference & Pricing
 - Official URL: https://platform.openai.com/docs/guides/realtime
-- Access Date: 2026-11-06
+- Pricing URL: https://openai.com/api/pricing
+- Access Date: 2026-11-10
 - WebSocket Endpoint: wss://api.openai.com/v1/realtime
-- Audio Formats: PCM16 (24kHz recommended, resampled from 16kHz)
-- Regional Processing: US / EU (India Regional Processing: UNVERIFIED / Not documented)
-- Zero-Retention: Available under Enterprise BAA / Zero Data Retention terms
-- Pricing: $0.06 per audio input minute ($3.60 per audio hour)
+- Audio Formats: PCM16 (24kHz recommended for Realtime; 16kHz resampled)
+- Regional Processing: US / EU global endpoints (India Data Residency: Not documented / UNVERIFIED)
+- Zero-Retention: Enterprise BAA / Zero Data Retention terms
+- Pricing: gpt-live-transcribe $0.017/min ($1.02/hr); Realtime audio tokens
+  $32/1M input (~$0.06/min uncached equiv = ~$3.60/hr; cached $0.40/1M)
 """
 
 from __future__ import annotations

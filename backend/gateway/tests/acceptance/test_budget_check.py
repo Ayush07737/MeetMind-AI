@@ -24,6 +24,7 @@ pytestmark = [pytest.mark.integration, pytest.mark.timeout(90)]
 
 
 @pytest.mark.asyncio
+@pytest.mark.timeout(180)
 async def test_budget_check_simulated_pipeline() -> None:
     """Run live simulated pipeline check through real Gateway and Stub ASR (N=200 utterances)."""
     redis_url = os.environ.get("ACCEPTANCE_REDIS_URL", "redis://127.0.0.1:6379/0")

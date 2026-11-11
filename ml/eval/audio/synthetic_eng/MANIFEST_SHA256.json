@@ -1,0 +1,42 @@
+{
+  "manifest_path": "ml/eval/audio/synthetic_eng/manifest.jsonl",
+  "manifest_sha256": "8b126e3c4b696c28cf2d124643d8c38e3a67b3d5156c7c69f222861844cd6790",
+  "total_segments": 1100,
+  "unique_utterances": 200,
+  "scenarios_count": 10,
+  "voices": {
+    "speaker_0": {
+      "name": "en-IN-PrabhatNeural",
+      "gender": "Male",
+      "role": "Tech Lead / Staff Engineer"
+    },
+    "speaker_1": {
+      "name": "en-IN-NeerjaNeural",
+      "gender": "Female",
+      "role": "Engineering Manager"
+    },
+    "speaker_2": {
+      "name": "en-IN-NeerjaExpressiveNeural",
+      "gender": "Female",
+      "role": "Senior SRE / DevOps Lead"
+    },
+    "speaker_3": {
+      "name": "en-IN-PrabhatNeural",
+      "gender": "Male",
+      "role": "Platform Engineer"
+    },
+    "speaker_hinglish_m": {
+      "name": "hi-IN-MadhurNeural",
+      "gender": "Male",
+      "role": "Backend Engineer"
+    },
+    "speaker_hinglish_f": {
+      "name": "hi-IN-SwaraNeural",
+      "gender": "Female",
+      "role": "QA Engineer"
+    }
+  },
+  "tts_vendor_disclosure": "Microsoft Neural TTS via Edge read-aloud client route (not a paid commercial API; Azure Speech SDK key absent in local .env; non-ASR-candidate vendor)",
+  "variants": ["clean", "noise_15db", "telephony_8khz", "speed_1_15x", "overlap", "two_channel"],
+  "owner_verified_count": 0
+}

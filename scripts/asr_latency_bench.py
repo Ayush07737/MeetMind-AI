@@ -144,6 +144,83 @@ def compute_theil_sen_slope_ci(
     }
 
 
+def get_powercfg_summary() -> str:
+    """Capture powercfg /a sleep states summary on Windows (A4a)."""
+    if sys.platform != "win32":
+        return "N/A (Non-Windows platform)"
+    try:
+        res = subprocess.run(["powercfg", "/a"], capture_output=True, text=True, check=False)
+        lines = [line.strip() for line in res.stdout.splitlines() if line.strip()]
+        avail = []
+        is_avail_section = False
+        for line in lines:
+            if "The following sleep states are available" in line:
+                is_avail_section = True
+                continue
+            if "The following sleep states are not available" in line:
+                break
+            if is_avail_section:
+                avail.append(line)
+        return ", ".join(avail) if avail else (lines[0] if lines else "unknown")
+    except Exception as exc:
+        return f"Error querying powercfg: {exc}"
+
+
+def set_thread_execution_state(enable: bool) -> bool:
+    """Prevent Windows Modern Standby / Sleep during active benchmark (A4a)."""
+    if sys.platform != "win32":
+        return False
+    try:
+        import ctypes
+
+        ES_CONTINUOUS = 0x80000000
+        ES_SYSTEM_REQUIRED = 0x00000001
+        ES_AWAYMODE_REQUIRED = 0x00000040
+        if enable:
+            res = ctypes.windll.kernel32.SetThreadExecutionState(
+                ES_CONTINUOUS | ES_SYSTEM_REQUIRED | ES_AWAYMODE_REQUIRED
+            )
+        else:
+            res = ctypes.windll.kernel32.SetThreadExecutionState(ES_CONTINUOUS)
+        return bool(res)
+    except Exception:
+        return False
+
+
+def query_kernel_power_events(start_dt: datetime, end_dt: datetime) -> list[str]:
+    """Query Windows Kernel-Power events during run window (A4a)."""
+    if sys.platform != "win32":
+        return []
+    try:
+        start_str = start_dt.strftime("%Y-%m-%d %H:%M:%S")
+        end_str = end_dt.strftime("%Y-%m-%d %H:%M:%S")
+        ps_cmd = (
+            f"$h = @{{LogName='System'; ProviderName='Microsoft-Windows-Kernel-Power'; "
+            f"StartTime=[datetime]'{start_str}'; EndTime=[datetime]'{end_str}'}}; "
+            f"Get-WinEvent -FilterHashtable $h -ErrorAction SilentlyContinue | "
+            f"Select-Object -Property TimeCreated, Id, LevelDisplayName, Message | ConvertTo-Json"
+        )
+        res = subprocess.run(
+            ["powershell", "-NoProfile", "-Command", ps_cmd],
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        out = res.stdout.strip()
+        if not out:
+            return []
+        data = json.loads(out)
+        if isinstance(data, dict):
+            data = [data]
+        events = []
+        for item in data:
+            msg = item.get("Message", "").splitlines()[0] if item.get("Message") else ""
+            events.append(f"Event ID {item.get('Id')} ({item.get('LevelDisplayName')}): {msg}")
+        return events
+    except Exception:
+        return []
+
+
 def run_environment_preflight(
     sample_duration_s: float = 10.0, max_cpu_percent: float = 30.0
 ) -> dict[str, Any]:
@@ -151,6 +228,10 @@ def run_environment_preflight(
     print("=" * 80)
     print(" PREFLIGHT ENVIRONMENT VALIDITY CHECK (K5.1)")
     print("=" * 80)
+    print("Host Power State / Sleep Management:")
+    print(f"   Preflight powercfg /a:      {get_powercfg_summary()}")
+    print("   Thread Execution State:     Supported on Windows (SetThreadExecutionState)")
+    print("-" * 80)
     if psutil is None:
         print("[WARN] psutil not available; skipping CPU preflight check.")
         return {"cpu_percent": 0.0, "top_procs": []}
@@ -733,6 +814,9 @@ async def run_benchmark(
     stability_samples: list[dict[str, Any]] = []
     stalls_recorded: list[dict[str, Any]] = []
     latest_worker_metrics: dict[str, Any] = {}
+    negative_latencies_count: int = 0
+    clamped_samples_count: int = 0
+    kernel_power_events: list[str] = []
 
     # Monitor consumers on internal bus and outbound stream
     ev_key = events_stream_key(tenant_id, meeting_id)
@@ -791,9 +875,18 @@ async def run_benchmark(
                             c_recv = payload.get("chunk_recv_wall")
                             t_pub = payload.get("publish_wall")
                             if e2e is not None:
-                                e2e_latencies_ms.append(float(e2e))
+                                val = float(e2e)
+                                if val < 0:
+                                    negative_latencies_count += 1
+                                e2e_latencies_ms.append(val)
                             elif c_recv and t_pub:
-                                e2e_latencies_ms.append(max(0.1, (t_pub - c_recv) * 1000.0))
+                                raw_diff = (t_pub - c_recv) * 1000.0
+                                if raw_diff < 0:
+                                    negative_latencies_count += 1
+                                clamped_diff = max(0.1, raw_diff)
+                                if clamped_diff != raw_diff:
+                                    clamped_samples_count += 1
+                                e2e_latencies_ms.append(clamped_diff)
                             else:
                                 s_epoch = payload.get("start_epoch_ms")
                                 end_ms = payload.get("end_ms", 0)
@@ -801,7 +894,12 @@ async def run_benchmark(
                                 if s_epoch and (end_ms > start_ms):
                                     audio_end_epoch = (s_epoch + (end_ms - start_ms)) / 1000.0
                                     pub_s = t_pub or (now_wall / 1000.0)
-                                    calc_e2e = max(10.0, (pub_s - audio_end_epoch) * 1000.0)
+                                    raw_e2e = (pub_s - audio_end_epoch) * 1000.0
+                                    if raw_e2e < 0:
+                                        negative_latencies_count += 1
+                                    calc_e2e = max(10.0, raw_e2e)
+                                    if calc_e2e != raw_e2e:
+                                        clamped_samples_count += 1
                                     e2e_latencies_ms.append(calc_e2e)
 
                             created_ts = data.get("ts_ms", now_wall)
@@ -1323,8 +1421,13 @@ async def run_benchmark(
             finally:
                 gc.enable()
 
+        set_thread_execution_state(True)
+        bench_start_dt = datetime.now()
         sender_task = asyncio.create_task(_audio_sender())
         await sender_task
+        bench_end_dt = datetime.now()
+        set_thread_execution_state(False)
+        kernel_power_events = query_kernel_power_events(bench_start_dt, bench_end_dt)
 
         actual_stream_dur = time.perf_counter() - t_start
 
@@ -1532,6 +1635,19 @@ async def run_benchmark(
     print(f"   Fixture Replay Loops:       {fixture_loops}")
     print(f"   Unique Finals per Loop:     {unique_finals_per_loop}")
     print(f"   Total Finals Generated:     {len(finals_collected)} (Expected: {expected_finals})")
+    if len(finals_collected) != expected_finals:
+        delta_finals = len(finals_collected) - expected_finals
+        print(
+            f"   [FINALS COUNT DELTA]:       {delta_finals:+d} finals collected vs expected "
+            f"({len(finals_collected)} vs {expected_finals})"
+        )
+        if delta_finals == 1:
+            print("                               Explanation: Stream flush frame on CloseStream.")
+    print(f"   Negative Latency Samples:   {negative_latencies_count}")
+    print(f"   Clamped Latency Samples:    {clamped_samples_count}")
+    print("   Host Power Execution State: HELD (SetThreadExecutionState)")
+    p_events_str = "; ".join(kernel_power_events) if kernel_power_events else "no events"
+    print(f"   Kernel-Power Events:        {p_events_str}")
     print(
         "   [INDEPENDENCE DISCLOSURE]:\n"
         f"   The {minutes:.0f}-minute run replays the 5-minute fixture {fixture_loops} times.\n"

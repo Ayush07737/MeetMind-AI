@@ -1,15 +1,17 @@
 """MeetMind AI — Sarvam Saaras v3 Experimental ASR Provider (B3).
 
 Official Documentation References:
-- Page Title: Sarvam AI Streaming Audio API Reference
-- Official URL: https://docs.sarvam.ai/api-reference/audio-streaming
-- Access Date: 2026-11-06
-- WebSocket Endpoint: wss://api.sarvam.ai/v1/audio/transcribe/stream
-- Languages: Hindi, English, Bengali, Gujarati, Kannada, Malayalam, Marathi,
-  Odia, Punjabi, Tamil, Telugu
-- Regional Processing: India (ap-south-1 / Mumbai local infrastructure)
-- Pricing Source A: Official website (₹0.25/min = ~$0.0030/min = ~$0.18/audio hour)
-- Pricing Source B: Marketplace/Cloud listing ($0.0050/min = ~$0.30/audio hour)
+- Page Title: Sarvam AI Speech-to-Text Streaming API & Pricing Documentation
+- Official URL: https://docs.sarvam.ai/api-reference-docs/speech-to-text/stt/stream
+- Access Date: 2026-11-10
+- WebSocket Endpoint: wss://api.sarvam.ai/speech-to-text/ws?model=saaras:v3
+  (modes: transcribe|translate|verbatim|translit|codemix)
+- Languages: 22 Indian languages + English
+- Streaming Diarization & Keyterm Prompting on /speech-to-text/ws (saaras:v3):
+  UNVERIFIED (live keyterm prompting documented on saaras:v4 batch/REST)
+- Regional Processing: India native infrastructure (Mumbai / ap-south-1)
+- Pricing: Standard STT streaming ~INR 30/hr (~INR 0.50/min, ~$0.35/hr; exact
+  real-time slab UNVERIFIED without funded dashboard)
 """
 
 from __future__ import annotations

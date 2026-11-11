@@ -1,0 +1,43 @@
+{
+  "card_id": "c3b4c5d6-e7f8-4a9b-0c1d-2e3f4a5b6c7d",
+  "revision": 1,
+  "supersedes": null,
+  "meeting_id": "meeting_eng_01",
+  "tenant_id": "tenant_default",
+  "trace_id": "trace_eng_12347",
+  "kind": "fact",
+  "tier": 1,
+  "title": "Missing Evidence Test Card",
+  "blocks": [],
+  "claims": [
+    {
+      "claim_id": "claim_01",
+      "text": "Claim marked verified but has empty evidence list",
+      "type": "assertion",
+      "value": null,
+      "unit": null,
+      "status": "verified",
+      "evidence": []
+    }
+  ],
+  "confidence_band": "low",
+  "confidence_basis": {},
+  "origin": "internal",
+  "status": "verified",
+  "restricted": false,
+  "visible_roles": [],
+  "timing": {
+    "trigger_ts_ms": 1793987130000,
+    "published_ts_ms": 1793987131500
+  },
+  "trigger": {
+    "utterance_id": "utt_abc123def45678901234",
+    "category": "latency_spike",
+    "trigger_confidence": 0.95,
+    "asr_confidence": 0.96,
+    "text_stability": 1.0
+  },
+  "late": false,
+  "abstain_reason": null,
+  "inferred_label": null
+}
