@@ -1,13 +1,15 @@
 """MeetMind AI — Deepgram Flux Experimental ASR Provider (B3).
 
 Official Documentation References:
-- Page Title: Deepgram Flux Streaming API Reference
+- Page Title: Deepgram Flux Streaming API & Pricing Reference
 - Official URL: https://developers.deepgram.com/docs/flux
-- Access Date: 2026-11-06
-- WebSocket Endpoint: wss://api.deepgram.com/v2/listen
+- Pricing URL: https://deepgram.com/pricing
+- Access Date: 2026-11-10
+- WebSocket Endpoint: wss://api.deepgram.com/v2/listen (India: wss://api.in.deepgram.com/v2/listen)
 - Models: flux-general-en, flux-general-multi
 - Events: StartOfTurn, Update, EagerEndOfTurn, TurnResumed, EndOfTurn
-- Pricing: $0.0058 per audio minute ($0.348 per audio hour)
+- Recommended Chunk Size: 80ms linear16 / opus (16 kHz default)
+- Pricing: $0.0077/min ($0.462/hr) PAYG; $0.0065/min Growth (2-ch UNVERIFIED on /v2/listen)
 """
 
 from __future__ import annotations

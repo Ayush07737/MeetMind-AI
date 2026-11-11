@@ -11,6 +11,7 @@ members = [
     "meetmind-gateway",
     "meetmind-integrations",
     "meetmind-orchestration",
+    "meetmind-quality",
     "meetmind-schemas",
     "meetmind-security",
     "meetmind-semantic-memory",
@@ -523,6 +524,21 @@ source = { editable = "backend/integrations" }
 name = "meetmind-orchestration"
 version = "0.1.0"
 source = { editable = "backend/orchestration" }
+
+[[package]]
+name = "meetmind-quality"
+version = "0.1.0"
+source = { editable = "packages/quality" }
+dependencies = [
+    { name = "meetmind-schemas" },
+    { name = "pydantic" },
+]
+
+[package.metadata]
+requires-dist = [
+    { name = "meetmind-schemas", editable = "packages/shared-schemas/schemas_py" },
+    { name = "pydantic", specifier = ">=2.10" },
+]
 
 [[package]]
 name = "meetmind-schemas"

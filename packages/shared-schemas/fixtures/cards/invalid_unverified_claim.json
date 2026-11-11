@@ -1,0 +1,43 @@
+{
+  "card_id": "c2b3c4d5-e6f7-4a8b-9c0d-1e2f3a4b5c6d",
+  "revision": 1,
+  "supersedes": null,
+  "meeting_id": "meeting_eng_01",
+  "tenant_id": "tenant_default",
+  "trace_id": "trace_eng_12346",
+  "kind": "fact",
+  "tier": 1,
+  "title": "Unverified Claim Test Card",
+  "blocks": [],
+  "claims": [
+    {
+      "claim_id": "claim_01",
+      "text": "Unverified assertion regarding system state",
+      "type": "assertion",
+      "value": null,
+      "unit": null,
+      "status": "inferred",
+      "evidence": []
+    }
+  ],
+  "confidence_band": "low",
+  "confidence_basis": {},
+  "origin": "internal",
+  "status": "verified",
+  "restricted": false,
+  "visible_roles": [],
+  "timing": {
+    "trigger_ts_ms": 1793987130000,
+    "published_ts_ms": 1793987131500
+  },
+  "trigger": {
+    "utterance_id": "utt_abc123def45678901234",
+    "category": "latency_spike",
+    "trigger_confidence": 0.95,
+    "asr_confidence": 0.96,
+    "text_stability": 1.0
+  },
+  "late": false,
+  "abstain_reason": null,
+  "inferred_label": null
+}

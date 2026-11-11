@@ -271,3 +271,45 @@ def test_clock_estimator_asymmetric_and_jitter_data():
 
     print(f"Max Error Observed Across Jitter: {max_observed_error}ms")
     print("-------------------------------------------------\n")
+
+
+def test_gateway_clamp_capture_server_ms_sntp_tolerance():
+    """Gateway caps minor SNTP jitter silently while auditing anomalous future/past shifts."""
+    from meetmind_gateway.ws_endpoint import _clamp_capture_server_ms
+
+    gw_recv_ms = 1_730_000_000_000
+    max_age_ms = 15_000
+
+    # Minor SNTP asymmetry residual (+5ms, RTT=40ms -> tolerance=100ms):
+    # capped to gw_recv_ms for monotonicity without emitting future_clamp audit
+    val, clamped, reason = _clamp_capture_server_ms(
+        raw_capture_server_ms=gw_recv_ms + 5,
+        gw_recv_ms=gw_recv_ms,
+        max_age_ms=max_age_ms,
+        rtt_ms=40,
+    )
+    assert val == gw_recv_ms
+    assert clamped is False
+    assert reason == "none"
+
+    # Genuine future anomaly (+60s): capped and audited as future_clamp
+    val, clamped, reason = _clamp_capture_server_ms(
+        raw_capture_server_ms=gw_recv_ms + 60_000,
+        gw_recv_ms=gw_recv_ms,
+        max_age_ms=max_age_ms,
+        rtt_ms=40,
+    )
+    assert val == gw_recv_ms
+    assert clamped is True
+    assert reason == "future_clamp"
+
+    # Genuine past anomaly (-60s): clamped to gw_recv_ms - max_age_ms and audited as past_clamp
+    val, clamped, reason = _clamp_capture_server_ms(
+        raw_capture_server_ms=gw_recv_ms - 60_000,
+        gw_recv_ms=gw_recv_ms,
+        max_age_ms=max_age_ms,
+        rtt_ms=40,
+    )
+    assert val == gw_recv_ms - max_age_ms
+    assert clamped is True
+    assert reason == "past_clamp"

@@ -40,8 +40,8 @@ async def test_real_uvicorn_ws_handshake_succeeds_then_receives_4401():
     thread = threading.Thread(target=server.run, daemon=True)
     thread.start()
 
-    # Wait for uvicorn server to start
-    for _ in range(120):
+    # Wait for uvicorn server to start (JWKS pre-warm timeout 5s + DB pool warm)
+    for _ in range(400):
         if server.started:
             break
         await asyncio.sleep(0.05)

@@ -1,0 +1,82 @@
+{
+  "card_id": "c1a2b3c4-d5e6-4f7a-8b9c-0d1e2f3a4b5c",
+  "revision": 1,
+  "supersedes": null,
+  "meeting_id": "meeting_eng_01",
+  "tenant_id": "tenant_default",
+  "trace_id": "trace_eng_12345",
+  "kind": "fact",
+  "tier": 1,
+  "title": "PostgreSQL Composite Index Status (PLAT-101)",
+  "blocks": [
+    {
+      "type": "paragraph",
+      "content": "Composite B-tree index on (tenant_id, session_id) was merged in PR-482 to mitigate 450ms p99 latency spikes."
+    }
+  ],
+  "claims": [
+    {
+      "claim_id": "claim_01",
+      "text": "PR-482 addresses PLAT-101 latency spike",
+      "type": "identifier",
+      "value": "PR-482",
+      "unit": null,
+      "status": "verified",
+      "evidence": [
+        {
+          "source_type": "pull_request",
+          "source_id": "github:meetmind/backend/pull/482",
+          "uri": "https://github.com/org/repo/pull/482",
+          "span": "Fixes #PLAT-101 by adding composite index on tenant_id and session_id",
+          "retrieved_at": 1793987131000,
+          "as_of": 1793987130000
+        }
+      ]
+    },
+    {
+      "claim_id": "claim_02",
+      "text": "Observed p99 latency was 450 ms at 2500 rps",
+      "type": "number",
+      "value": 450,
+      "unit": "ms",
+      "status": "verified",
+      "evidence": [
+        {
+          "source_type": "internal",
+          "source_id": "datadog:metric:redis.latency.p99",
+          "uri": "https://app.datadoghq.com/metric/redis.latency.p99",
+          "span": "redis.latency.p99 value=450ms rate=2500rps",
+          "retrieved_at": 1793987131000,
+          "as_of": 1793987100000
+        }
+      ]
+    }
+  ],
+  "confidence_band": "high",
+  "confidence_basis": {
+    "retrieval_score": 0.92,
+    "source_freshness": 0.88,
+    "asr_confidence": 0.96,
+    "verifier_result": 1.0
+  },
+  "origin": "internal",
+  "status": "verified",
+  "restricted": false,
+  "visible_roles": [],
+  "timing": {
+    "trigger_ts_ms": 1793987130000,
+    "published_ts_ms": 1793987131500,
+    "retrieval_ms": 120.5,
+    "reasoning_ms": 25.0
+  },
+  "trigger": {
+    "utterance_id": "utt_abc123def45678901234",
+    "category": "latency_spike",
+    "trigger_confidence": 0.95,
+    "asr_confidence": 0.96,
+    "text_stability": 1.0
+  },
+  "late": false,
+  "abstain_reason": null,
+  "inferred_label": null
+}

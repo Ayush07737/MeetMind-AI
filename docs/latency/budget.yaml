@@ -1,7 +1,4 @@
 # MeetMind AI — Latency Budget Specification as Code (Q2)
-#
-# Defines platform quality contracts, stage SLA ceilings, observed cloud measurements,
-# simulated delays for test harnesses, and memory stability limits.
 
 version: "1.0.0"
 
@@ -40,7 +37,7 @@ stages:
       p95_ms: 1596.37
       date: "2026-11-01"
       log_path: "logs/bench30.log"
-      note: "Measured on 30-minute Nova-3 stream via India cloud endpoint (api.in.deepgram.com) with 61.0ms WS RTT"
+      note: "Measured on ASR-receipt clock over 30-minute Nova-3 stream via India cloud endpoint (api.in.deepgram.com) with 61.0ms WS RTT; valid 2026-11-06 stats30 observed interim P50=608.5ms at 107.7ms WS RTT"
 
   stable_trigger_text:
     name: "Stable Trigger Final Transcript Available"
@@ -55,7 +52,7 @@ stages:
       service_p95_ms: 4.93
       date: "2026-11-01"
       log_path: "logs/bench30.log"
-      note: "Measured on 30-minute run; P95 tail driven by acoustic sentence accumulation before endpointing"
+      note: "Measured on ASR-receipt clock; P95 tail driven by acoustic sentence accumulation before endpointing"
 
   intent_classification:
     name: "Real-Time Intent & Category Classification"
@@ -126,3 +123,88 @@ history:
     service_p95_ms: 4.93
     ws_rtt_ms: 61.03
     note: "Authoritative 30-minute continuous run on India cloud endpoint"
+  - date: "2026-11-06"
+    source: "logs/q0a_stats30_india.log"
+    interim_p50_ms: 608.50
+    e2e_p50_ms: 440.10
+    service_p95_ms: 7.25
+    ws_rtt_ms: 107.65
+    note: "Valid 30-minute post-sleep-fix stats run on India endpoint"
+
+# Section D — Proposed Latency Lanes (Design Only; Do NOT claim met without T0-clock run)
+lanes:
+  baseline_note: >-
+    Observed ASR latencies (~440ms finals P50, ~590-610ms interim P50) are measured on the
+    ASR-receipt clock. End-to-end T0-clock numbers are NOT MET until client-capture-to-ASR
+    legs are measured live. Do not claim any lane is met without a full T0-clock run.
+  t0_gap_measurements:
+    - leg: "client_capture_to_gateway_ingress_ms"
+      description: "Audio frame encode + public internet uplink RTT/2 from Chrome Extension/Desktop to Gateway WebSocket"
+      owner: "Extension (#3) / Gateway (#1)"
+    - leg: "clock_sync_residual_error_ms"
+      description: "Client-to-server clock offset drift after protocol clock_sync calibration"
+      owner: "Gateway (#1)"
+    - leg: "gateway_to_redis_and_asr_recv_ms"
+      description: "Gateway XADD + Redis Streams propagation + ASR XREADGROUP dequeue before provider send"
+      owner: "Gateway (#1) / ASR (#2)"
+    - leg: "outbound_card_pub_to_ui_render_ms"
+      description: "Redis out stream -> Gateway WS forwarder -> Frontend WebSocket -> DOM paint"
+      owner: "Gateway (#1) / Frontend (#11)"
+
+  lane_0_instant:
+    name: "Lane 0 — Instant Transcript + Deterministic Entity Chips (Zero LLM)"
+    status: "Proposed Design (Q-0c — Owner Confirmation Required; NOT MET until T0-clock run)"
+    clock: "t0_capture -> ui_render (live transcript + regex/lexicon chips)"
+    target_p50_ms: 1000
+    target_p95_ms: 2000
+    arithmetic_breakdown:
+      asr_interim_p50_observed_ms: 600
+      asr_service_overhead_p50_ms: 7
+      remaining_budget_p50_ms: 393
+      remaining_allocations:
+        network_legs_uplink_plus_downlink_ms: 180
+        classification_regex_lexicon_ms: 40
+        retrieval_local_cache_ms: 30
+        rendering_and_ws_push_ms: 50
+        unallocated_margin_ms: 93
+
+  lane_1_retrieval:
+    name: "Lane 1 — Tier-1 Evidence Card (Retrieval Only, Zero LLM)"
+    status: "Proposed Design (Q-0c — Owner Confirmation Required; NOT MET until T0-clock run)"
+    clock: "t0_capture -> ui_render (tier 1 verified card)"
+    target_p50_ms: 1500
+    target_p95_ms: 3000
+    arithmetic_breakdown:
+      asr_final_p50_observed_ms: 440
+      asr_final_p95_observed_ms: 1930
+      remaining_budget_p50_ms: 1060
+      remaining_budget_p95_ms: 1070
+      remaining_allocations_p50:
+        network_legs_uplink_plus_downlink_ms: 220
+        classification_fast_path_ms: 150
+        retrieval_cache_or_index_and_verify_ms: 450
+        rendering_and_publish_ms: 80
+        unallocated_margin_ms: 160
+
+  lane_2_reasoned:
+    name: "Lane 2 — Tier-2 Reasoned Analytical Card"
+    status: "Proposed Design (Q-0c — Owner Confirmation Required; NOT MET until T0-clock run)"
+    clock: "t0_capture -> ui_render (tier 2 reasoned card)"
+    target_p50_ms: null
+    target_p95_ms: 4000
+    arithmetic_breakdown:
+      asr_final_p95_observed_ms: 1930
+      remaining_budget_p95_ms: 2070
+      remaining_allocations_p95:
+        network_legs_uplink_plus_downlink_ms: 250
+        classification_and_context_assembly_ms: 350
+        retrieval_and_llm_reasoning_plus_verify_ms: 1200
+        rendering_and_revision_publish_ms: 100
+        unallocated_margin_ms: 170
+
+  post_meeting:
+    name: "Post-Meeting Batch Digest & Outcome Linkage"
+    status: "No real-time latency target"
+    clock: "meeting_ended -> summary_ready"
+    target_p50_ms: null
+    target_p95_ms: null

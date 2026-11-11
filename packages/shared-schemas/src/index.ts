@@ -406,6 +406,15 @@ export const DegradedReasonSchema = z.enum([
 ]);
 export type DegradedReason = z.infer<typeof DegradedReasonSchema>;
 
+export const WordTimingSchema = z.object({
+  w: z.string(),
+  start_ms: z.number().int(),
+  end_ms: z.number().int(),
+  confidence: z.number(),
+  speaker: z.union([z.number(), z.string()]).nullable().optional(),
+});
+export type WordTiming = z.infer<typeof WordTimingSchema>;
+
 export const TranscriptFinalPayloadSchema = z.object({
   utterance_id: z.string().length(24),
   speaker_id: z.string(),
@@ -426,6 +435,7 @@ export const TranscriptFinalPayloadSchema = z.object({
   publish_wall: z.number().nullable().optional(),
   e2e_ms: z.number().nullable().optional(),
   late: z.boolean().default(false).optional(),
+  words: z.array(WordTimingSchema).optional(),
 });
 export type TranscriptFinalPayload = z.infer<typeof TranscriptFinalPayloadSchema>;
 
@@ -442,8 +452,34 @@ export const TranscriptInterimPayloadSchema = z.object({
   provider: z.string(),
   model: z.string(),
   is_stable: z.boolean().default(false),
+  stable_prefix_words: z.number().int().default(0).optional(),
 });
 export type TranscriptInterimPayload = z.infer<typeof TranscriptInterimPayloadSchema>;
+
+export const TriggerCandidatePayloadSchema = z.object({
+  candidate_id: z.string().min(1),
+  meeting_id: z.string().min(1),
+  tenant_id: z.string().min(1),
+  utterance_id: z.string().min(1),
+  stable_prefix_words: z.number().int(),
+  text: z.string(),
+  confidence: z.number(),
+  trigger_category: z.string(),
+  created_ts_ms: z.number().int(),
+});
+export type TriggerCandidatePayload = z.infer<typeof TriggerCandidatePayloadSchema>;
+
+export const TriggerConfirmedPayloadSchema = z.object({
+  candidate_id: z.string().nullable().optional(),
+  meeting_id: z.string().min(1),
+  tenant_id: z.string().min(1),
+  utterance_id: z.string().min(1),
+  text: z.string(),
+  confidence: z.number(),
+  trigger_category: z.string(),
+  confirmed_ts_ms: z.number().int(),
+});
+export type TriggerConfirmedPayload = z.infer<typeof TriggerConfirmedPayloadSchema>;
 
 export const TranscriptServiceDegradedPayloadSchema = z.object({
   state: DegradedStateSchema,
@@ -544,3 +580,4 @@ export function activeMeetingsSetKey(): string {
 }
 
 export * from "./budget.js";
+export * from "./cards.js";
