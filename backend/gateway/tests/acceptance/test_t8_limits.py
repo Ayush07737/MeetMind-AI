@@ -18,7 +18,7 @@ from conftest import ServerHarness, exchange_ws_ticket
 from meetmind_schemas.events import WSCloseCode
 from websockets.exceptions import ConnectionClosed
 
-pytestmark = [pytest.mark.integration, pytest.mark.timeout(120)]
+pytestmark = [pytest.mark.integration]  # 13.56s observed (~2x=27s; global 30s default)
 
 
 @pytest.mark.asyncio

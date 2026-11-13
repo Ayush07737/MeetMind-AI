@@ -1,31 +1,125 @@
-"""MeetMind AI — Shared ASR Evaluation Normalizer (B4).
+"""MeetMind AI — Shared ASR Evaluation Normalizer (A1.1 / B4).
 
 Applied identically to reference and hypothesis transcripts for fair, reproducible
-evaluation across ASR candidates (Deepgram Nova-3, Flux, Sarvam Saaras v3, OpenAI).
+evaluation across ASR candidates (Deepgram Nova-3, Flux, Gladia, AssemblyAI, Sarvam, OpenAI).
 
 Rules:
-1. Lowercase all text.
-2. Punctuation removal: strip commas, periods, quotes, exclamation marks, question marks,
-   semicolons, colons, brackets, parentheses.
+1. Script Detection & Common-Script Transliteration:
+   - Detect Latin vs Devanagari vs Mixed script per hypothesis (`detect_script`).
+   - Transliterate Devanagari spans to Romanized Latin using `indic-transliteration`
+     (ITRANS + documented casual Hinglish orthographic cleanup; MIT License) so Hinglish
+     WER is never inflated by script mismatch.
+   - Expose English-tokens-only WER for Hinglish (`compute_hinglish_english_wer`) alongside
+     common-script Hinglish WER (`compute_hinglish_translit_wer`).
+2. Lowercase all text & remove punctuation (preserving version dots and identifier hyphens).
 3. Currency & Fused Token Normalization:
    - "rs.", "rs", "inr", "rupees" -> "inr"
-   - fused tokens: "rs150" -> "inr 150", "inr12" -> "inr 12", "$50m" -> "50 million usd"
+   - fused tokens: "rs150" -> "inr 150", "inr12" -> "inr 12"
    - "$", "usd", "dollars" -> "usd"
-4. Spoken to Digits Number Normalization:
-   - "zero".."nineteen", "twenty".."ninety" mapped to integer strings.
-   - Compound words: "twenty five" -> "25".
-   - Indian denominations: "lakh", "lakhs", "lac", "lacs" -> "lakh";
-     "crore", "crores", "cr" -> "crore".
-   - Western denominations: "thousand", "million", "billion" preserved or canonicalized.
-   - Percentages: "percent", "pct", "%" -> "percent".
-   - Basis points: "basis points", "bps" -> "bps".
-5. Exact match extraction of canonical numbers for Numeric-Token Error Rate (NTER).
+4. Spoken to Digits Number Normalization & Canonical Numeric/Identifier Extraction (NTER/IEMR).
 """
 
 from __future__ import annotations
 
 import re
 from typing import Any
+
+from indic_transliteration import sanscript
+
+TRANSLIT_LIBRARY = "indic-transliteration"
+TRANSLIT_LICENSE = "MIT"
+TRANSLIT_SCHEME = "sanscript.DEVANAGARI -> sanscript.ITRANS + lowercase Hinglish cleanup"
+
+# Closed-set conversational Hindi words used in Engineering Corpus v2 Hinglish segments.
+# Used by `filter_english_tokens` so English-only Hinglish WER isolates technical/numeric/
+# English recognition quality independently of Hindi transliteration conventions.
+HINGLISH_HINDI_STOPWORDS: frozenset[str] = frozenset(
+    {
+        "aa",
+        "aate",
+        "aur",
+        "baad",
+        "baar",
+        "badhta",
+        "bar",
+        "bhai",
+        "bhej",
+        "bhi",
+        "bina",
+        "dekhna",
+        "dena",
+        "dikha",
+        "din",
+        "diya",
+        "diye",
+        "do",
+        "dono",
+        "dusra",
+        "ek",
+        "gaya",
+        "gaye",
+        "ghante",
+        "hai",
+        "hain",
+        "ho",
+        "hoon",
+        "humne",
+        "isliye",
+        "jaa",
+        "kar",
+        "karke",
+        "karte",
+        "karti",
+        "ke",
+        "ki",
+        "kiya",
+        "ko",
+        "konsa",
+        "kya",
+        "lag",
+        "lekin",
+        "lena",
+        "liye",
+        "lo",
+        "lungi",
+        "main",
+        "me",
+        "mein",
+        "na",
+        "ne",
+        "padega",
+        "pe",
+        "raha",
+        "rahe",
+        "rahi",
+        "rehte",
+        "sabhi",
+        "sakta",
+        "se",
+        "sirf",
+        "tha",
+        "the",
+        "zyaada",
+        "zyada",
+        "bhejna",
+        "check_hi",
+        "chuka",
+        "chuki",
+        "ka",
+        "karna",
+        "karni",
+        "karo",
+        "kia",
+        "kuch",
+        "par",
+        "phir",
+        "toh",
+        "wala",
+        "wali",
+        "yeh",
+        "ye",
+    }
+)
 
 # Word to number mapping
 SMALL_NUMBERS = {
@@ -97,6 +191,74 @@ NUM_WORDS_PAT = "|".join(ALL_NUMBERS.keys())
 ID_PREFIXES = ["plat", "eng", "front", "infra", "data", "core", "tech", "sec", "inc", "adr", "pr"]
 ID_PREFIX_PAT = "|".join(ID_PREFIXES)
 
+_DEVA_SPAN_RE = re.compile(r"[\u0900-\u097F]+")
+
+
+def detect_script(text: str) -> str:
+    """Classify hypothesis script using Unicode Devanagari vs Latin codepoints.
+
+    Returns one of: ``'Empty'``, ``'Latin'``, ``'Devanagari'``, ``'Mixed'``, ``'Other'``.
+    """
+    if not text or not text.strip():
+        return "Empty"
+    n_deva = 0
+    n_latin = 0
+    n_alpha_other = 0
+    for ch in text:
+        if "\u0900" <= ch <= "\u097f":
+            n_deva += 1
+        elif "a" <= ch.lower() <= "z":
+            n_latin += 1
+        elif ch.isalpha():
+            n_alpha_other += 1
+    if n_deva > 0 and n_latin > 0:
+        return "Mixed"
+    if n_deva > 0:
+        return "Devanagari"
+    if n_latin > 0:
+        return "Latin"
+    if n_alpha_other > 0:
+        return "Other"
+    return "Other"
+
+
+def transliterate_devanagari_to_latin(text: str) -> str:
+    """Transliterate Devanagari spans to Romanized Latin using indic-transliteration (MIT).
+
+    Leaves existing Latin/ASCII characters, numbers, and symbols intact while converting
+    Devanagari spans (`[\\u0900-\\u097F]+`) via `sanscript.ITRANS`, followed by documented
+    lowercase Hinglish normalization (candra-o `ॅ`/`ॉ` -> `o`, anusvara `M` -> `n`,
+    geminate/schwa tail trim, and `|` danda -> space).
+    """
+    if not text:
+        return ""
+    if not _DEVA_SPAN_RE.search(text):
+        return text
+
+    # Pre-normalize Devanagari candra-o/e and nukta forms common in transliterated English loanwords
+    cleaned = text.replace("\u0949", "\u094b").replace("\u0945", "\u0947").replace("\u0964", " ")
+
+    def _conv(m: re.Match[str]) -> str:
+        raw_deva = m.group(0)
+        it = sanscript.transliterate(raw_deva, sanscript.DEVANAGARI, sanscript.ITRANS)
+        # Map ITRANS ASCII diacritics while preserving vowel-case distinction for schwa trimming
+        it = it.replace("~N", "n").replace("N^", "n").replace("Ch", "ch").replace("sh", "sh")
+        it = it.replace("Sh", "sh").replace(".n", "n").replace(".N", "n").replace("M", "n")
+        it = it.replace("R^i", "ri").replace("R^I", "ri")
+        # Trim unwritten final inherent schwa (lowercase `-a`, NOT long vowel `-A`)
+        if len(it) > 2 and it.endswith("a") and it[-2].lower() not in "aeiou":
+            it = it[:-1]
+        return it.lower()
+
+    return _DEVA_SPAN_RE.sub(_conv, cleaned)
+
+
+def filter_english_tokens(text: str, transliterate: bool = True) -> list[str]:
+    """Extract normalized tokens excluding closed-set Hinglish Hindi glue words."""
+    src = transliterate_devanagari_to_latin(text) if transliterate else text
+    norm = normalize_text(src)
+    return [tok for tok in norm.split() if tok not in HINGLISH_HINDI_STOPWORDS]
+
 
 def normalize_engineering_terms(text: str) -> str:
     """Normalize spoken engineering identifiers, metrics, and versions."""
@@ -157,13 +319,14 @@ def normalize_engineering_terms(text: str) -> str:
     return t
 
 
-def normalize_text(text: str) -> str:
+def normalize_text(text: str, transliterate_devanagari: bool = True) -> str:
     """Normalize text into canonical token sequence."""
     if not text:
         return ""
 
-    # 0. Engineering terms, versions, identifiers, and percentiles
-    t = normalize_engineering_terms(text)
+    # 0. Transliterate Devanagari spans if enabled, then normalize engineering terms & versions
+    src = transliterate_devanagari_to_latin(text) if transliterate_devanagari else text
+    t = normalize_engineering_terms(src)
 
     # 1. Expand currency abbreviations and fused currency tokens
     t = re.sub(r"\brs\.?\s*", "inr ", t)
@@ -294,14 +457,7 @@ def extract_canonical_numbers(text: str) -> list[dict[str, Any]]:
     return numbers
 
 
-def compute_normalized_wer(reference: str, hypothesis: str) -> float:
-    """Compute WER between normalized reference and hypothesis."""
-    norm_ref = normalize_text(reference)
-    norm_hyp = normalize_text(hypothesis)
-
-    ref_words = norm_ref.split()
-    hyp_words = norm_hyp.split()
-
+def _word_error_rate(ref_words: list[str], hyp_words: list[str]) -> float:
     if not ref_words:
         return 0.0 if not hyp_words else 1.0
 
@@ -326,6 +482,27 @@ def compute_normalized_wer(reference: str, hypothesis: str) -> float:
                 )
 
     return float(dp[r_len][h_len]) / float(r_len)
+
+
+def compute_normalized_wer(
+    reference: str, hypothesis: str, transliterate_devanagari: bool = True
+) -> float:
+    """Compute WER between normalized reference and hypothesis.
+
+    When ``transliterate_devanagari`` is True (default), Devanagari characters in either
+    string are transliterated to Romanized Latin before normalization so code-switched
+    hypotheses are not penalized purely by script choice.
+    """
+    norm_ref = normalize_text(reference, transliterate_devanagari=transliterate_devanagari)
+    norm_hyp = normalize_text(hypothesis, transliterate_devanagari=transliterate_devanagari)
+    return _word_error_rate(norm_ref.split(), norm_hyp.split())
+
+
+def compute_hinglish_english_wer(reference: str, hypothesis: str) -> float:
+    """Compute WER restricted to non-Hindi (English + numeric + ID) tokens on Hinglish turns."""
+    ref_eng = filter_english_tokens(reference, transliterate=True)
+    hyp_eng = filter_english_tokens(hypothesis, transliterate=True)
+    return _word_error_rate(ref_eng, hyp_eng)
 
 
 def compute_numeric_token_error_rate(reference: str, hypothesis: str) -> dict[str, Any]:

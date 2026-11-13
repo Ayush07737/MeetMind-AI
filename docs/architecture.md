@@ -40,6 +40,7 @@ graph TB
     subgraph Extensibility["Extensibility"]
         DPF["Domain Pack Framework (§19)"]
         EDP["Engineering Domain Pack (§20)"]
+        OUT["Outcome Tracker (§22)"]
     end
 
     EXT --> GW
@@ -97,6 +98,13 @@ graph TB
 | 18  | Advanced Agent Cognition Upgrade           | #7, #11                | Cross-cutting |
 | 19  | Domain Pack Framework                      | #6, #7                 | Extensibility |
 | 20  | Engineering Domain Pack                    | #19                    | Extensibility |
+| 22  | Outcome Tracker (`SPEC-AMENDMENT-Q0`)      | #8, #12, #14           | Extensibility |
+
+## Quality Contracts & Domain Strategy (`Q-0` / `ADR-008..012`)
+
+- **Shared Contracts & Quality Gatekeeper (`meetmind_schemas`, `meetmind_quality`)**: All components from §6 onward build against unified `T0` server-clock timing envelopes (`docs/latency/clocks.md`), declarative latency/memory ceilings (`docs/latency/budget.yaml`), strict evidence-backed `InsightCard` schemas (`ADR-009`), abstention-by-default verification (`verify_card` / `publish_decision`), and end-to-end Decision Genome schemas (`meetmind_schemas.graph`, `ADR-011`).
+- **Two-Lane ASR & Classification Constraints**: §6 classification (`<= 200 ms` P50 / `300 ms` P95) strictly excludes remote LLM calls (`ADR-008`). Streaming ASR serves real-time UX with India endpoint pinning & `mip_opt_out=true`, while async post-meeting passes remain configurable under `ADR-012` and regional LLM ZDR rules under `ADR-010`.
+- **Engineering-First Domain Ordering**: Engineering & Development (`docs/spec-amendments/engineering-pack.md`) is the sole active v1 vertical; Financial Advisory and Enterprise Sales packs stay `SPEC-ONLY` until traction gates (`docs/product/traction-gates.md`) are met.
 
 ## Technology Stack
 

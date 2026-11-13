@@ -70,17 +70,33 @@ All connectors are **read-only first** (`Zero Autonomous Mutation Invariant`: Me
 
 ---
 
-## 5. Outcome Tracker Chain
+## 5. Outcome Tracker Chain (§22 Spec Alignment)
 
-MeetMind AI tracks engineering commitments across five linked verification states (read-only attribution):
+MeetMind AI tracks engineering commitments across five linked verification states (`meetmind_schemas.graph`, ADR-011, and §22 in `docs/spec-amendments/q0.md` — read-only attribution):
 
 ```
-decision (decision_agreed + owner) -> ticket (PLAT-*) -> PR (PR-*) -> deploy (env + version/sha) -> metric (p99 / error_rate / SLO)
+Decision (expected_outcome, owner, review_date)
+  -[:EXECUTED_AS]-> Action -[:REFERENCES]-> Entity(Ticket: PLAT-*)
+  -> Entity(PullRequest: PR-*) -> Entity(Deployment: env + version/sha)
+  -[:RESULTED_IN]-> Outcome(actual_value vs target)
 ```
+
+Supported `Entity` subtypes in `meetmind_schemas.graph`: `Ticket`, `PullRequest`, `Deployment`, `Incident`, `Service`.
 
 ---
 
-## 6. Deferred Verticals (SPEC-ONLY — Zero Code Permitted)
+## 6. Quality Contracts, Latency Lanes & Abstention Gates (Q-0d Alignment)
+
+All future §6–§18 components implementing the Engineering Domain Pack are governed by **ADR-008 through ADR-012** and `docs/spec-amendments/q0.md`:
+
+- **Clock & Budget Constraints (ADR-008, `docs/latency/budget.yaml`)**: §6 Trigger Classification (`<= 200 ms` P50 / `<= 300 ms` P95) **cannot invoke an LLM API call**; it must execute via rules/lexicons or local embeddings (`<= 50 ms`). End-to-end lanes (`Lane 0 <= 1s/2s`, `Lane 1 <= 1.5s/3s`, `Lane 2 <= 4s` P95) remain `NOT MET` until live T0-clock client-to-UI legs are measured.
+- **Evidence & Abstention-by-Default (ADR-009, `meetmind_quality`)**: `InsightCard` publication defaults to **`ABSTAIN`** on missing/stale/conflicting evidence, `asr_uncertainty > 0.35` (`"heard as"` store-only), identifier/numeric confusion (`PLAT-123` vs `PLAT-213`, `450 ms` vs `4.5 s`), spoken secrets (`restricted_secret`), or `disagreement_signalled`. Both publishers and the Gateway enforce `validate_outbound_card`.
+- **Golden Evaluation CI Gates (`scripts/eval_quality.py`, `ml/eval/golden/README.md`)**: Held-out evaluation (`EVAL_HELDOUT_PATH`, unseen by agents, `min_cases_for_claim >= 300`) gates every release at `displayed_unsupported_claim_rate == 0.0`, `abstention_correctness >= 0.95`, `supported_claim_precision >= 0.98`, and `HIGH`-band precision `>= 0.95`.
+- **Two-Lane ASR & Regional ZDR Compliance (ADR-010, ADR-012)**: Live streaming prefers regional endpoints with ZDR/`mip_opt_out=true` and `stable_prefix_words`; optional async post-meeting accuracy pass feeds §8 Decision Genome when enabled; India-pinned LLM reasoning is restricted per ADR-010 (`in.api.openai.com` ZDR+`gpt-6-luna` or verified `asia-south1` Vertex ZDR).
+
+---
+
+## 7. Deferred Verticals (SPEC-ONLY — Zero Code Permitted)
 
 **Financial Advisory Pack (`SPEC-ONLY`)**: Reserved future vertical for wealth-management client calls requiring SEBI/FINRA disclaimer rules, INR crore/lakh numeric verification, portfolio-holding freshness checks, and restricted compliance role visibility; zero connectors, prompts, or classifiers may be built until all traction gates (`docs/product/traction-gates.md`) are met.
 

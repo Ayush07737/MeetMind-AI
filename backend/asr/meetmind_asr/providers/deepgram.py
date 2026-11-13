@@ -316,8 +316,38 @@ class DeepgramProvider(ASRProvider):
                     start_ms = int(float(w_start) * 1000)
 
             speaker = 0
-            if words:
-                speaker = int(words[0].get("speaker", 0))
+            if words and words[0].get("speaker") is not None:
+                speaker = int(words[0]["speaker"])
+
+            norm_words: list[dict[str, Any]] = []
+            for w in words:
+                w_text = str(w.get("punctuated_word") or w.get("word") or "").strip()
+                if not w_text:
+                    continue
+                w_s_raw = w.get("start")
+                w_e_raw = w.get("end")
+                w_start_ms = int(round(float(w_s_raw) * 1000)) if w_s_raw is not None else start_ms
+                w_end_ms = (
+                    int(round(float(w_e_raw) * 1000))
+                    if w_e_raw is not None
+                    else max(w_start_ms, end_ms)
+                )
+                if w_end_ms < w_start_ms:
+                    w_end_ms = w_start_ms
+                w_conf_raw = w.get("confidence")
+                w_conf = (
+                    round(float(w_conf_raw), 4) if w_conf_raw is not None else round(confidence, 4)
+                )
+                w_spk = w.get("speaker")
+                norm_words.append(
+                    {
+                        "w": w_text,
+                        "start_ms": w_start_ms,
+                        "end_ms": w_end_ms,
+                        "confidence": w_conf,
+                        "speaker": int(w_spk) if isinstance(w_spk, (int, float)) else w_spk,
+                    }
+                )
 
             ev_type = "final" if is_final else "interim"
             now_ev = time.time()
@@ -337,6 +367,7 @@ class DeepgramProvider(ASRProvider):
                     channel=channel_index,
                     is_final=is_final,
                     is_stable=speech_final or is_final,
+                    words=norm_words,
                     raw=msg,
                     recv_perf=recv_perf,
                 )

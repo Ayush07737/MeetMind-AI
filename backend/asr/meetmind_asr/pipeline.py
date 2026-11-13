@@ -125,6 +125,7 @@ class MeetingPipeline:
             maxlen=300
         )
         self._seen_interim_words: set[tuple[str, int]] = set()
+        self._prev_interim_tokens: dict[int, list[str]] = {}
         self._standby_provider: ASRProvider | None = None
 
         # Provider session timeline tracking (Requirement 2: no TimelineMapper for latency)
@@ -144,6 +145,16 @@ class MeetingPipeline:
         self._all_dispatched_client_seqs: collections.deque[int] = collections.deque(maxlen=5000)
         self._detected_gaps: list[dict[str, Any]] = []
         self._reconnect_attempts: list[dict[str, Any]] = []
+
+        # Cumulative stats for worker handoff / recycle (Requirement A1.2)
+        self._cumulative_chunks_sent: int = 0
+        self._cumulative_bytes_sent: int = 0
+        self._cumulative_reconnect_count: int = 0
+        self._cumulative_dropped_chunks_count: int = 0
+        self._cumulative_degraded_s: float = 0.0
+        self._cumulative_gaps: list[dict[str, Any]] = []
+        self._cumulative_accepted_seqs: set[int] = set()
+        self._cumulative_sent_seqs: list[int] = []
 
         # Outage and catch-up state
         self._is_catching_up = False
@@ -237,6 +248,40 @@ class MeetingPipeline:
                         self._timeline.meeting_origin_capture_ts = int(origin_raw)
         except Exception as exc:
             logger.warning("Failed to load metadata for %s: %s", self.meeting_id, exc)
+
+        # Load cumulative worker metrics if this meeting is continuing across worker recycle (A1.2)
+        try:
+            cum_key = f"mm:{self.tenant_id}:asr_cumulative:{self.meeting_id}"
+            cum_raw = await self.redis.hgetall(cum_key)
+            if cum_raw:
+                decoded = {
+                    (k.decode("utf-8") if isinstance(k, bytes) else str(k)): (
+                        v.decode("utf-8") if isinstance(v, bytes) else str(v)
+                    )
+                    for k, v in cum_raw.items()
+                }
+                self._cumulative_chunks_sent = int(decoded.get("chunks_sent", 0))
+                self._cumulative_bytes_sent = int(decoded.get("bytes_sent", 0))
+                self._cumulative_reconnect_count = int(decoded.get("reconnects", 0))
+                self._cumulative_dropped_chunks_count = int(decoded.get("dropped_chunks", 0))
+                self._cumulative_degraded_s = float(decoded.get("degraded_seconds", 0.0))
+                if "gaps" in decoded:
+                    with contextlib.suppress(Exception):
+                        self._cumulative_gaps = json.loads(decoded["gaps"])
+                if "accepted_seqs" in decoded:
+                    with contextlib.suppress(Exception):
+                        self._cumulative_accepted_seqs = set(json.loads(decoded["accepted_seqs"]))
+                if "sent_seqs" in decoded:
+                    with contextlib.suppress(Exception):
+                        self._cumulative_sent_seqs = json.loads(decoded["sent_seqs"])
+                logger.info(
+                    "Meeting %s loaded cumulative recycle state: chunks_sent=%d, reconnects=%d",
+                    self.meeting_id,
+                    self._cumulative_chunks_sent,
+                    self._cumulative_reconnect_count,
+                )
+        except Exception as exc:
+            logger.warning("Failed to load cumulative metrics for %s: %s", self.meeting_id, exc)
 
         # Seed deduplicator from existing finals on the internal bus for crash recovery failover
         try:
@@ -351,28 +396,6 @@ class MeetingPipeline:
                 self.meeting_id,
                 exc,
             )
-
-    def _find_chunk_for_end_ms(self, end_ms: int) -> tuple[int, float, float, float] | None:
-        """Find (client_seq, t_recv_wall, t_recv_perf, t_send_perf) for chunk containing end_ms."""
-        if not self._chunk_history:
-            return None
-        best_match = None
-        min_distance = float("inf")
-        for (
-            client_seq,
-            c_start,
-            c_end,
-            t_r_wall,
-            t_r_perf,
-            t_s_perf,
-        ) in reversed(self._chunk_history):
-            if c_start <= end_ms <= c_end:
-                return client_seq, t_r_wall, t_r_perf, t_s_perf
-            dist = abs(c_end - end_ms)
-            if dist < min_distance:
-                min_distance = dist
-                best_match = (client_seq, t_r_wall, t_r_perf, t_s_perf)
-        return best_match
 
     async def _audio_read_loop(self) -> None:
         """Read audio frames from Redis stream mm:{tenant}:audio:{meeting}."""
@@ -715,9 +738,17 @@ class MeetingPipeline:
             asyncio.create_task(self._init_standby())
 
             self._timeline.reset_session()
-            self._provider_session_origin_wall = None
             reaccept_time: float | None = None
             replay_chunks = list(self._sent_replay_history)
+            bytes_per_sec = float(max(1, self._sample_rate * 2 * max(1, self._channels)))
+            pre_replay_bytes = sum(len(c.data) for _, c in replay_chunks) + sum(
+                len(c.data) for _, c in self._reconnect_buffer
+            )
+            self._provider_session_origin_wall = (
+                max(0.0, time.time() - (pre_replay_bytes / bytes_per_sec))
+                if pre_replay_bytes > 0
+                else None
+            )
 
             for _, chunk in replay_chunks:
                 if self._provider_session_origin_wall is None:
@@ -730,6 +761,8 @@ class MeetingPipeline:
 
             while self._reconnect_buffer:
                 eid, chunk = self._reconnect_buffer.popleft()
+                if self._provider_session_origin_wall is None:
+                    self._provider_session_origin_wall = time.time()
                 await self.provider.send_audio(chunk)
                 if reaccept_time is None:
                     reaccept_time = time.time()
@@ -739,6 +772,12 @@ class MeetingPipeline:
                 self._timeline.register_chunk(chunk.capture_ts_ms)
                 self._chunks_sent += 1
                 self._bytes_sent += len(chunk.data)
+                self._all_dispatched_client_seqs.append(chunk.client_seq)
+
+            if pre_replay_bytes > 0:
+                self._provider_session_origin_wall = max(
+                    0.0, time.time() - (pre_replay_bytes / bytes_per_sec)
+                )
 
             recovery_time = reaccept_time if reaccept_time is not None else time.time()
             dur_s = recovery_time - t_disconnect
@@ -833,9 +872,17 @@ class MeetingPipeline:
                 self._speaker_epoch += 1
                 self._speaker_mapping.clear()
                 self._timeline.reset_session()
-                self._provider_session_origin_wall = time.time()
                 reaccept_time: float | None = None
                 replay_chunks = list(self._sent_replay_history)
+                bytes_per_sec = float(max(1, self._sample_rate * 2 * max(1, self._channels)))
+                pre_replay_bytes = sum(len(c.data) for _, c in replay_chunks) + sum(
+                    len(c.data) for _, c in self._reconnect_buffer
+                )
+                self._provider_session_origin_wall = (
+                    max(0.0, time.time() - (pre_replay_bytes / bytes_per_sec))
+                    if pre_replay_bytes > 0
+                    else None
+                )
 
                 # Resend replay window audio
                 for _, chunk in replay_chunks:
@@ -850,6 +897,8 @@ class MeetingPipeline:
                 # Send buffered audio
                 while self._reconnect_buffer:
                     eid, chunk = self._reconnect_buffer.popleft()
+                    if self._provider_session_origin_wall is None:
+                        self._provider_session_origin_wall = time.time()
                     await self.provider.send_audio(chunk)
                     if reaccept_time is None:
                         reaccept_time = time.time()
@@ -859,6 +908,12 @@ class MeetingPipeline:
                     self._timeline.register_chunk(chunk.capture_ts_ms)
                     self._chunks_sent += 1
                     self._bytes_sent += len(chunk.data)
+                    self._all_dispatched_client_seqs.append(chunk.client_seq)
+
+                if pre_replay_bytes > 0:
+                    self._provider_session_origin_wall = max(
+                        0.0, time.time() - (pre_replay_bytes / bytes_per_sec)
+                    )
 
                 # Recovery complete
                 recovery_time = reaccept_time if reaccept_time is not None else time.time()
@@ -1068,6 +1123,7 @@ class MeetingPipeline:
 
         if event.is_final:
             ch = event.channel if event.channel is not None else 0
+            self._prev_interim_tokens.pop(ch, None)
             spk_key = (ch, spk_id)
             if start_ms < self._highest_published_start_ms[spk_key] - 2000:
                 logger.debug(
@@ -1128,6 +1184,41 @@ class MeetingPipeline:
             cap_srv_ms = chunk_match[4] if chunk_match and len(chunk_match) > 4 else None
             gw_recv_ms = chunk_match[5] if chunk_match and len(chunk_match) > 5 else None
             asr_recv_ms = chunk_match[6] if chunk_match and len(chunk_match) > 6 else None
+
+            mapped_words: list[dict[str, Any]] | None = None
+            raw_ev_words = getattr(event, "words", None) or []
+            if raw_ev_words:
+                timeline_shift_ms = start_ms - event.start_ms
+                tmp_words: list[dict[str, Any]] = []
+                for wd in raw_ev_words:
+                    w_tok = str(wd.get("w", "")).strip()
+                    if not w_tok:
+                        continue
+                    w_s_raw = int(wd.get("start_ms", event.start_ms))
+                    w_e_raw = int(wd.get("end_ms", max(w_s_raw, event.end_ms)))
+                    w_start_m = max(0, w_s_raw + timeline_shift_ms)
+                    w_end_m = max(w_start_m, w_e_raw + timeline_shift_ms)
+                    w_conf = round(float(wd.get("confidence", event.confidence)), 4)
+                    raw_w_spk = wd.get("speaker")
+                    w_spk: int | str | None
+                    if raw_w_spk is None:
+                        w_spk = spk_id
+                    elif isinstance(raw_w_spk, (int, str)):
+                        w_spk = raw_w_spk
+                    else:
+                        w_spk = str(raw_w_spk)
+                    tmp_words.append(
+                        {
+                            "w": w_tok,
+                            "start_ms": w_start_m,
+                            "end_ms": w_end_m,
+                            "confidence": w_conf,
+                            "speaker": w_spk,
+                        }
+                    )
+                if tmp_words:
+                    mapped_words = tmp_words
+
             payload = {
                 "utterance_id": uid,
                 "speaker_id": spk_id,
@@ -1148,6 +1239,7 @@ class MeetingPipeline:
                 "publish_wall": t_pub_wall,
                 "e2e_ms": round(e2e_ms, 2) if e2e_ms is not None else None,
                 "late": is_late,
+                "words": mapped_words,
             }
 
             t0_cap = cap_srv_ms or start_epoch_ms
@@ -1198,6 +1290,25 @@ class MeetingPipeline:
 
         else:
             # Interim result -> published to OUT stream only
+            ch = event.channel if event.channel is not None else 0
+            curr_tokens = [
+                tok
+                for tok in (t.strip(".,!?;:\"'()[]{}").lower() for t in event.text.split())
+                if tok
+            ]
+            if event.is_stable:
+                stable_prefix_words = len(curr_tokens)
+            else:
+                prev_tokens = self._prev_interim_tokens.get(ch, [])
+                match_len = 0
+                for a, b in zip(prev_tokens, curr_tokens, strict=False):
+                    if a == b:
+                        match_len += 1
+                    else:
+                        break
+                stable_prefix_words = match_len
+            self._prev_interim_tokens[ch] = curr_tokens
+
             raw_msg = getattr(event, "raw", {})
             alts = raw_msg.get("channel", {}).get("alternatives", [])
             if alts:
@@ -1239,6 +1350,7 @@ class MeetingPipeline:
                 "provider": self.settings.asr_provider,
                 "model": "nova-3",
                 "is_stable": event.is_stable,
+                "stable_prefix_words": stable_prefix_words,
             }
 
             prov_m = max(start_epoch_ms, provider_recv_ms)
@@ -1447,11 +1559,18 @@ class MeetingPipeline:
             except Exception:
                 pass
 
-        # Drain all remaining buffered audio chunks to provider
+        # Drain all remaining buffered reconnect audio chunks to provider
         try:
-            while self._buffer and self.provider.is_open:
-                chunk = self._buffer.popleft()
+            while self._reconnect_buffer and self.provider.is_open:
+                eid, chunk = self._reconnect_buffer.popleft()
                 await self.provider.send_audio(chunk)
+                t_send = time.perf_counter()
+                self._pending_acks.append((t_send, eid))
+                self._sent_replay_history.append((t_send, chunk))
+                self._timeline.register_chunk(chunk.capture_ts_ms)
+                self._chunks_sent += 1
+                self._bytes_sent += len(chunk.data)
+                self._all_dispatched_client_seqs.append(chunk.client_seq)
                 await asyncio.sleep(0.002)
         except Exception:
             pass
@@ -1479,41 +1598,92 @@ class MeetingPipeline:
             t.cancel()
         await asyncio.gather(*self._tasks, return_exceptions=True)
 
-        # 4. Acknowledge remaining entries
-        if is_ended and self._pending_acks:
+        # 4. Acknowledge remaining entries (whether recycling or ending, flushed audio must be acked)
+        if self._pending_acks:
             to_ack = [eid for _, eid in self._pending_acks]
             with contextlib.suppress(Exception):
                 await self.redis.xack(self._audio_key, "asr", *to_ack)
                 await self.redis.xdel(self._audio_key, *to_ack)
                 self.metrics.chunks_acked += len(to_ack)
+            self._pending_acks.clear()
 
-        # 5. Record session summary audit
-        with contextlib.suppress(Exception):
-            await self.redis.set(
-                f"mm:{self.tenant_id}:asr_accepted_seqs:{self.meeting_id}",
-                json.dumps(sorted(list(getattr(self.provider, "accepted_client_seqs", set())))),
-            )
-            await self.redis.set(
-                f"mm:{self.tenant_id}:asr_sent_seqs:{self.meeting_id}",
-                json.dumps(sorted(list(self._all_dispatched_client_seqs))),
-            )
+        cum_key = f"mm:{self.tenant_id}:asr_cumulative:{self.meeting_id}"
 
-        # 5. Record session summary audit (synchronously with 15s timeout & 3 retries)
-        if not getattr(self, "_summary_recorded", False):
-            self._summary_recorded = True
-            await self.auditor.record_session_summary_sync(
-                tenant_id=self.tenant_id,
-                user_id="system_asr",
-                meeting_id=self.meeting_id,
-                provider=self.settings.asr_provider,
-                chunks_sent=self._chunks_sent,
-                bytes_sent=self._bytes_sent,
-                reconnects=self._reconnect_count,
-                dropped_chunks=self._dropped_chunks_count,
-                degraded_seconds=self._total_degraded_s,
-                gaps=self._detected_gaps,
-                timeout=15.0,
-                retries=3,
-            )
+        if not is_ended:
+            # Worker is recycling at max meeting duration or rebalancing:
+            # Store cumulative progress so replacement worker continues without chunk loss or duplicate summary
+            total_sent = self._cumulative_chunks_sent + self._chunks_sent
+            total_bytes = self._cumulative_bytes_sent + self._bytes_sent
+            total_reconn = self._cumulative_reconnect_count + self._reconnect_count
+            total_dropped = self._cumulative_dropped_chunks_count + self._dropped_chunks_count
+            total_deg = self._cumulative_degraded_s + self._total_degraded_s
+            all_gaps = self._cumulative_gaps + self._detected_gaps
+            all_acc = sorted(list(self._cumulative_accepted_seqs | set(getattr(self.provider, "accepted_client_seqs", set()))))
+            all_sent = list(dict.fromkeys(self._cumulative_sent_seqs + list(self._all_dispatched_client_seqs)))
+
+            cum_map = {
+                "chunks_sent": str(total_sent),
+                "bytes_sent": str(total_bytes),
+                "reconnects": str(total_reconn),
+                "dropped_chunks": str(total_dropped),
+                "degraded_seconds": str(total_deg),
+                "gaps": json.dumps(all_gaps),
+                "accepted_seqs": json.dumps(all_acc),
+                "sent_seqs": json.dumps(all_sent),
+            }
+            with contextlib.suppress(Exception):
+                await self.redis.hset(cum_key, mapping=cum_map)
+                await self.redis.expire(cum_key, 3600)
+
+            with contextlib.suppress(Exception):
+                await self.redis.set(
+                    f"mm:{self.tenant_id}:asr_accepted_seqs:{self.meeting_id}",
+                    json.dumps(all_acc),
+                )
+                await self.redis.set(
+                    f"mm:{self.tenant_id}:asr_sent_seqs:{self.meeting_id}",
+                    json.dumps(all_sent),
+                )
+        else:
+            # Meeting has actually ended (meeting_ended / meeting_abandoned):
+            # Compute cumulative totals across all workers that served this meeting
+            total_sent = self._cumulative_chunks_sent + self._chunks_sent
+            total_bytes = self._cumulative_bytes_sent + self._bytes_sent
+            total_reconn = self._cumulative_reconnect_count + self._reconnect_count
+            total_dropped = self._cumulative_dropped_chunks_count + self._dropped_chunks_count
+            total_deg = self._cumulative_degraded_s + self._total_degraded_s
+            all_gaps = self._cumulative_gaps + self._detected_gaps
+            all_acc = sorted(list(self._cumulative_accepted_seqs | set(getattr(self.provider, "accepted_client_seqs", set()))))
+            all_sent = list(dict.fromkeys(self._cumulative_sent_seqs + list(self._all_dispatched_client_seqs)))
+
+            with contextlib.suppress(Exception):
+                await self.redis.set(
+                    f"mm:{self.tenant_id}:asr_accepted_seqs:{self.meeting_id}",
+                    json.dumps(all_acc),
+                )
+                await self.redis.set(
+                    f"mm:{self.tenant_id}:asr_sent_seqs:{self.meeting_id}",
+                    json.dumps(all_sent),
+                )
+
+            # Record session summary audit (synchronously with 15s timeout & 3 retries)
+            if not getattr(self, "_summary_recorded", False):
+                self._summary_recorded = True
+                await self.auditor.record_session_summary_sync(
+                    tenant_id=self.tenant_id,
+                    user_id="system_asr",
+                    meeting_id=self.meeting_id,
+                    provider=self.settings.asr_provider,
+                    chunks_sent=total_sent,
+                    bytes_sent=total_bytes,
+                    reconnects=total_reconn,
+                    dropped_chunks=total_dropped,
+                    degraded_seconds=total_deg,
+                    gaps=all_gaps,
+                    timeout=15.0,
+                    retries=3,
+                )
+                with contextlib.suppress(Exception):
+                    await self.redis.delete(cum_key)
         if getattr(self, "_stop_future", None) and not self._stop_future.done():
             self._stop_future.set_result(None)

@@ -96,6 +96,13 @@ Every service that will eventually need tenant isolation **must** route through 
 - **Latency SLO**: Service-added pipeline overhead P50 < 10ms, P95 < 25ms. Transient WebSocket reconnect < 2.0s.
 - **Audit**: Writes `asr_session_started` and `asr_session_summary` to Neon via `meetmind_security` non-blocking queue. Raw audio and transcript text are NEVER included in audit payloads.
 
+## Quality Contracts & Evaluation Standards (§6–§22, `Q-0`)
+
+- **Clocks & Budget (`ADR-008`)**: Downstream stages MUST preserve `EventEnvelope.timing` from `t0_capture`, stay within `docs/latency/budget.yaml`, and never call an external generative LLM inside §6 classification (`<= 200ms` P50 / `<= 300ms` P95).
+- **Evidence & Abstention-by-Default (`ADR-009`, `meetmind_quality`)**: Every user-visible insight MUST pass `verify_card()`, `publish_decision()` (abstaining on missing/stale/conflicting evidence, `asr_uncertainty > 0.35`, spoken secrets, or `disagreement_signalled`), and dual-side `validate_outbound_card()`. Never display raw numeric percentages instead of `confidence_band`.
+- **Golden Held-Out Isolation (`Q6`)**: Never inspect, hardcode, or tune heuristics against external `EVAL_HELDOUT_PATH` files; treat `ml/eval/golden/seed_engineering.jsonl` as non-authoritative calibration only.
+- **Domain Scope**: Engineering & Development (`docs/spec-amendments/engineering-pack.md`, §22 Outcome Tracker) is the sole active v1 domain pack; Financial Advisory and Enterprise Sales remain `SPEC-ONLY` until traction gates (`docs/product/traction-gates.md`) are met.
+
 ## Code Style
 
 - Python line length: 100 characters

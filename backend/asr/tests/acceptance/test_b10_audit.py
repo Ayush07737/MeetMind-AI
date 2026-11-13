@@ -19,7 +19,8 @@ from conftest import ServerHarness, exchange_ws_ticket, make_pcm16_chunk
 from meetmind_schemas.keys import events_stream_key
 from meetmind_security import db
 
-pytestmark = [pytest.mark.integration, pytest.mark.timeout(180)]
+# 40.66s observed (setup+call+teardown); ~2x=81s
+pytestmark = [pytest.mark.integration, pytest.mark.timeout(85)]
 
 
 @pytest.mark.asyncio

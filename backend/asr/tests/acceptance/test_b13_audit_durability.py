@@ -23,7 +23,7 @@ from meetmind_asr.config import AsrSettings
 from meetmind_asr.service import AsrService
 from meetmind_security import db
 
-pytestmark = [pytest.mark.integration, pytest.mark.timeout(180)]
+pytestmark = [pytest.mark.integration, pytest.mark.timeout(50)]  # 23.13s observed (~2x=46s)
 
 
 @pytest.fixture(autouse=True)

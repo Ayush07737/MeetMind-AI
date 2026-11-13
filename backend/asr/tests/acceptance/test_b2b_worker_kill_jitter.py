@@ -28,7 +28,7 @@ from meetmind_asr.dedupe import normalize_text
 from meetmind_schemas.events import EventEnvelope, TranscriptFinalPayload
 from meetmind_schemas.keys import asr_owner_key, events_stream_key
 
-pytestmark = [pytest.mark.integration, pytest.mark.timeout(90)]
+pytestmark = [pytest.mark.integration, pytest.mark.timeout(50)]  # 23.72s observed (~2x=47s)
 
 
 @pytest.mark.asyncio

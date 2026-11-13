@@ -191,6 +191,7 @@ class StubProvider(ASRProvider):
 
         # Provider offsets in ms relative to this session
         offset_ms = (self._chunk_count - 1) * 100
+        interim_slice = words[:interim_word_count]
         raw_words = [
             {
                 "word": w,
@@ -198,7 +199,17 @@ class StubProvider(ASRProvider):
                 "end": (offset_ms + (idx + 1) * 20) / 1000.0,
                 "confidence": 0.92,
             }
-            for idx, w in enumerate(words[:interim_word_count])
+            for idx, w in enumerate(interim_slice)
+        ]
+        norm_interim_words = [
+            {
+                "w": w,
+                "start_ms": offset_ms + idx * 20,
+                "end_ms": offset_ms + (idx + 1) * 20,
+                "confidence": 0.92,
+                "speaker": interim_ch,
+            }
+            for idx, w in enumerate(interim_slice)
         ]
         await self._event_queue.put(
             ProviderEvent(
@@ -211,6 +222,7 @@ class StubProvider(ASRProvider):
                 channel=interim_ch,
                 is_final=False,
                 is_stable=False,
+                words=norm_interim_words,
                 recv_perf=time.perf_counter(),
                 raw={
                     "channel": {"alternatives": [{"transcript": interim_text, "words": raw_words}]}
@@ -236,6 +248,20 @@ class StubProvider(ASRProvider):
                     if len(w) > 2:
                         final_text = " ".join(w[1:] + [w[0]])
 
+            final_toks = final_text.split()
+            span_ms = max(1, end_offset - start_offset)
+            step_ms = max(1, span_ms // max(1, len(final_toks)))
+            final_words = [
+                {
+                    "w": tok,
+                    "start_ms": start_offset + idx * step_ms,
+                    "end_ms": min(end_offset, start_offset + (idx + 1) * step_ms),
+                    "confidence": 0.98,
+                    "speaker": final_ch,
+                }
+                for idx, tok in enumerate(final_toks)
+            ]
+
             self._current_text_idx += 1
             self._chunk_buffer.clear()
 
@@ -253,6 +279,7 @@ class StubProvider(ASRProvider):
                     channel=final_ch,
                     is_final=True,
                     is_stable=True,
+                    words=final_words,
                     recv_perf=time.perf_counter(),
                 )
             )
@@ -270,6 +297,19 @@ class StubProvider(ASRProvider):
             end_offset = self._chunk_count * 100
             phrase = self._scripted_phrases[self._current_text_idx % len(self._scripted_phrases)]
             self._chunk_buffer.clear()
+            fin_toks = phrase.split()
+            span_ms = max(1, end_offset - start_offset)
+            step_ms = max(1, span_ms // max(1, len(fin_toks)))
+            fin_words = [
+                {
+                    "w": tok,
+                    "start_ms": start_offset + idx * step_ms,
+                    "end_ms": min(end_offset, start_offset + (idx + 1) * step_ms),
+                    "confidence": 0.98,
+                    "speaker": 0,
+                }
+                for idx, tok in enumerate(fin_toks)
+            ]
             await self._event_queue.put(
                 ProviderEvent(
                     event_type="final",
@@ -281,6 +321,7 @@ class StubProvider(ASRProvider):
                     channel=0,
                     is_final=True,
                     is_stable=True,
+                    words=fin_words,
                     recv_perf=time.perf_counter(),
                 )
             )

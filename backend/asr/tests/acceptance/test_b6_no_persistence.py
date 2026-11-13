@@ -23,7 +23,8 @@ import pytest
 import websockets
 from conftest import SYNTHETIC_MARKER, ServerHarness, exchange_ws_ticket, make_pcm16_chunk
 
-pytestmark = [pytest.mark.integration, pytest.mark.timeout(90)]
+# 36.49s observed (setup+call+teardown); ~2x=73s
+pytestmark = [pytest.mark.integration, pytest.mark.timeout(75)]
 
 
 def _snapshot_directory(root: Path) -> dict[Path, float]:

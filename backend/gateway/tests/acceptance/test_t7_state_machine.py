@@ -21,7 +21,7 @@ from meetmind_gateway.keys import audio_stream_key
 from meetmind_schemas.events import WSCloseCode, encode_audio_frame
 from websockets.exceptions import ConnectionClosed
 
-pytestmark = [pytest.mark.integration, pytest.mark.timeout(120)]
+pytestmark = [pytest.mark.integration]  # 14.71s observed (~2x=29s; global 30s default)
 
 
 @pytest.mark.asyncio

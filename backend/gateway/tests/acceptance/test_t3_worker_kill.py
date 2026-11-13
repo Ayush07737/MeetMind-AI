@@ -29,7 +29,7 @@ from meetmind_gateway.keys import audio_stream_key
 from meetmind_schemas.events import decode_audio_frame, encode_audio_frame
 from meetmind_security import db
 
-pytestmark = [pytest.mark.integration, pytest.mark.timeout(180)]
+pytestmark = [pytest.mark.integration, pytest.mark.timeout(80)]  # 38.23s observed (~2x=76s)
 
 
 @pytest.mark.asyncio
