@@ -146,16 +146,6 @@ class MeetingPipeline:
         self._detected_gaps: list[dict[str, Any]] = []
         self._reconnect_attempts: list[dict[str, Any]] = []
 
-        # Cumulative stats for worker handoff / recycle (Requirement A1.2)
-        self._cumulative_chunks_sent: int = 0
-        self._cumulative_bytes_sent: int = 0
-        self._cumulative_reconnect_count: int = 0
-        self._cumulative_dropped_chunks_count: int = 0
-        self._cumulative_degraded_s: float = 0.0
-        self._cumulative_gaps: list[dict[str, Any]] = []
-        self._cumulative_accepted_seqs: set[int] = set()
-        self._cumulative_sent_seqs: list[int] = []
-
         # Outage and catch-up state
         self._is_catching_up = False
         self._is_reconnecting = False
@@ -248,40 +238,6 @@ class MeetingPipeline:
                         self._timeline.meeting_origin_capture_ts = int(origin_raw)
         except Exception as exc:
             logger.warning("Failed to load metadata for %s: %s", self.meeting_id, exc)
-
-        # Load cumulative worker metrics if this meeting is continuing across worker recycle (A1.2)
-        try:
-            cum_key = f"mm:{self.tenant_id}:asr_cumulative:{self.meeting_id}"
-            cum_raw = await self.redis.hgetall(cum_key)
-            if cum_raw:
-                decoded = {
-                    (k.decode("utf-8") if isinstance(k, bytes) else str(k)): (
-                        v.decode("utf-8") if isinstance(v, bytes) else str(v)
-                    )
-                    for k, v in cum_raw.items()
-                }
-                self._cumulative_chunks_sent = int(decoded.get("chunks_sent", 0))
-                self._cumulative_bytes_sent = int(decoded.get("bytes_sent", 0))
-                self._cumulative_reconnect_count = int(decoded.get("reconnects", 0))
-                self._cumulative_dropped_chunks_count = int(decoded.get("dropped_chunks", 0))
-                self._cumulative_degraded_s = float(decoded.get("degraded_seconds", 0.0))
-                if "gaps" in decoded:
-                    with contextlib.suppress(Exception):
-                        self._cumulative_gaps = json.loads(decoded["gaps"])
-                if "accepted_seqs" in decoded:
-                    with contextlib.suppress(Exception):
-                        self._cumulative_accepted_seqs = set(json.loads(decoded["accepted_seqs"]))
-                if "sent_seqs" in decoded:
-                    with contextlib.suppress(Exception):
-                        self._cumulative_sent_seqs = json.loads(decoded["sent_seqs"])
-                logger.info(
-                    "Meeting %s loaded cumulative recycle state: chunks_sent=%d, reconnects=%d",
-                    self.meeting_id,
-                    self._cumulative_chunks_sent,
-                    self._cumulative_reconnect_count,
-                )
-        except Exception as exc:
-            logger.warning("Failed to load cumulative metrics for %s: %s", self.meeting_id, exc)
 
         # Seed deduplicator from existing finals on the internal bus for crash recovery failover
         try:
@@ -1598,92 +1554,41 @@ class MeetingPipeline:
             t.cancel()
         await asyncio.gather(*self._tasks, return_exceptions=True)
 
-        # 4. Acknowledge remaining entries (whether recycling or ending, flushed audio must be acked)
-        if self._pending_acks:
+        # 4. Acknowledge remaining entries
+        if is_ended and self._pending_acks:
             to_ack = [eid for _, eid in self._pending_acks]
             with contextlib.suppress(Exception):
                 await self.redis.xack(self._audio_key, "asr", *to_ack)
                 await self.redis.xdel(self._audio_key, *to_ack)
                 self.metrics.chunks_acked += len(to_ack)
-            self._pending_acks.clear()
 
-        cum_key = f"mm:{self.tenant_id}:asr_cumulative:{self.meeting_id}"
+        # 5. Record session summary audit
+        with contextlib.suppress(Exception):
+            await self.redis.set(
+                f"mm:{self.tenant_id}:asr_accepted_seqs:{self.meeting_id}",
+                json.dumps(sorted(list(getattr(self.provider, "accepted_client_seqs", set())))),
+            )
+            await self.redis.set(
+                f"mm:{self.tenant_id}:asr_sent_seqs:{self.meeting_id}",
+                json.dumps(sorted(list(self._all_dispatched_client_seqs))),
+            )
 
-        if not is_ended:
-            # Worker is recycling at max meeting duration or rebalancing:
-            # Store cumulative progress so replacement worker continues without chunk loss or duplicate summary
-            total_sent = self._cumulative_chunks_sent + self._chunks_sent
-            total_bytes = self._cumulative_bytes_sent + self._bytes_sent
-            total_reconn = self._cumulative_reconnect_count + self._reconnect_count
-            total_dropped = self._cumulative_dropped_chunks_count + self._dropped_chunks_count
-            total_deg = self._cumulative_degraded_s + self._total_degraded_s
-            all_gaps = self._cumulative_gaps + self._detected_gaps
-            all_acc = sorted(list(self._cumulative_accepted_seqs | set(getattr(self.provider, "accepted_client_seqs", set()))))
-            all_sent = list(dict.fromkeys(self._cumulative_sent_seqs + list(self._all_dispatched_client_seqs)))
-
-            cum_map = {
-                "chunks_sent": str(total_sent),
-                "bytes_sent": str(total_bytes),
-                "reconnects": str(total_reconn),
-                "dropped_chunks": str(total_dropped),
-                "degraded_seconds": str(total_deg),
-                "gaps": json.dumps(all_gaps),
-                "accepted_seqs": json.dumps(all_acc),
-                "sent_seqs": json.dumps(all_sent),
-            }
-            with contextlib.suppress(Exception):
-                await self.redis.hset(cum_key, mapping=cum_map)
-                await self.redis.expire(cum_key, 3600)
-
-            with contextlib.suppress(Exception):
-                await self.redis.set(
-                    f"mm:{self.tenant_id}:asr_accepted_seqs:{self.meeting_id}",
-                    json.dumps(all_acc),
-                )
-                await self.redis.set(
-                    f"mm:{self.tenant_id}:asr_sent_seqs:{self.meeting_id}",
-                    json.dumps(all_sent),
-                )
-        else:
-            # Meeting has actually ended (meeting_ended / meeting_abandoned):
-            # Compute cumulative totals across all workers that served this meeting
-            total_sent = self._cumulative_chunks_sent + self._chunks_sent
-            total_bytes = self._cumulative_bytes_sent + self._bytes_sent
-            total_reconn = self._cumulative_reconnect_count + self._reconnect_count
-            total_dropped = self._cumulative_dropped_chunks_count + self._dropped_chunks_count
-            total_deg = self._cumulative_degraded_s + self._total_degraded_s
-            all_gaps = self._cumulative_gaps + self._detected_gaps
-            all_acc = sorted(list(self._cumulative_accepted_seqs | set(getattr(self.provider, "accepted_client_seqs", set()))))
-            all_sent = list(dict.fromkeys(self._cumulative_sent_seqs + list(self._all_dispatched_client_seqs)))
-
-            with contextlib.suppress(Exception):
-                await self.redis.set(
-                    f"mm:{self.tenant_id}:asr_accepted_seqs:{self.meeting_id}",
-                    json.dumps(all_acc),
-                )
-                await self.redis.set(
-                    f"mm:{self.tenant_id}:asr_sent_seqs:{self.meeting_id}",
-                    json.dumps(all_sent),
-                )
-
-            # Record session summary audit (synchronously with 15s timeout & 3 retries)
-            if not getattr(self, "_summary_recorded", False):
-                self._summary_recorded = True
-                await self.auditor.record_session_summary_sync(
-                    tenant_id=self.tenant_id,
-                    user_id="system_asr",
-                    meeting_id=self.meeting_id,
-                    provider=self.settings.asr_provider,
-                    chunks_sent=total_sent,
-                    bytes_sent=total_bytes,
-                    reconnects=total_reconn,
-                    dropped_chunks=total_dropped,
-                    degraded_seconds=total_deg,
-                    gaps=all_gaps,
-                    timeout=15.0,
-                    retries=3,
-                )
-                with contextlib.suppress(Exception):
-                    await self.redis.delete(cum_key)
+        # 5. Record session summary audit (synchronously with 15s timeout & 3 retries)
+        if not getattr(self, "_summary_recorded", False):
+            self._summary_recorded = True
+            await self.auditor.record_session_summary_sync(
+                tenant_id=self.tenant_id,
+                user_id="system_asr",
+                meeting_id=self.meeting_id,
+                provider=self.settings.asr_provider,
+                chunks_sent=self._chunks_sent,
+                bytes_sent=self._bytes_sent,
+                reconnects=self._reconnect_count,
+                dropped_chunks=self._dropped_chunks_count,
+                degraded_seconds=self._total_degraded_s,
+                gaps=self._detected_gaps,
+                timeout=15.0,
+                retries=3,
+            )
         if getattr(self, "_stop_future", None) and not self._stop_future.done():
             self._stop_future.set_result(None)

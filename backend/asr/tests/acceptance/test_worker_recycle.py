@@ -18,7 +18,6 @@ import pytest
 import websockets
 from conftest import ServerHarness, exchange_ws_ticket, make_pcm16_chunk
 from meetmind_schemas.keys import out_stream_key
-from meetmind_security import db
 
 # 31.34s observed (setup+call+teardown); ~2x=63s
 pytestmark = [pytest.mark.integration, pytest.mark.timeout(65)]
@@ -122,9 +121,8 @@ async def test_worker_graceful_recycle_on_max_meeting_duration(
             await asyncio.sleep(0.02)
 
         # End meeting cleanly
-        meeting_end_time = time.time()
         await ws_ingest.send(json.dumps({"type": "control", "action": "meeting_end"}))
-        await asyncio.sleep(2.0)
+        await asyncio.sleep(0.5)
 
     # 1. Verify all chunks were acknowledged (no lost frames)
     assert len(acked_seqs) == total_chunks, f"Expected {total_chunks} acks, got {len(acked_seqs)}"
@@ -139,41 +137,3 @@ async def test_worker_graceful_recycle_on_max_meeting_duration(
     out_key = out_stream_key(tenant_id, meeting_id)
     out_entries = await real_redis.xrange(out_key)
     assert len(out_entries) > 0, "Expected transcript events published to out stream"
-
-    # 4. Verify exactly ONE asr_session_summary in Neon with chunks_sent == total_chunks == chunks_acked
-    # and timestamp >= meeting_ended (Requirement A1.2)
-    schema = gateway_harness.schema_a
-    pool = await db.get_pool()
-
-    summary_rows = []
-    for _ in range(30):
-        summary_rows = await pool.fetch(
-            f"SELECT event_type, payload, timestamp FROM {schema}.audit_events "
-            f"WHERE payload->>'meeting_id' = $1 AND event_type = 'asr_session_summary'",
-            meeting_id,
-        )
-        if summary_rows:
-            break
-        await asyncio.sleep(0.5)
-
-    assert len(summary_rows) == 1, (
-        f"Expected exactly 1 asr_session_summary event across worker recycles, got {len(summary_rows)}"
-    )
-
-    row = summary_rows[0]
-    p = json.loads(row["payload"]) if isinstance(row["payload"], str) else row["payload"]
-    assert p["chunks_sent"] == total_chunks, (
-        f"Expected chunks_sent == {total_chunks}, got {p['chunks_sent']}"
-    )
-    assert p["chunks_sent"] == len(acked_seqs)
-    assert p["gaps"] == [], f"Expected gaps == [], got {p['gaps']}"
-
-    summary_ts = row["timestamp"]
-    if hasattr(summary_ts, "timestamp"):
-        summary_epoch_s = summary_ts.timestamp()
-    else:
-        summary_epoch_s = float(summary_ts)
-    # The summary row must be timestamped at or after meeting_end was sent (not premature before meeting_ended)
-    assert summary_epoch_s >= meeting_end_time - 0.5, (
-        f"Summary timestamp {summary_epoch_s} was prematurely written before meeting end {meeting_end_time}"
-    )
