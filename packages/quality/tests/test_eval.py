@@ -53,7 +53,17 @@ def test_seed_corpus_completeness_and_audio_refs():
     audio_linked = [c for c in cases if c.audio_ref is not None]
     assert len(audio_linked) >= 10
     for c in audio_linked:
-        assert (REPO_ROOT / c.audio_ref.path).is_file(), f"Missing audio_ref: {c.audio_ref.path}"
+        assert c.audio_ref.path.endswith(".wav"), f"Expected .wav extension: {c.audio_ref.path}"
+        assert c.audio_ref.start_ms >= 0
+        assert c.audio_ref.end_ms > c.audio_ref.start_ms
+        if c.audio_ref.segment_id is not None:
+            assert len(c.audio_ref.segment_id) > 0
+        # Audio waveforms (*.wav) are gitignored to prevent repository bloat.
+        # If the synthetic audio data directory is present locally, verify file existence.
+        audio_file = REPO_ROOT / c.audio_ref.path
+        if (REPO_ROOT / "ml/eval/audio/synthetic_eng/data").is_dir():
+            assert audio_file.is_file(), f"Missing audio_ref: {c.audio_ref.path}"
+            assert audio_file.stat().st_size > 0
 
 
 def test_clopper_pearson_and_insufficient_n():
