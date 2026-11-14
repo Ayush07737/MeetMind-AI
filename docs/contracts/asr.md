@@ -8,14 +8,14 @@
 
 ## 1. Streams & Redis Keys
 
-| Key / Stream                      | Purpose                                                                                           | Max Length      | TTL                            |
-| :-------------------------------- | :------------------------------------------------------------------------------------------------ | :-------------- | :----------------------------- |
-| `mm:system:lifecycle`             | Global meeting lifecycle events stream (`meeting_active`, `meeting_ended`, `meeting_abandoned`)   | 10,000 (approx) | Persistent                     |
-| `mm:{tenant}:audio:{meeting}`     | Input binary audio frames consumed by ASR consumer group `asr`                                    | 6,000 (approx)  | 900 s (active) / 300 s (grace) |
-| `mm:{tenant}:events:{meeting}`    | Internal bus stream for downstream services (`transcript_final`, `transcript_service_degraded`)   | 5,000 (approx)  | 86,400 s (24 h)                |
-| `mm:{tenant}:out:{meeting}`       | Client-facing outbound stream for listeners (`transcript_interim`, `transcript_service_degraded`) | 5,000 (approx)  | 86,400 s (24 h)                |
-| `mm:{tenant}:asr_owner:{meeting}` | Distributed worker ownership lease (holds `worker_id`)                                            | N/A (string)    | 15 s (heartbeat every 5 s)     |
-| `mm:{tenant}:meeting:{meeting}`   | Meeting session hash (contains `local_user_name`, `attendees`, `origin_capture_ts`)               | N/A (hash)      | 86,400 s (24 h)                |
+| Key / Stream                      | Purpose                                                                                                                                                                                               | Max Length      | TTL                            |
+| :-------------------------------- | :---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | :-------------- | :----------------------------- |
+| `mm:system:lifecycle`             | Global meeting lifecycle events stream (`meeting_active`, `meeting_ended`, `meeting_abandoned`)                                                                                                       | 10,000 (approx) | Persistent                     |
+| `mm:{tenant}:audio:{meeting}`     | Input binary audio frames consumed by ASR consumer group `asr`                                                                                                                                        | 6,000 (approx)  | 900 s (active) / 300 s (grace) |
+| `mm:{tenant}:events:{meeting}`    | Internal bus stream for downstream services (`transcript_final`, `transcript_service_degraded`, `audio_gap`; downstream `trigger_candidate` / `trigger_confirmed` schemas in `meetmind_schemas.flow`) | 5,000 (approx)  | 86,400 s (24 h)                |
+| `mm:{tenant}:out:{meeting}`       | Client-facing outbound stream for listeners (`transcript_interim`, `transcript_service_degraded`)                                                                                                     | 5,000 (approx)  | 86,400 s (24 h)                |
+| `mm:{tenant}:asr_owner:{meeting}` | Distributed worker ownership lease (holds `worker_id`)                                                                                                                                                | N/A (string)    | 15 s (heartbeat every 5 s)     |
+| `mm:{tenant}:meeting:{meeting}`   | Meeting session hash (contains `local_user_name`, `attendees`, `origin_capture_ts`)                                                                                                                   | N/A (hash)      | 86,400 s (24 h)                |
 
 ### 1.1 Stream Routing, Consumers & Retention Invariants (C3)
 
@@ -28,7 +28,7 @@
 
 ## 2. Event Envelope & Schemas
 
-Every published event follows the standard `EventEnvelope` format with a top-level `payload` dict:
+Every published event follows the standard `EventEnvelope` format with a top-level `payload` dict and optional server-clock `timing` stamps (`t0_capture`, `gw_recv`, `asr_recv`, `provider_msg`, `asr_pub`):
 
 ```json
 {
@@ -37,6 +37,13 @@ Every published event follows the standard `EventEnvelope` format with a top-lev
   "tenant_id": "tenant_default",
   "ts_ms": 1791790000000,
   "trace_id": "0123456789abcdef0123456789abcdef",
+  "timing": {
+    "t0_capture": 1791789999000,
+    "gw_recv": 1791789999040,
+    "asr_recv": 1791789999045,
+    "provider_msg": 1791789999990,
+    "asr_pub": 1791790000000
+  },
   "payload": { ... }
 }
 ```
@@ -45,21 +52,21 @@ Every published event follows the standard `EventEnvelope` format with a top-lev
 
 Published to `mm:{tenant}:events:{meeting}` only. Never forwarded directly to clients.
 
-| Field            | Type                 | Description                                                                                            |
-| :--------------- | :------------------- | :----------------------------------------------------------------------------------------------------- |
-| `utterance_id`   | `str`                | First 24 hex characters of `sha256(meeting\|channel\|speaker\|start_ms)`                               |
-| `speaker_id`     | `str`                | Speaker identifier (`spk_0`, `spk_1`, scoped to channel)                                               |
-| `speaker_name`   | `str \| null`        | Human participant name (resolved via metadata when possible)                                           |
-| `channel`        | `int \| null`        | Audio channel index (0 for local, 1 for remote)                                                        |
-| `text`           | `str`                | Finalized transcript text                                                                              |
-| `start_ms`       | `int`                | Offset from meeting audio capture origin (ms)                                                          |
-| `end_ms`         | `int`                | Offset from meeting audio capture origin (ms)                                                          |
-| `start_epoch_ms` | `int`                | Approximate UNIX epoch timestamp of utterance start                                                    |
-| `confidence`     | `float`              | ASR model confidence score [0.0 - 1.0]                                                                 |
-| `language`       | `str`                | Language code (e.g., `en`, `en-IN`, `en-US`)                                                           |
-| `provider`       | `str`                | Provider identifier (`deepgram` or `stub`)                                                             |
-| `model`          | `str`                | ASR model identifier (`nova-3` or `scripted`)                                                          |
-| `words`          | `list[dict] \| null` | Amendment A1: List of word timings `[{w, start_ms, end_ms, confidence, speaker?}]` for claim grounding |
+| Field            | Type                 | Description                                                                                                                                        |
+| :--------------- | :------------------- | :------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `utterance_id`   | `str`                | First 24 hex characters of `sha256(meeting\|channel\|speaker\|start_ms)`                                                                           |
+| `speaker_id`     | `str`                | Speaker identifier (`spk_0`, `spk_1`, scoped to channel)                                                                                           |
+| `speaker_name`   | `str \| null`        | Human participant name (resolved via metadata when possible)                                                                                       |
+| `channel`        | `int \| null`        | Audio channel index (0 for local, 1 for remote)                                                                                                    |
+| `text`           | `str`                | Finalized transcript text                                                                                                                          |
+| `start_ms`       | `int`                | Offset from meeting audio capture origin (ms)                                                                                                      |
+| `end_ms`         | `int`                | Offset from meeting audio capture origin (ms)                                                                                                      |
+| `start_epoch_ms` | `int`                | Approximate UNIX epoch timestamp of utterance start                                                                                                |
+| `confidence`     | `float`              | ASR model confidence score [0.0 - 1.0]                                                                                                             |
+| `language`       | `str`                | Language code (e.g., `en`, `en-IN`, `en-US`)                                                                                                       |
+| `provider`       | `str`                | Provider identifier (`deepgram` or `stub`)                                                                                                         |
+| `model`          | `str`                | ASR model identifier (`nova-3` or `scripted`)                                                                                                      |
+| `words`          | `list[dict] \| null` | Amendment A1 (runtime populated for Deepgram & Stub): Bounded word list `[{w, start_ms, end_ms, confidence, speaker?}]` for ASR uncertainty gating |
 
 ### 2.2. `transcript_interim` (Client Out Stream Only)
 
@@ -67,21 +74,21 @@ Published to `mm:{tenant}:out:{meeting}` only. Dropped under backpressure.
 
 > **Stream Isolation Invariant (C3)**: Interim transcripts are published exclusively to the client outbound stream (`mm:{tenant}:out:{meeting}`) and are **never written to the internal bus (`mm:{tenant}:events:{meeting}`)**. This guarantees that high-rate interim text hypotheses do not displace final transcripts in the bounded 5,000-entry `events` stream, ensuring ~4.9 hours of durable meeting event history for downstream intelligence consumers.
 
-| Field                 | Type          | Description                                                                |
-| :-------------------- | :------------ | :------------------------------------------------------------------------- |
-| `speaker_id`          | `str`         | Speaker identifier (`spk_0`, `spk_1`)                                      |
-| `speaker_name`        | `str \| null` | Human participant name                                                     |
-| `channel`             | `int \| null` | Audio channel index                                                        |
-| `text`                | `str`         | Real-time interim transcript hypothesis                                    |
-| `start_ms`            | `int`         | Offset from meeting audio capture origin (ms)                              |
-| `end_ms`              | `int`         | Offset from meeting audio capture origin (ms)                              |
-| `start_epoch_ms`      | `int`         | Approximate UNIX epoch timestamp                                           |
-| `confidence`          | `float`       | Interim confidence score                                                   |
-| `language`            | `str`         | Language code                                                              |
-| `provider`            | `str`         | Provider identifier                                                        |
-| `model`               | `str`         | Model identifier                                                           |
-| `is_stable`           | `bool`        | True if model marked hypothesis as stable prefix                           |
-| `stable_prefix_words` | `int`         | Count of leading prefix words considered stable (for speculative triggers) |
+| Field                 | Type          | Description                                                                                       |
+| :-------------------- | :------------ | :------------------------------------------------------------------------------------------------ |
+| `speaker_id`          | `str`         | Speaker identifier (`spk_0`, `spk_1`)                                                             |
+| `speaker_name`        | `str \| null` | Human participant name                                                                            |
+| `channel`             | `int \| null` | Audio channel index                                                                               |
+| `text`                | `str`         | Real-time interim transcript hypothesis                                                           |
+| `start_ms`            | `int`         | Offset from meeting audio capture origin (ms)                                                     |
+| `end_ms`              | `int`         | Offset from meeting audio capture origin (ms)                                                     |
+| `start_epoch_ms`      | `int`         | Approximate UNIX epoch timestamp                                                                  |
+| `confidence`          | `float`       | Interim confidence score                                                                          |
+| `language`            | `str`         | Language code                                                                                     |
+| `provider`            | `str`         | Provider identifier                                                                               |
+| `model`               | `str`         | Model identifier                                                                                  |
+| `is_stable`           | `bool`        | True if leading prefix remained unchanged across consecutive interims (or provider marked stable) |
+| `stable_prefix_words` | `int`         | Runtime count of leading tokenized words unchanged across the last two interims (resets on final) |
 
 ### 2.3. `transcript_service_degraded` (Both Streams)
 

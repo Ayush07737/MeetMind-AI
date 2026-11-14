@@ -134,6 +134,31 @@ Client-to-server JSON frames:
   "type": "control",
   "action": "meeting_end"
 }
+
+// Clock Sync Probe (at meeting_start, 3x min-RTT, and every 60s)
+{
+  "type": "control",
+  "action": "clock_sync",
+  "t1": 1730500000100
+}
+
+// Server Clock Sync Reply
+{
+  "type": "control",
+  "action": "clock_sync_reply",
+  "t1": 1730500000100,
+  "t2": 1730500002600,
+  "t3": 1730500002601
+}
+
+// Clock Report (persisted in session hash; audits initial & shift > 500ms)
+{
+  "type": "control",
+  "action": "clock_report",
+  "offset_ms": 2500,
+  "rtt_ms": 42,
+  "samples": 3
+}
 ```
 
 ### 2.3 Binary Audio Frame Schema
@@ -193,7 +218,12 @@ Only four client-facing event types are permitted:
 3. `transcript_interim`
 4. `transcript_service_degraded`
 
-All outbound events MUST have a top-level `payload` dictionary. Internal events (e.g., `transcript_final`, `trigger_classified`, `raw_audio_chunk`) are dropped with a warning.
+All outbound events MUST have a top-level `payload` dictionary and optional `timing` server-epoch millisecond timestamps (`t0_capture`, `gw_recv`, `asr_recv`, `provider_msg`, `asr_pub`, `classify_pub`, `retrieval_done`, `card_pub`, `ui_render`; see `docs/latency/clocks.md`). Internal events (e.g., `transcript_final`, `trigger_candidate`, `trigger_confirmed`, `raw_audio_chunk`) are dropped before forwarding.
+
+For `intelligence_event` frames carrying `payload.card` (`meetmind_schemas.cards.InsightCard`):
+
+- The Gateway forwarder enforces `validate_outbound_card(card)` fail-closed before WebSocket transmission. Invalid cards, cards with unverified claims (`status != "verified"` for `fact`/`action_recommendation`), or `inferred` cards lacking explicit label prefixes are dropped, counted via forwarder drop metrics, and logged via a bounded security audit event.
+- If `card.restricted` is `true`, only listener sockets whose authenticated role is present in `card.visible_roles` receive the event.
 
 ```json
 {
@@ -305,7 +335,8 @@ Field types:
 - `adapter_type` (string): Capture adapter name (`chrome_extension`, `desktop_app`).
 - `audio_data` (bytes): 18-byte big-endian header (`MM`, u32 client_seq, u64 capture_ts_ms, u16 sample_rate, u8 channels, u8 codec) concatenated with raw audio payload.
 - `timestamp_ms` (string): Ingestion arrival Unix timestamp in ms.
-- `capture_ts_ms` (string): Origin capture Unix timestamp in ms.
+- `capture_ts_ms` (string): Origin capture Unix timestamp in ms (client clock from 18-byte binary header).
+- `capture_server_ms` (string): Client capture timestamp translated onto the Gateway server epoch clock (`capture_ts_ms + clock_offset_ms`; see `docs/latency/clocks.md`).
 - `recv_ns` (string): Gateway arrival timestamp in monotonic nanoseconds (`time.perf_counter_ns()`).
 - `published_ns` (string): Redis publish completion in monotonic nanoseconds.
 - `gap_size` (string, optional): Included only if `client_seq > last_acked_client_seq + 1`.

@@ -26,7 +26,8 @@ from meetmind_gateway.keys import writer_lease_key
 from meetmind_schemas.events import WSCloseCode
 from websockets.exceptions import ConnectionClosed
 
-pytestmark = [pytest.mark.integration, pytest.mark.timeout(180)]
+# 55.80s observed (setup+call+teardown); 2x=~112s (>90s cap due to slow DB retry waits)
+pytestmark = [pytest.mark.integration, pytest.mark.timeout(115)]
 
 
 @pytest.mark.asyncio

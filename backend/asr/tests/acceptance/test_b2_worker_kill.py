@@ -26,7 +26,7 @@ from conftest import ServerHarness, exchange_ws_ticket, make_pcm16_chunk
 from meetmind_schemas.events import EventEnvelope, TranscriptFinalPayload
 from meetmind_schemas.keys import asr_owner_key, events_stream_key
 
-pytestmark = [pytest.mark.integration, pytest.mark.timeout(90)]
+pytestmark = [pytest.mark.integration, pytest.mark.timeout(50)]  # 25.27s observed (~2x=51s)
 
 
 @pytest.mark.asyncio

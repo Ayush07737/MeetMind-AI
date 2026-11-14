@@ -36,7 +36,7 @@ def get_deepgram_api_key() -> SecretStr:
 @pytest.mark.asyncio
 async def test_l1_provider_lifecycle_and_ordering():
     """L1: Open, stream 2 seconds of real speech, finish flushes finals, verify ordering."""
-    print("\n[Estimated Cost] ~0.033 audio minutes x $0.0058/min = ~$0.0002")
+    print("\n[Estimated Cost] ~0.033 audio minutes x $0.0077/min = ~$0.0003")
     api_key = get_deepgram_api_key()
     provider = DeepgramProvider(api_key=api_key, mip_opt_out=True)
 
@@ -87,9 +87,12 @@ async def test_l1_provider_lifecycle_and_ordering():
     # Deepgram should have emitted at least one interim or final transcript
     transcripts = [e for e in events if e.event_type in ("interim", "final")]
     assert len(transcripts) > 0
-    # Final transcript should have text
+    # Final transcript should have text and word timings with confidences
     finals = [e for e in events if e.is_final and e.text]
     assert len(finals) > 0, f"Expected at least one final transcript, got {event_types}"
+    assert any(
+        len(f.words) > 0 and all("w" in wd and "confidence" in wd for wd in f.words) for f in finals
+    ), "Expected populated words with confidence on live Deepgram final transcripts"
 
     # Verify close() is idempotent
     await provider.close()
@@ -101,7 +104,7 @@ async def test_l1_provider_lifecycle_and_ordering():
 @pytest.mark.asyncio
 async def test_l1_keepalive_during_silence():
     """L1: Keepalive during 15 seconds of silence keeps Deepgram session alive."""
-    print("\n[Estimated Cost] 0 audio minutes x $0.0058/min = $0.0000 (KeepAlive only)")
+    print("\n[Estimated Cost] 0 audio minutes x $0.0077/min = $0.0000 (KeepAlive only)")
     api_key = get_deepgram_api_key()
     provider = DeepgramProvider(api_key=api_key, mip_opt_out=True)
 

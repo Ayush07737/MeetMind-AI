@@ -59,6 +59,7 @@ class ProviderEvent:
     channel: int = 0
     is_final: bool = False
     is_stable: bool = False
+    words: list[dict[str, Any]] = field(default_factory=list)
     raw: dict[str, Any] = field(default_factory=dict)
     error: str | None = None
     recv_perf: float = 0.0

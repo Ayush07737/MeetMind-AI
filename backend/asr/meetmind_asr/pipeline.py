@@ -125,6 +125,7 @@ class MeetingPipeline:
             maxlen=300
         )
         self._seen_interim_words: set[tuple[str, int]] = set()
+        self._prev_interim_tokens: dict[int, list[str]] = {}
         self._standby_provider: ASRProvider | None = None
 
         # Provider session timeline tracking (Requirement 2: no TimelineMapper for latency)
@@ -351,28 +352,6 @@ class MeetingPipeline:
                 self.meeting_id,
                 exc,
             )
-
-    def _find_chunk_for_end_ms(self, end_ms: int) -> tuple[int, float, float, float] | None:
-        """Find (client_seq, t_recv_wall, t_recv_perf, t_send_perf) for chunk containing end_ms."""
-        if not self._chunk_history:
-            return None
-        best_match = None
-        min_distance = float("inf")
-        for (
-            client_seq,
-            c_start,
-            c_end,
-            t_r_wall,
-            t_r_perf,
-            t_s_perf,
-        ) in reversed(self._chunk_history):
-            if c_start <= end_ms <= c_end:
-                return client_seq, t_r_wall, t_r_perf, t_s_perf
-            dist = abs(c_end - end_ms)
-            if dist < min_distance:
-                min_distance = dist
-                best_match = (client_seq, t_r_wall, t_r_perf, t_s_perf)
-        return best_match
 
     async def _audio_read_loop(self) -> None:
         """Read audio frames from Redis stream mm:{tenant}:audio:{meeting}."""
@@ -715,9 +694,17 @@ class MeetingPipeline:
             asyncio.create_task(self._init_standby())
 
             self._timeline.reset_session()
-            self._provider_session_origin_wall = None
             reaccept_time: float | None = None
             replay_chunks = list(self._sent_replay_history)
+            bytes_per_sec = float(max(1, self._sample_rate * 2 * max(1, self._channels)))
+            pre_replay_bytes = sum(len(c.data) for _, c in replay_chunks) + sum(
+                len(c.data) for _, c in self._reconnect_buffer
+            )
+            self._provider_session_origin_wall = (
+                max(0.0, time.time() - (pre_replay_bytes / bytes_per_sec))
+                if pre_replay_bytes > 0
+                else None
+            )
 
             for _, chunk in replay_chunks:
                 if self._provider_session_origin_wall is None:
@@ -730,6 +717,8 @@ class MeetingPipeline:
 
             while self._reconnect_buffer:
                 eid, chunk = self._reconnect_buffer.popleft()
+                if self._provider_session_origin_wall is None:
+                    self._provider_session_origin_wall = time.time()
                 await self.provider.send_audio(chunk)
                 if reaccept_time is None:
                     reaccept_time = time.time()
@@ -739,6 +728,12 @@ class MeetingPipeline:
                 self._timeline.register_chunk(chunk.capture_ts_ms)
                 self._chunks_sent += 1
                 self._bytes_sent += len(chunk.data)
+                self._all_dispatched_client_seqs.append(chunk.client_seq)
+
+            if pre_replay_bytes > 0:
+                self._provider_session_origin_wall = max(
+                    0.0, time.time() - (pre_replay_bytes / bytes_per_sec)
+                )
 
             recovery_time = reaccept_time if reaccept_time is not None else time.time()
             dur_s = recovery_time - t_disconnect
@@ -833,9 +828,17 @@ class MeetingPipeline:
                 self._speaker_epoch += 1
                 self._speaker_mapping.clear()
                 self._timeline.reset_session()
-                self._provider_session_origin_wall = time.time()
                 reaccept_time: float | None = None
                 replay_chunks = list(self._sent_replay_history)
+                bytes_per_sec = float(max(1, self._sample_rate * 2 * max(1, self._channels)))
+                pre_replay_bytes = sum(len(c.data) for _, c in replay_chunks) + sum(
+                    len(c.data) for _, c in self._reconnect_buffer
+                )
+                self._provider_session_origin_wall = (
+                    max(0.0, time.time() - (pre_replay_bytes / bytes_per_sec))
+                    if pre_replay_bytes > 0
+                    else None
+                )
 
                 # Resend replay window audio
                 for _, chunk in replay_chunks:
@@ -850,6 +853,8 @@ class MeetingPipeline:
                 # Send buffered audio
                 while self._reconnect_buffer:
                     eid, chunk = self._reconnect_buffer.popleft()
+                    if self._provider_session_origin_wall is None:
+                        self._provider_session_origin_wall = time.time()
                     await self.provider.send_audio(chunk)
                     if reaccept_time is None:
                         reaccept_time = time.time()
@@ -859,6 +864,12 @@ class MeetingPipeline:
                     self._timeline.register_chunk(chunk.capture_ts_ms)
                     self._chunks_sent += 1
                     self._bytes_sent += len(chunk.data)
+                    self._all_dispatched_client_seqs.append(chunk.client_seq)
+
+                if pre_replay_bytes > 0:
+                    self._provider_session_origin_wall = max(
+                        0.0, time.time() - (pre_replay_bytes / bytes_per_sec)
+                    )
 
                 # Recovery complete
                 recovery_time = reaccept_time if reaccept_time is not None else time.time()
@@ -1068,6 +1079,7 @@ class MeetingPipeline:
 
         if event.is_final:
             ch = event.channel if event.channel is not None else 0
+            self._prev_interim_tokens.pop(ch, None)
             spk_key = (ch, spk_id)
             if start_ms < self._highest_published_start_ms[spk_key] - 2000:
                 logger.debug(
@@ -1128,6 +1140,41 @@ class MeetingPipeline:
             cap_srv_ms = chunk_match[4] if chunk_match and len(chunk_match) > 4 else None
             gw_recv_ms = chunk_match[5] if chunk_match and len(chunk_match) > 5 else None
             asr_recv_ms = chunk_match[6] if chunk_match and len(chunk_match) > 6 else None
+
+            mapped_words: list[dict[str, Any]] | None = None
+            raw_ev_words = getattr(event, "words", None) or []
+            if raw_ev_words:
+                timeline_shift_ms = start_ms - event.start_ms
+                tmp_words: list[dict[str, Any]] = []
+                for wd in raw_ev_words:
+                    w_tok = str(wd.get("w", "")).strip()
+                    if not w_tok:
+                        continue
+                    w_s_raw = int(wd.get("start_ms", event.start_ms))
+                    w_e_raw = int(wd.get("end_ms", max(w_s_raw, event.end_ms)))
+                    w_start_m = max(0, w_s_raw + timeline_shift_ms)
+                    w_end_m = max(w_start_m, w_e_raw + timeline_shift_ms)
+                    w_conf = round(float(wd.get("confidence", event.confidence)), 4)
+                    raw_w_spk = wd.get("speaker")
+                    w_spk: int | str | None
+                    if raw_w_spk is None:
+                        w_spk = spk_id
+                    elif isinstance(raw_w_spk, (int, str)):
+                        w_spk = raw_w_spk
+                    else:
+                        w_spk = str(raw_w_spk)
+                    tmp_words.append(
+                        {
+                            "w": w_tok,
+                            "start_ms": w_start_m,
+                            "end_ms": w_end_m,
+                            "confidence": w_conf,
+                            "speaker": w_spk,
+                        }
+                    )
+                if tmp_words:
+                    mapped_words = tmp_words
+
             payload = {
                 "utterance_id": uid,
                 "speaker_id": spk_id,
@@ -1148,6 +1195,7 @@ class MeetingPipeline:
                 "publish_wall": t_pub_wall,
                 "e2e_ms": round(e2e_ms, 2) if e2e_ms is not None else None,
                 "late": is_late,
+                "words": mapped_words,
             }
 
             t0_cap = cap_srv_ms or start_epoch_ms
@@ -1198,6 +1246,25 @@ class MeetingPipeline:
 
         else:
             # Interim result -> published to OUT stream only
+            ch = event.channel if event.channel is not None else 0
+            curr_tokens = [
+                tok
+                for tok in (t.strip(".,!?;:\"'()[]{}").lower() for t in event.text.split())
+                if tok
+            ]
+            if event.is_stable:
+                stable_prefix_words = len(curr_tokens)
+            else:
+                prev_tokens = self._prev_interim_tokens.get(ch, [])
+                match_len = 0
+                for a, b in zip(prev_tokens, curr_tokens, strict=False):
+                    if a == b:
+                        match_len += 1
+                    else:
+                        break
+                stable_prefix_words = match_len
+            self._prev_interim_tokens[ch] = curr_tokens
+
             raw_msg = getattr(event, "raw", {})
             alts = raw_msg.get("channel", {}).get("alternatives", [])
             if alts:
@@ -1239,6 +1306,7 @@ class MeetingPipeline:
                 "provider": self.settings.asr_provider,
                 "model": "nova-3",
                 "is_stable": event.is_stable,
+                "stable_prefix_words": stable_prefix_words,
             }
 
             prov_m = max(start_epoch_ms, provider_recv_ms)
@@ -1447,11 +1515,18 @@ class MeetingPipeline:
             except Exception:
                 pass
 
-        # Drain all remaining buffered audio chunks to provider
+        # Drain all remaining buffered reconnect audio chunks to provider
         try:
-            while self._buffer and self.provider.is_open:
-                chunk = self._buffer.popleft()
+            while self._reconnect_buffer and self.provider.is_open:
+                eid, chunk = self._reconnect_buffer.popleft()
                 await self.provider.send_audio(chunk)
+                t_send = time.perf_counter()
+                self._pending_acks.append((t_send, eid))
+                self._sent_replay_history.append((t_send, chunk))
+                self._timeline.register_chunk(chunk.capture_ts_ms)
+                self._chunks_sent += 1
+                self._bytes_sent += len(chunk.data)
+                self._all_dispatched_client_seqs.append(chunk.client_seq)
                 await asyncio.sleep(0.002)
         except Exception:
             pass

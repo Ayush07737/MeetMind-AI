@@ -2,12 +2,15 @@
 
 from ml.eval.asr_bakeoff.normalize import (
     compute_entity_error_rate,
+    compute_hinglish_english_wer,
     compute_identifier_exact_match,
     compute_normalized_wer,
     compute_numeric_token_error_rate,
+    detect_script,
     extract_canonical_numbers,
     extract_identifiers,
     normalize_text,
+    transliterate_devanagari_to_latin,
 )
 
 
@@ -130,3 +133,24 @@ def test_entity_error_rate():
     assert res["correct"] == 2
     assert res["missing"] == 1
     assert res["entity_error_rate"] == 0.3333
+
+
+def test_script_detection():
+    assert detect_script("Grafana memory usage 85 percent") == "Latin"
+    assert detect_script("लॉग्स चेक कर लो एक बार") == "Devanagari"
+    assert detect_script("Logs check कर लो Grafana पर 85%") == "Mixed"
+    assert detect_script("   ") == "Empty"
+
+
+def test_devanagari_transliteration_and_hinglish_scoring():
+    ref = "Logs check kar lo ek baar, Grafana dashboard pe memory usage 85 percent dikha raha hai."
+    hyp_deva = "Logs check कर लो एक बार Grafana dashboard पे memory usage 85% दिखा रहा है।"
+    raw_wer = compute_normalized_wer(ref, hyp_deva, transliterate_devanagari=False)
+    translit_wer = compute_normalized_wer(ref, hyp_deva, transliterate_devanagari=True)
+    eng_wer = compute_hinglish_english_wer(ref, hyp_deva)
+    tr = transliterate_devanagari_to_latin(hyp_deva)
+    assert "kar" in tr
+    assert "ek" in tr
+    assert translit_wer < raw_wer
+    assert translit_wer <= 0.25
+    assert eng_wer == 0.0

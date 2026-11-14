@@ -70,7 +70,8 @@ from meetmind_schemas.keys import events_stream_key, out_stream_key  # noqa: E40
 from meetmind_security import db  # noqa: E402
 from meetmind_security.tenant import TenantConfig  # noqa: E402
 
-RATE_PER_MIN = 0.0058  # $/minute for Nova-3 streaming
+# $/minute for Nova-3 monolingual streaming (PAYG, deepgram.com/pricing 2026-11-11)
+RATE_PER_MIN = 0.0077
 
 # =============================================================================
 # K4.5 / C1: Memory Gate Thresholds with Stated Engineering Rationale
@@ -1425,11 +1426,12 @@ async def run_benchmark(
         bench_start_dt = datetime.now()
         sender_task = asyncio.create_task(_audio_sender())
         await sender_task
+        actual_stream_dur = time.perf_counter() - t_start
         bench_end_dt = datetime.now()
         set_thread_execution_state(False)
-        kernel_power_events = query_kernel_power_events(bench_start_dt, bench_end_dt)
-
-        actual_stream_dur = time.perf_counter() - t_start
+        kernel_power_events = await asyncio.to_thread(
+            query_kernel_power_events, bench_start_dt, bench_end_dt
+        )
 
         def _fetch_health(url: str, timeout: float) -> dict[str, Any]:
             try:

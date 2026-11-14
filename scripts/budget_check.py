@@ -25,9 +25,11 @@ import threading
 import time
 import urllib.request
 import uuid
+from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
+import yaml
 from dotenv import load_dotenv
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
@@ -48,7 +50,7 @@ for p in [
 import asyncpg  # noqa: E402
 import websockets  # noqa: E402
 from conftest import LocalJWKSServer, exchange_ws_ticket, get_free_port  # noqa: E402
-from meetmind_schemas.budget import load_budget  # noqa: E402
+from meetmind_schemas.budget import find_budget_yaml_path, load_budget  # noqa: E402
 from meetmind_schemas.events import encode_audio_frame  # noqa: E402
 from meetmind_schemas.keys import (  # noqa: E402
     ACTIVE_MEETINGS_SET_KEY,
@@ -82,27 +84,190 @@ def compute_percentiles(vals: list[float]) -> dict[str, float]:
     }
 
 
+def _read_text_auto(path: Path) -> str:
+    raw_bytes = path.read_bytes()
+    if raw_bytes.startswith((b"\xff\xfe", b"\xfe\xff")):
+        return raw_bytes.decode("utf-16", errors="replace")
+    return raw_bytes.decode("utf-8", errors="replace")
+
+
+def _load_lane_target_p95(
+    budget_path: Path | str | None,
+    lane_key: str,
+    default_ms: float = 2000.0,
+) -> float:
+    path = Path(budget_path) if budget_path else find_budget_yaml_path()
+    try:
+        raw = yaml.safe_load(path.read_text(encoding="utf-8")) or {}
+    except Exception:
+        return default_ms
+    lane = (raw.get("lanes") or {}).get(lane_key) or {}
+    val = lane.get("target_p95_ms")
+    return float(val) if val is not None else default_ms
+
+
+def _load_bakeoff_stable_text(
+    bakeoff_json: Path | str | None = None,
+    bakeoff_log: Path | str | None = None,
+    candidate_key: str | None = None,
+) -> dict[str, Any]:
+    """Load time_to_stable_text P50/P95 from A1 bakeoff JSON or text log."""
+    if bakeoff_json is not None:
+        bp = Path(bakeoff_json).resolve()
+        if not bp.exists():
+            return {"error": f"Bakeoff JSON not found: {bp}", "path": bp}
+        st = bp.stat()
+        mtime_local = datetime.fromtimestamp(st.st_mtime).astimezone().isoformat()
+        data = json.loads(bp.read_text(encoding="utf-8"))
+        summaries = data.get("summaries") or {}
+        if not summaries:
+            return {"error": f"No 'summaries' object found in bakeoff JSON: {bp}", "path": bp}
+
+        keys = list(summaries.keys())
+        if candidate_key:
+            if candidate_key not in summaries:
+                return {
+                    "error": f"Candidate '{candidate_key}' not found in {keys}",
+                    "path": bp,
+                    "mtime_local": mtime_local,
+                }
+            selected_key = candidate_key
+        else:
+            preferred = [
+                "deepgram_nova3:default",
+                "deepgram_nova3_default",
+                "deepgram_nova3",
+                keys[0],
+            ]
+            selected_key = next((k for k in preferred if k in summaries), keys[0])
+
+        rows: list[dict[str, Any]] = []
+        for k, entry in summaries.items():
+            p50 = entry.get("stable_text_p50_ms")
+            p95 = entry.get("stable_text_p95_ms")
+            n_val = entry.get("stable_text_n", entry.get("n_ok"))
+            rows.append(
+                {
+                    "key": k,
+                    "name": entry.get("name", k),
+                    "p50_ms": float(p50) if p50 is not None else None,
+                    "p95_ms": float(p95) if p95 is not None else None,
+                    "n": int(n_val) if n_val is not None else None,
+                }
+            )
+        sel = summaries[selected_key]
+        p50 = sel.get("stable_text_p50_ms")
+        p95 = sel.get("stable_text_p95_ms")
+        if p95 is None:
+            return {
+                "error": f"Missing stable_text_p95_ms for candidate '{selected_key}'",
+                "path": bp,
+                "mtime_local": mtime_local,
+            }
+        return {
+            "source": "bakeoff_json",
+            "path": bp,
+            "mtime_local": mtime_local,
+            "selected_key": selected_key,
+            "selected_name": sel.get("name", selected_key),
+            "p50_ms": float(p50) if p50 is not None else 0.0,
+            "p95_ms": float(p95),
+            "n": sel.get("stable_text_n", sel.get("n_ok")),
+            "all_rows": rows,
+        }
+
+    if bakeoff_log is not None:
+        bp = Path(bakeoff_log).resolve()
+        if not bp.exists():
+            return {"error": f"Bakeoff log not found: {bp}", "path": bp}
+        st = bp.stat()
+        mtime_local = datetime.fromtimestamp(st.st_mtime).astimezone().isoformat()
+        txt = _read_text_auto(bp)
+        # Match Candidate row with Stable_P50 and Stable_P95 or Time-to-Stable-Text line
+        m_inline = re.search(
+            r"Time-to-Stable-Text\s*[:|]\s*P50=\s*([0-9.]+)ms\s*\|\s*P95=\s*([0-9.]+)ms",
+            txt,
+        )
+        if m_inline:
+            return {
+                "source": "bakeoff_log",
+                "path": bp,
+                "mtime_local": mtime_local,
+                "selected_key": candidate_key or "inline",
+                "selected_name": candidate_key or "inline",
+                "p50_ms": float(m_inline.group(1)),
+                "p95_ms": float(m_inline.group(2)),
+                "n": None,
+                "all_rows": [],
+            }
+        # Fallback: parse table rows produced by ml/eval/asr_bakeoff/run_bakeoff.py
+        table_pat = re.compile(
+            r"^(\S+(?:\s+\S+)*?)\s+\d+\s+[0-9.]+\s+[0-9.]+\s+([0-9.]+)\s+([0-9.]+)\s+[0-9.]+%",
+            re.MULTILINE,
+        )
+        matches = table_pat.findall(txt)
+        if matches:
+            chosen = None
+            if candidate_key:
+                for row in matches:
+                    if candidate_key.lower() in row[0].lower():
+                        chosen = row
+                        break
+            if chosen is None:
+                chosen = matches[0]
+            return {
+                "source": "bakeoff_log",
+                "path": bp,
+                "mtime_local": mtime_local,
+                "selected_key": candidate_key or chosen[0],
+                "selected_name": chosen[0],
+                "p50_ms": float(chosen[1]),
+                "p95_ms": float(chosen[2]),
+                "n": None,
+                "all_rows": [
+                    {
+                        "key": r[0],
+                        "name": r[0],
+                        "p50_ms": float(r[1]),
+                        "p95_ms": float(r[2]),
+                        "n": None,
+                    }
+                    for r in matches
+                ],
+            }
+        return {
+            "error": f"Could not parse Time-to-Stable-Text from bakeoff log: {bp}",
+            "path": bp,
+            "mtime_local": mtime_local,
+        }
+
+    return {}
+
+
 def check_benchmark_log(
     log_path: Path | str,
     budget_path: Path | str | None = None,
     verbose: bool = True,
+    bakeoff_json: Path | str | None = None,
+    bakeoff_log: Path | str | None = None,
+    bakeoff_candidate: str | None = None,
 ) -> bool:
     """Validate parsed metrics in a benchmark log against docs/latency/budget.yaml."""
     budget = load_budget(budget_path)
     max_own_overhead = budget.constraints.overhead.max_own_overhead_per_stage_ms
-    target_p95_finals = budget.stages["stable_trigger_text"].target_p95_ms
+    target_p95_finals = budget.stages["stable_trigger_text"].target_p95_ms or 2000
+    lane0_target_p95 = _load_lane_target_p95(budget_path, "lane_0_instant", 2000.0)
 
-    p = Path(log_path)
+    p = Path(log_path).resolve()
     if not p.exists():
         if verbose:
             print(f"[FAIL] Benchmark log not found: {p}")
         return False
 
-    raw_bytes = p.read_bytes()
-    if raw_bytes.startswith((b"\xff\xfe", b"\xfe\xff")):
-        content = raw_bytes.decode("utf-16", errors="replace")
-    else:
-        content = raw_bytes.decode("utf-8", errors="replace")
+    st = p.stat()
+    mtime_local = datetime.fromtimestamp(st.st_mtime).astimezone().isoformat()
+    mtime_utc = datetime.fromtimestamp(st.st_mtime, tz=UTC).isoformat()
+    content = _read_text_auto(p)
 
     m_svc = re.search(
         r"Service-Added Latency\s*:\s*P50=\s*([0-9.]+)ms\s*\|\s*P95=\s*([0-9.]+)ms",
@@ -112,44 +277,152 @@ def check_benchmark_log(
         r"End-to-End Latency\s*:\s*P50=\s*([0-9.]+)ms\s*\|\s*P95=\s*([0-9.]+)ms",
         content,
     )
+    m_interim = re.search(
+        r"Interim Latency\s*:\s*P50=\s*([0-9.]+)ms\s*\|\s*P95=\s*([0-9.]+)ms",
+        content,
+    )
+    m_unique = re.search(
+        r"Per-Unique-Utterance Medians\s*\(N=(\d+)[^)]*\)\s*:\s*"
+        r"E2E Latency:\s*P50=\s*([0-9.]+)ms\s*\|\s*P95=\s*([0-9.]+)ms\s*"
+        r"\[\s*95%\s*Bootstrap\s*CI:\s*([0-9.]+)ms\s*,\s*([0-9.]+)ms\s*\]",
+        content,
+        re.MULTILINE | re.DOTALL,
+    )
 
     if not m_svc:
         if verbose:
-            print("[FAIL] Could not parse 'Service-Added Latency' from benchmark log")
+            print(f"[FAIL] Could not parse 'Service-Added Latency' from {p}")
         return False
     if not m_e2e:
         if verbose:
-            print("[FAIL] Could not parse 'End-to-End Latency' from benchmark log")
+            print(f"[FAIL] Could not parse 'End-to-End Latency' from {p}")
         return False
 
     svc_p50 = float(m_svc.group(1))
     svc_p95 = float(m_svc.group(2))
     e2e_p50 = float(m_e2e.group(1))
     e2e_p95 = float(m_e2e.group(2))
+    interim_p50 = float(m_interim.group(1)) if m_interim else None
+    interim_p95 = float(m_interim.group(2)) if m_interim else None
 
     passed_svc = svc_p95 <= max_own_overhead
-    passed_finals = e2e_p95 <= target_p95_finals
-    overall = passed_svc and passed_finals
+
+    if m_unique:
+        unique_n = int(m_unique.group(1))
+        unique_p50 = float(m_unique.group(2))
+        unique_p95 = float(m_unique.group(3))
+        ci_low = float(m_unique.group(4))
+        ci_high = float(m_unique.group(5))
+        passed_unique_p95 = unique_p95 <= target_p95_finals
+        passed_unique_ci = ci_high <= target_p95_finals
+    else:
+        unique_n = 0
+        unique_p50 = 0.0
+        unique_p95 = 0.0
+        ci_low = 0.0
+        ci_high = 0.0
+        passed_unique_p95 = False
+        passed_unique_ci = False
+
+    # Lane 0: time_to_stable_text from A1 bakeoff (or inline benchmark log if present)
+    lane0_info: dict[str, Any] = {}
+    if bakeoff_json is not None or bakeoff_log is not None:
+        lane0_info = _load_bakeoff_stable_text(
+            bakeoff_json=bakeoff_json,
+            bakeoff_log=bakeoff_log,
+            candidate_key=bakeoff_candidate,
+        )
+    else:
+        m_inline_stable = re.search(
+            r"Time-to-Stable-Text(?:\s+Latency)?\s*:\s*P50=\s*([0-9.]+)ms\s*\|\s*P95=\s*([0-9.]+)ms",
+            content,
+        )
+        if m_inline_stable:
+            lane0_info = {
+                "source": "inline_log",
+                "path": p,
+                "mtime_local": mtime_local,
+                "selected_key": "inline",
+                "selected_name": "inline",
+                "p50_ms": float(m_inline_stable.group(1)),
+                "p95_ms": float(m_inline_stable.group(2)),
+                "n": None,
+                "all_rows": [],
+            }
+
+    if lane0_info:
+        passed_lane0 = False if "error" in lane0_info else lane0_info["p95_ms"] <= lane0_target_p95
+    else:
+        passed_lane0 = True  # Not requested / not supplied
+
+    overall = passed_svc and passed_unique_p95 and passed_unique_ci and passed_lane0
 
     if verbose:
-        print("=" * 80)
-        print(f" BENCHMARK LOG BUDGET VERIFICATION: {p.name}")
-        print(" [Clock Mode: ASR-receipt clock]")
-        print(" NOTE: Latencies in benchmark log measure from chunk arrival at ASR worker.")
-        print("       Budget targets are defined from client T0 (capture time on server clock).")
-        print("       Log-mode check leaves ~70ms headroom for client-to-ASR transit legs.")
-        print("=" * 80)
+        print("=" * 88)
+        print(" BENCHMARK LOG BUDGET VERIFICATION")
+        print(f" Log Path (Resolved): {p}")
+        print(f" Log LastWriteTime  : {mtime_local} (UTC: {mtime_utc})")
+        print(" [Clock Mode: ASR-receipt clock — NOT T0 client-capture clock]")
+        print(" NOTE: Benchmark log latencies measure from chunk arrival at ASR worker.")
+        print(
+            "       ASR-receipt-clock numbers are NOT T0-clock numbers (client->ASR legs omitted)."
+        )
+        print("=" * 88)
         print(
             f"Service-Added Latency P50: {svc_p50:.2f}ms | P95: {svc_p95:.2f}ms "
             f"(Ceiling: <= {max_own_overhead:.1f}ms) -> {'PASS' if passed_svc else 'FAIL'}"
         )
         print(
-            f"Finals Latency (ASR Clock) P50: {e2e_p50:.2f}ms | P95: {e2e_p95:.2f}ms "
-            f"(Ceiling: <= {target_p95_finals:.1f}ms) -> {'PASS' if passed_finals else 'FAIL'}"
+            f"Pooled Finals Latency [INFO, correlated] P50: {e2e_p50:.2f}ms | P95: {e2e_p95:.2f}ms"
         )
-        print("-" * 80)
+        if interim_p50 is not None and interim_p95 is not None:
+            print(
+                f"Interim Word Latency [INFO, ASR clock]  P50: {interim_p50:.2f}ms | "
+                f"P95: {interim_p95:.2f}ms"
+            )
+        if m_unique:
+            print(
+                f"Per-Unique-Utterance Median Finals (N={unique_n}) "
+                f"P50: {unique_p50:.2f}ms | P95: {unique_p95:.2f}ms "
+                f"(Ceiling: <= {target_p95_finals:.1f}ms) -> "
+                f"{'PASS' if passed_unique_p95 else 'FAIL'}"
+            )
+            print(
+                f"Per-Unique-Utterance P95 95% Bootstrap CI: [{ci_low:.2f}ms, {ci_high:.2f}ms] "
+                f"(Upper <= {target_p95_finals:.1f}ms) -> "
+                f"{'PASS' if passed_unique_ci else 'FAIL'}"
+            )
+        else:
+            print(
+                "[FAIL] Per-Unique-Utterance Medians and 95% Bootstrap CI not found in log "
+                "(required gate)."
+            )
+        if lane0_info:
+            if "error" in lane0_info:
+                print(f"Lane-0 Time-to-Stable-Text (A1): [FAIL] {lane0_info['error']}")
+            else:
+                print(
+                    f"Lane-0 Time-to-Stable-Text ({lane0_info['selected_name']}, "
+                    f"source={lane0_info['source']}, LastWriteTime={lane0_info['mtime_local']}): "
+                    f"P50={lane0_info['p50_ms']:.2f}ms | P95={lane0_info['p95_ms']:.2f}ms "
+                    f"(N={lane0_info.get('n')}, Lane-0 Ceiling <= {lane0_target_p95:.1f}ms) "
+                    f"-> {'PASS' if passed_lane0 else 'FAIL'}"
+                )
+                for row in lane0_info.get("all_rows") or []:
+                    if row["p95_ms"] is not None:
+                        print(
+                            f"   [A1 Candidate] {row['key']:<32} "
+                            f"Stable_P50={row['p50_ms']:.1f}ms | "
+                            f"Stable_P95={row['p95_ms']:.1f}ms | N={row['n']}"
+                        )
+        else:
+            print(
+                f"Lane-0 Time-to-Stable-Text (A1): NOT PROVIDED "
+                f"(pass --bakeoff-json/--bakeoff-log; target <= {lane0_target_p95:.1f}ms)"
+            )
+        print("-" * 88)
         print(f"OVERALL RESULT: {'PASS' if overall else 'FAIL'}")
-        print("=" * 80)
+        print("=" * 88)
 
     return overall
 
@@ -165,6 +438,7 @@ async def run_budget_check(
     budget = load_budget(budget_path)
     sim = budget.simulated
     max_own_overhead = budget.constraints.overhead.max_own_overhead_per_stage_ms
+    lane0_target_p95 = _load_lane_target_p95(budget_path, "lane_0_instant", 2000.0)
 
     tenant_id = f"bcheck_{uuid.uuid4().hex[:6]}"
     schema_name = f"tenant_{tenant_id}"
@@ -376,9 +650,11 @@ async def run_budget_check(
         "retrieval_overhead": [],
         "card_overhead": [],
         "t0_to_interim": [],
+        "t0_to_stable_text": [],
         "t0_to_final": [],
         "total_e2e": [],
     }
+    interim_history_by_utterance: dict[str, list[tuple[float, str]]] = {}
 
     target_finals = target_utterances
     pending_tasks: set[asyncio.Task] = set()
@@ -454,7 +730,15 @@ async def run_budget_check(
                             t0 = timing.get("t0_capture")
                             pub = timing.get("asr_pub")
                             if t0 and pub:
-                                stage_durations["t0_to_interim"].append(max(0.0, float(pub - t0)))
+                                lag_ms = max(0.0, float(pub - t0))
+                                stage_durations["t0_to_interim"].append(lag_ms)
+                                pl = env.get("payload") or {}
+                                uid = str(pl.get("utterance_id") or "")
+                                txt = str(pl.get("text") or "").strip().lower()
+                                if uid and txt:
+                                    interim_history_by_utterance.setdefault(uid, []).append(
+                                        (lag_ms, txt)
+                                    )
 
     consumer_task = asyncio.create_task(_event_consumer())
     interim_task = asyncio.create_task(_interim_consumer())
@@ -612,7 +896,17 @@ async def run_budget_check(
         if prov_m and asr_p:
             stage_durations["asr_service_overhead"].append(max(0.0, float(asr_p - prov_m)))
         if t0 and asr_p:
-            stage_durations["t0_to_final"].append(max(0.0, float(asr_p - t0)))
+            final_lag = max(0.0, float(asr_p - t0))
+            stage_durations["t0_to_final"].append(final_lag)
+            pl = env.get("payload") or {}
+            uid = str(pl.get("utterance_id") or "")
+            final_txt = str(pl.get("text") or "").strip().lower()
+            stable_lag = final_lag
+            for ilag, itxt in interim_history_by_utterance.get(uid, ()):
+                if itxt and final_txt and itxt == final_txt:
+                    stable_lag = min(stable_lag, ilag)
+                    break
+            stage_durations["t0_to_stable_text"].append(stable_lag)
         if t0 and ui_r:
             stage_durations["total_e2e"].append(max(0.0, float(ui_r - t0)))
 
@@ -645,7 +939,8 @@ async def run_budget_check(
         "classify_overhead": max_own_overhead,
         "retrieval_overhead": max_own_overhead,
         "card_overhead": max_own_overhead,
-        "t0_to_interim": 2000.0,
+        "t0_to_interim": lane0_target_p95,
+        "t0_to_stable_text": lane0_target_p95,
         "t0_to_final": 2000.0,
         "total_e2e": 3500.0,
     }
@@ -693,6 +988,24 @@ def main():
     )
     parser.add_argument("--redis-url", type=str, default="redis://127.0.0.1:6379/0")
     parser.add_argument("--log", type=str, default=None, help="Path to benchmark log to verify")
+    parser.add_argument(
+        "--bakeoff-json",
+        type=str,
+        default=None,
+        help="Path to A1 bakeoff JSON for Lane-0 time_to_stable_text verification",
+    )
+    parser.add_argument(
+        "--bakeoff-log",
+        type=str,
+        default=None,
+        help="Path to A1 bakeoff text log for Lane-0 time_to_stable_text verification",
+    )
+    parser.add_argument(
+        "--bakeoff-candidate",
+        type=str,
+        default=None,
+        help="Candidate key in bakeoff JSON summaries to gate for Lane-0 stable text",
+    )
     args = parser.parse_args()
 
     if args.log:
@@ -700,6 +1013,9 @@ def main():
             log_path=args.log,
             budget_path=args.budget,
             verbose=True,
+            bakeoff_json=args.bakeoff_json,
+            bakeoff_log=args.bakeoff_log,
+            bakeoff_candidate=args.bakeoff_candidate,
         )
     else:
         passed = asyncio.run(

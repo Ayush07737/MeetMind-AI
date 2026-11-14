@@ -33,7 +33,7 @@ from meetmind_gateway.keys import (
 from meetmind_gateway.persistence_check import assert_audio_redis_not_persistent
 from meetmind_schemas.events import encode_audio_frame
 
-pytestmark = [pytest.mark.integration, pytest.mark.timeout(180)]
+pytestmark = [pytest.mark.integration, pytest.mark.timeout(50)]  # 23.17s observed (~2x=46s)
 
 
 @pytest.mark.asyncio

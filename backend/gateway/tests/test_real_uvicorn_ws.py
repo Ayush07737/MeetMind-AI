@@ -9,7 +9,7 @@ from meetmind_gateway.app import create_app
 from meetmind_gateway.config import GatewaySettings
 from meetmind_schemas.events import WSCloseCode
 
-pytestmark = [pytest.mark.integration, pytest.mark.timeout(60)]
+pytestmark = [pytest.mark.integration]  # ~9.3s observed; global 30s default applies
 
 
 def get_free_port() -> int:

@@ -17,7 +17,7 @@ from conftest import ServerHarness, exchange_ws_ticket
 from meetmind_gateway.keys import audio_stream_key
 from meetmind_schemas.events import decode_audio_frame, encode_audio_frame
 
-pytestmark = [pytest.mark.integration, pytest.mark.timeout(120)]
+pytestmark = [pytest.mark.integration, pytest.mark.timeout(50)]  # 24.09s observed (~2x=48s)
 
 
 @pytest.mark.asyncio

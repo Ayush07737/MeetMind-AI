@@ -20,7 +20,7 @@ from conftest import ServerHarness, exchange_ws_ticket
 from meetmind_schemas import encode_audio_frame
 from meetmind_schemas.keys import events_stream_key, out_stream_key
 
-pytestmark = [pytest.mark.integration, pytest.mark.timeout(60)]
+pytestmark = [pytest.mark.integration, pytest.mark.timeout(40)]  # 20.22s observed (~2x=40s)
 
 
 def make_opus_chunk(seq: int, ts_ms: int) -> bytes:

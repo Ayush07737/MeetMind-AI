@@ -19,6 +19,7 @@ import websockets
 from conftest import ServerHarness, exchange_ws_ticket, make_pcm16_chunk
 from meetmind_schemas.keys import audio_stream_key
 
+# ~42-57s observed (~2x capped at 90s per A4)
 pytestmark = [pytest.mark.integration, pytest.mark.timeout(90)]
 
 

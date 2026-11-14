@@ -23,7 +23,7 @@ from meetmind_security.tenant import TenantConfig
 
 # Load environment
 load_dotenv(Path(__file__).resolve().parents[3] / ".env")
-pytestmark = [pytest.mark.integration, pytest.mark.timeout(120)]
+pytestmark = [pytest.mark.integration, pytest.mark.timeout(55)]  # 27.53s observed (~2x=55s)
 
 
 @pytest.fixture

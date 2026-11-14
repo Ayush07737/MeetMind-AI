@@ -19,7 +19,8 @@ import websockets
 from conftest import ServerHarness, exchange_ws_ticket, make_pcm16_chunk
 from meetmind_security import db
 
-pytestmark = [pytest.mark.integration, pytest.mark.timeout(180)]
+# 43.97s observed (setup+call); ~2x=88s -> capped at 90s per A4
+pytestmark = [pytest.mark.integration, pytest.mark.timeout(90)]
 
 
 async def _drain_acks(ws):
