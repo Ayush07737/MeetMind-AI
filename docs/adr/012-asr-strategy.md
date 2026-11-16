@@ -64,32 +64,54 @@ Deepgram rates reflect regular PAYG (`$0.0077/min` mono; `HTTP 403` on `/balance
 
 ---
 
-## Decision Log (Populated from 2026-11-12 Q-0d Empirical Data)
+## Decision Log (PROVISIONAL — Subject to Real-Audio Verification & Freeze Criteria)
 
-_All metrics below cite `logs/bakeoff_streaming_q0d.log` (`N_eff=150`, `3` reps) and `logs/bakeoff_async_q0d.log` (`N_eff=150`). Because synthetic corpus has `owner_verified_count=0`, decisions remain subject to validation on owner-recorded Indian-English/Hinglish meetings before GA._
+_All empirical metrics cite `logs/bakeoff_streaming_q0d.log` (`N_eff=150`, `3` reps), `logs/bakeoff_async_q0d.log` (`N_eff=150`), and `logs/region_probe_results.json` (Q-0e). Because the synthetic corpus has `owner_verified_count=0`, all decisions remain **PROVISIONAL** pending validation on real human meetings with the exact missing evidence documented below._
 
-1. **Live Default Retained — Deepgram Nova-3 (`api.in.deepgram.com`, `en-IN` baseline + `multi` evaluation track)**:
-   - **Evidence**: Nova-3 (`en-IN` `[default]` `Score=73.89`, `multi` `[default]` `Score=73.73`) is the **only** evaluated candidate passing all four operational hard gates (`G_Diar=True`, `G_RTT=True` at `+0.0 ms`, `G_Vocab=True`, `G_ZDR=True`). It delivers `StabP50 = 1325.6 ms` (`en-IN`) / `1341.6 ms` (`multi`), low retraction (`3.71%` / `3.87%`), live mono `2-spk` + native `2-ch` stereo support, and India residency (`api.in.deepgram.com`).
-   - **Action on `en-IN` vs `multi` for Hinglish**: Transliterated scoring (`indic-transliteration`, MIT) proved that **`Nova-3 (multi)` cuts overall synthetic WER from `0.414` (`en-IN`) to `0.245` (`[0.222, 0.269]`)** and **Hinglish transliterated WER from `0.5416` to `0.2830`** (with Hinglish `ID_Match = 1.000`), because `multi` transcribes Hindi words phonetically into Devanagari/Mixed script rather than distorting them into English approximations (`+9.0/100h` cost delta: `$75` vs `$66`). However, before switching the tenant language default from `en-IN` to `multi`, Q-1/real-audio testing must measure downstream entity/number extraction behavior over Mixed Devanagari+Latin vs ASCII Romanized output (note `en-IN` had lower `H_EngWER=0.2726` vs `0.5022` on Hinglish English tokens).
-   - **Aggressive Endpointing Note**: Adding `utterance_end_ms=1000, vad_events=true` reduced Nova-3 `EOT_P50` from `2434 ms` to `652 ms` (`en-IN`) with zero WER degradation (`0.414 -> 0.414`), at a small `+202 ms` `StabP50` shift (`1325.6 -> 1527.3 ms`). We keep `[default]` (`endpointing=10`) unchanged in production today until real human turn-pause telemetry confirms no premature split during code-switching pauses.
+1. **Live Lane Default: Deepgram Nova-3 (`api.in.deepgram.com`) — [PROVISIONAL]**:
+   - **Status**: PROVISIONAL Live Default behind `ASR_PROVIDER=deepgram`.
+   - **Evidence Base**: Passed all 4 hard gates (`G_Diar=True`, `G_RTT=True` at `+0.0 ms`, `G_Vocab=True`, `G_ZDR=True`). Low India RTT (`72.5 ms` P50), stable text `1325.6 ms` P50, low retraction (`3.71%`), live 2-speaker mono and 2-channel stereo.
+   - **Missing Evidence Required for Freeze**:
+     - Validation on owner-recorded real human engineering meetings (natural code-switching pauses and unprompted speaker overlap).
+     - Downstream card accuracy verification comparing `multi` (Devanagari/Latin script mix) vs `en-IN` (Romanized text) to ensure trigger classifiers handle script variance without degradation.
+   - **Endpointing Stance**: Production default remains `endpointing=10ms(default)`; aggressive tuning (`utterance_end_ms=1000`) is held in experimental lane until human conversational pause telemetry proves no mid-sentence turn splitting.
 
-2. **Candidates Not Selected for v1 Live Default (With Evidence)**:
-   - **Deepgram Flux**: Fastest `WordLag50 = 829.5 ms`, `StabP50 = 1207.8 ms` (`[default]`), and `[aggressive]` `EOT_P50 = 224.4 ms` (`Eager50 = 64.9 ms`), lowest retraction (`3.15%`). Rejected as v1 meeting default because **`G_Diar = False`** (`TurnInfo` omits mono speaker labels) and higher synthetic WER (`0.454` / `0.448`). Best reserved for future single-user push-to-talk / 2-channel mic-only modes.
-   - **Gladia Solaria-1 Live**: Rejected as v1 default — fails **`G_Diar`** (live `POST /v2/live` with `{"diarization": true}` rejected with `HTTP 400`, `request_id: "G-90f5c799"`), fails **`G_ZDR`** on self-serve (no ZDR, default training unless Enterprise), high retraction (`13.02%–14.80%`), slow stabilization (`StabP50 = 2696–2790 ms`, `StabP95 = 6.38–7.07 s`), EU/US-only (`+136.7 ms` RTT), and highest tested live cost (`$73.40/100h` mono).
-   - **AssemblyAI Universal-3.6 Pro**: Achieved the best live `ID_Match` (`0.865` / `0.861`) and lowest `NTER` (`0.130` `[aggressive]`), supporting mono speaker labels. Not selected for v1 live default due to slow word stabilization (`StabP50 = 3313.8 ms` `[default]` / `3225.0 ms` `[aggressive]`, missing Lane 0/Lane 1 targets), `+142.0 ms` India RTT delta (no India region), `G_ZDR = False` without Enterprise agreement, and **account concurrent-WebSocket quota failures (`HTTP/WS 1008 policy violation` on ~300/450 streams at concurrency `5`, vs clean `concurrency=2` probe)**.
-   - **Sarvam Saaras (`v4/v3`) & OpenAI (`gpt-live-transcribe`)**: Status **`NOT RUN`** (`Sarvam`: `HTTP 402` credits exhausted; `OpenAI`: `OPENAI_API_KEY` absent). OpenAI also carries `$1.02/hr` cost, no live speaker labels, and no India audio residency (ADR-010).
+2. **Alternative Live Candidates — [PROVISIONAL DECISIONS]**:
+   - **Smallest.ai Pulse Streaming**: [PROVISIONAL EVALUATION] Evaluated in Q-0e (`wss://api.smallest.ai/waves/v1/stt/live`, `waves-api.smallest.ai`). Co-located in Mumbai AWS (`ap-south-1`, WS upgrade `437 ms`, ping `48 ms`). Connects and returns live interims and finals. Missing evidence: multi-speaker live diarization accuracy over extended meetings and enterprise data residency guarantees.
+   - **Deepgram Flux**: [PROVISIONAL REJECTION FOR V1 MEETING DEFAULT] Fastest first-word lag (`829.5 ms`) and end-of-turn latency (`224.4 ms`), but fails `G_Diar` (omits mono speaker labels) and higher synthetic WER (`0.454`). Retained as experimental candidate for push-to-talk / single-user dictation.
+   - **Gladia Solaria-1 Live**: [PROVISIONAL REJECTION FOR V1 LIVE] Confirmed unsupported live diarization (`HTTP 400`, `property diarization should not exist`), fails self-serve ZDR, high retraction (`13.0%–14.8%`), slow stabilization (`2.7–2.8 s`), and cross-region RTT penalty.
+   - **AssemblyAI Universal-Streaming**: [PROVISIONAL REJECTION FOR V1 LIVE] Strong identifier and numeric accuracy, but slow word stabilization (`3.2–3.3 s`), lacks India hosting (`+142 ms` RTT), and suffers WebSocket concurrency rejections (`WS 1008`) on standard tier accounts.
+   - **Soniox Real-Time**: [PROVISIONAL NOT RUN — NO CREDITS] WebSocket probe authenticates, but returns `error_code: 402 (organization_balance_exhausted)`.
+   - **Sarvam Saaras**: [PROVISIONAL NOT RUN — NO CREDITS] Account credits exhausted (`HTTP 402`).
+   - **OpenAI Streaming**: [PROVISIONAL NOT RUN — MISSING KEY] `OPENAI_API_KEY` absent from environment.
 
-3. **Async Accuracy Lane Recommendation (Post-Meeting / §8 Feed, Pending Residency Review)**:
-   - On `N_eff = 150` pre-recorded evaluation (`logs/bakeoff_async_q0d.log`):
-     - **`Gladia Solaria-3 Async`** achieved the lowest overall WER (`0.262 [0.228, 0.299]`), highest `ID_Match` (`0.7429`), lowest `EER` (`0.2823`), strong `2SpkAcc` (`0.7334`), zero errors (`150/150`), and lowest cost (`$17.30/100h`).
-     - **`AssemblyAI U-3.5 Pro Async`** achieved the highest 2-speaker conversation turn assignment (`2SpkAcc = 0.7667`) and lowest `NTER` (`0.2059`) at `$28.00/100h`.
-     - **`Deepgram Nova-3 Async` (`en-IN`)** delivered the fastest turnaround (`5.13 s` P50 vs `13.1–13.7 s`) and `mip_opt_out=true` India/global ZDR compliance at `$45.60/100h` (with `H_EngWER = 0.2118`), though `en-IN` lagged on mixed Hinglish WER (`0.413`).
-   - **Architectural Action**: Wire the optional §12 / §8 **Post-Meeting Accuracy Lane** behind a tenant policy switch: tenants requiring India/ZDR compliance today use **Deepgram Nova-3 Async** (evaluate `multi` async next once real recordings arrive); US/EU non-strict-residency tenants opting into Enterprise ZDR can utilize **Gladia Solaria-3 Async** (`$17.30/100h`) or **AssemblyAI U-3.5 Pro Async** (`$28.00/100h`) to reconcile Decision Genome claims/numbers after the meeting.
+3. **Accuracy Lane Recommendation (Post-Meeting / §8 Decision Genome) — [PROVISIONAL]**:
+   - **Status**: PROVISIONAL Recommendation for post-meeting digest and graph reconciliation.
+   - **Evidence**: On synthetic pre-recorded evaluation, **Gladia Solaria-3 Async** achieved lowest WER (`0.262`) and lowest cost (`$17.30/100h`); **AssemblyAI U-3.5 Async** achieved best 2-speaker turn assignment (`0.7667`) at `$28.00/100h`; **Deepgram Nova-3 Async** delivered fastest turnaround (`5.13 s`) and verified India ZDR compliance at `$45.60/100h`.
+   - **Missing Evidence Required for Freeze**: Signed tenant enterprise agreements for GDPR/DPDP zero-data retention on Gladia/AssemblyAI before enabling them for production tenant data.
+
+---
+
+## ASR FREEZE CRITERIA (Owner Gate to Permanently Halt Provider Evaluation)
+
+To prevent ongoing benchmark churn and permanently freeze the ASR tier so development focuses exclusively on core product intelligence (§6–§22), the following explicit freeze criteria must be satisfied:
+
+1. **Owner 30-Minute Instrument Run Verified**:
+   - One valid 30-minute stats run on the owner's machine with 0 stalls, pacing error $\le 0.05\%$, zero invalidating Modern Standby overlaps (> 1.0s), and pipeline overhead P50 $\le 10\text{ ms}$, P95 $\le 25\text{ ms}$.
+2. **Worker Handover & Lossless Recycle Verified**:
+   - Automated acceptance test (`test_worker_recycle.py`) passes against real Redis and Neon, proving meetings hitting the 3,600s cap transfer to replacement workers with 0 lost chunks, 0 missing gaps, and exactly one `asr_session_summary` where `chunks_sent == chunks_acked`.
+3. **Production Configuration Frozen**:
+   - **Live Provider**: `ASR_PROVIDER=deepgram`, `model=nova-3`, `endpointing=10`, `diarize=true`, `mip_opt_out=true`.
+   - **Base URL**: Default resolved dynamically via `ASR_REGION` (`in` $\to$ `wss://api.in.deepgram.com/v1/listen`).
+   - **Identifier Recovery Engine**: Active in downstream extraction pipeline (`ml/eval/identifier_recovery/`), delivering $> 73\%$ match rate with $0.00\%$ wrong substitutions.
+4. **Permanent Freeze Trigger**:
+   - Upon owner sign-off of Q-0e report and the valid 30-minute stats confirmation, all ASR provider exploration is **OFFICIALLY FROZEN**.
+   - No further provider bake-offs, alternative adapters, or vendor feature chases will be conducted. All speech recognition code is locked except for regression fixes and dictionary/keyterm additions.
 
 ---
 
 ## Consequences
 
 - `meetmind_asr` stays on `ASR_PROVIDER=deepgram` (`Nova-3`, `api.in.deepgram.com`, `mip_opt_out=true`) with `words[]` and `stable_prefix_words` live.
-- No candidate passes `G_Acc` (`WER <= 0.15` & `ID_Match >= 0.85`) across noisy/telephony/overlapping synthetic Edge TTS speech; final production tuning (`en-IN` vs `multi` and `utterance_end_ms`) awaits **real owner-recorded engineering meetings** (`A6`).
+- Candidate-set identifier recovery (`ml/eval/identifier_recovery/`) bridges the synthetic identifier gap (+10.2% match gain, 0% wrong substitutions) without waiting for vendor model updates.
 - All external held-out quality gates (`Clause Q-C4`) remain decoupled from ASR provider selection via word-confidence uncertainty gating (`meetmind_quality.policy`).

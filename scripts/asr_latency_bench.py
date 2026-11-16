@@ -23,6 +23,7 @@ import contextlib
 import csv
 import json
 import os
+import re
 import socket
 import statistics
 import subprocess
@@ -188,10 +189,19 @@ def set_thread_execution_state(enable: bool) -> bool:
         return False
 
 
-def query_kernel_power_events(start_dt: datetime, end_dt: datetime) -> list[str]:
-    """Query Windows Kernel-Power events during run window (A4a)."""
+def query_kernel_power_events(
+    start_dt: datetime, end_dt: datetime, has_stall: bool = False
+) -> tuple[list[str], bool]:
+    """Query Windows Kernel-Power events during run window (A4a, Q-0e A1.1).
+
+    Classifies events:
+    - INVALIDATING: Modern Standby interval (506 entering to 507 exiting) overlapping run
+      by > 1.0s, or any standby transition coinciding with a stall.
+    - INFORMATIONAL: Power source change (105), session transitions (566), or sub-second shifts.
+    Returns (event_strings, is_invalidating).
+    """
     if sys.platform != "win32":
-        return []
+        return [], False
     try:
         start_str = start_dt.strftime("%Y-%m-%d %H:%M:%S")
         end_str = end_dt.strftime("%Y-%m-%d %H:%M:%S")
@@ -209,17 +219,61 @@ def query_kernel_power_events(start_dt: datetime, end_dt: datetime) -> list[str]
         )
         out = res.stdout.strip()
         if not out:
-            return []
+            return [], False
         data = json.loads(out)
         if isinstance(data, dict):
             data = [data]
-        events = []
+
+        # Parse event entries chronologically
+        parsed_entries = []
         for item in data:
+            tc_raw = str(item.get("TimeCreated", ""))
+            m = re.search(r"(\d+)", tc_raw)
+            ev_dt = datetime.fromtimestamp(int(m.group(1)) / 1000.0, tz=UTC) if m else start_dt
+            ev_id = int(item.get("Id", 0))
+            tc_raw = str(item.get("TimeCreated", ""))
+            m = re.search(r"(\d+)", tc_raw)
+            ev_dt = datetime.fromtimestamp(int(m.group(1)) / 1000.0, tz=UTC) if m else start_dt
+            ev_id = int(item.get("Id", 0))
             msg = item.get("Message", "").splitlines()[0] if item.get("Message") else ""
-            events.append(f"Event ID {item.get('Id')} ({item.get('LevelDisplayName')}): {msg}")
-        return events
+            parsed_entries.append({"dt": ev_dt, "id": ev_id, "msg": msg})
+
+        # Sort by timestamp ascending
+        parsed_entries.sort(key=lambda x: x["dt"])
+
+        # Detect 506 (enter standby) -> 507 (exit standby) intervals
+        last_506_dt: datetime | None = None
+        intervals: dict[int, float] = {}
+        for entry in parsed_entries:
+            if entry["id"] == 506:
+                last_506_dt = entry["dt"]
+            elif entry["id"] == 507 and last_506_dt is not None:
+                dur = (entry["dt"] - last_506_dt).total_seconds()
+                intervals[id(entry)] = dur
+                last_506_dt = None
+
+        events = []
+        is_invalid = False
+        start_tz = start_dt if start_dt.tzinfo else start_dt.replace(tzinfo=UTC)
+        for entry in parsed_entries:
+            ev_dt = entry["dt"] if entry["dt"].tzinfo else entry["dt"].replace(tzinfo=UTC)
+            t_rel = (ev_dt - start_tz).total_seconds()
+            dur_s = intervals.get(id(entry), 0.0)
+            ev_id = entry["id"]
+
+            if ev_id in (506, 507) and (dur_s > 1.0 or has_stall):
+                classification = "INVALIDATING"
+                is_invalid = True
+            else:
+                classification = "INFORMATIONAL"
+
+            dur_str = f" standby_interval={dur_s:.2f}s" if dur_s > 0 else ""
+            events.append(
+                f"[T+{t_rel:+6.1f}s] Event ID {ev_id} [{classification}]: {entry['msg']}{dur_str}"
+            )
+        return events, is_invalid
     except Exception:
-        return []
+        return [], False
 
 
 def run_environment_preflight(
@@ -1429,8 +1483,11 @@ async def run_benchmark(
         actual_stream_dur = time.perf_counter() - t_start
         bench_end_dt = datetime.now()
         set_thread_execution_state(False)
-        kernel_power_events = await asyncio.to_thread(
-            query_kernel_power_events, bench_start_dt, bench_end_dt
+        kernel_power_events, power_is_invalidating = await asyncio.to_thread(
+            query_kernel_power_events,
+            bench_start_dt,
+            bench_end_dt,
+            bool(stalls_recorded),
         )
 
         def _fetch_health(url: str, timeout: float) -> dict[str, Any]:
@@ -1648,8 +1705,12 @@ async def run_benchmark(
     print(f"   Negative Latency Samples:   {negative_latencies_count}")
     print(f"   Clamped Latency Samples:    {clamped_samples_count}")
     print("   Host Power Execution State: HELD (SetThreadExecutionState)")
-    p_events_str = "; ".join(kernel_power_events) if kernel_power_events else "no events"
-    print(f"   Kernel-Power Events:        {p_events_str}")
+    if kernel_power_events:
+        print("   Kernel-Power Events:")
+        for ev in kernel_power_events:
+            print(f"      {ev}")
+    else:
+        print("   Kernel-Power Events:        no events")
     print(
         "   [INDEPENDENCE DISCLOSURE]:\n"
         f"   The {minutes:.0f}-minute run replays the 5-minute fixture {fixture_loops} times.\n"
@@ -2207,6 +2268,12 @@ async def run_benchmark(
         f"   {'Interim Latency P50 (Asp.)':<26} | {'<= 500.0 ms':<14} | {obs_int:<18} | "
         f"{d_int:<10} | {str(interim_met):<6} | False (Aspirational)"
     )
+    obs_power = "INVALIDATING" if power_is_invalidating else "0 sleep stalls"
+    d_power = "+1" if power_is_invalidating else "0"
+    print(
+        f"   {'Power & Sleep Check':<26} | {'0 sleep stalls':<14} | {obs_power:<18} | "
+        f"{d_power:<10} | {str(not power_is_invalidating):<6} | True"
+    )
     print("   " + "-" * 96)
 
     gated_checks = [
@@ -2216,6 +2283,7 @@ async def run_benchmark(
         ("Stream Duration Accuracy", duration_pass),
         ("Degraded State Machine", degraded_count_pass),
         ("Client Stall Check", not has_stall),
+        ("Power & Sleep Check", not power_is_invalidating),
     ]
     if mem_gate_active:
         gated_checks.append(("Memory: Tracemalloc Growth", tm_pass))

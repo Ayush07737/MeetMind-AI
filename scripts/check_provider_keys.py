@@ -61,6 +61,20 @@ PROVIDER_KEY_SPECS: list[dict[str, Any]] = [
         "aliases": ["OPENAI_KEY"],
         "extra_env": [],
     },
+    {
+        "provider": "smallest",
+        "candidates": ["smallest_pulse", "smallest_async"],
+        "primary_env": "SMALLEST_API_KEY",
+        "aliases": ["SMALLESTAI_API_KEY"],
+        "extra_env": [],
+    },
+    {
+        "provider": "soniox",
+        "candidates": ["soniox_realtime", "soniox_async"],
+        "primary_env": "SONIOX_API_KEY",
+        "aliases": [],
+        "extra_env": [],
+    },
 ]
 
 

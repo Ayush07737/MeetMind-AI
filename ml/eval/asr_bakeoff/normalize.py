@@ -300,7 +300,17 @@ def normalize_engineering_terms(text: str) -> str:
 
     t = re.sub(ver_regex, _repl_ver, t)
 
-    # 4. Spoken identifiers (e.g. plat one zero one -> plat-101, pr four eight two -> pr-482)
+    # 4. Spoken identifiers
+    # Hyphenated digits after prefix: e.g. core 6-0-1 -> core-601, front 4-1-0 -> front-410
+    t = re.sub(
+        r"\b(" + ID_PREFIX_PAT + r")[\s-]+(\d+(?:-\d+)+)\b",
+        lambda m: f"{m.group(1)}-{m.group(2).replace('-', '')} ",
+        t,
+    )
+    # Standalone hyphenated digit sequences (e.g. 6-0-1 -> 601, 1-0-1 -> 101)
+    t = re.sub(r"\b(\d)-(\d)-(\d)\b", r"\1\2\3", t)
+
+    # Spoken identifiers with word numbers (e.g. plat one zero one -> plat-101)
     id_regex = r"\b(" + ID_PREFIX_PAT + r")\s+((?:(?:" + NUM_WORDS_PAT + r"|\d+)\s*)+)"
 
     def _repl_id(m: re.Match) -> str:
@@ -315,6 +325,36 @@ def normalize_engineering_terms(text: str) -> str:
         return f"{pfx}-" + "".join(digits) + " "
 
     t = re.sub(id_regex, _repl_id, t)
+    # Fused prefix+digits: e.g. PR482 -> pr-482, plat101 -> plat-101
+    t = re.sub(r"\b(" + ID_PREFIX_PAT + r")(\d+)\b", r"\1-\2", t)
+    # Spoken decimals: e.g. zero point one -> 0.1, 0 point 1 -> 0.1, 3 point 7 -> 3.7
+    t = re.sub(
+        r"\b((?:" + NUM_WORDS_PAT + r"|\d+))\s+point\s+((?:" + NUM_WORDS_PAT + r"|\d+))\b",
+        lambda m: (
+            f"{ALL_NUMBERS.get(m.group(1), m.group(1))}.{ALL_NUMBERS.get(m.group(2), m.group(2))}"
+        ),
+        t,
+    )
+    t = re.sub(
+        r"\bpoint\s+((?:" + NUM_WORDS_PAT + r"|\d+))\b",
+        lambda m: f"0.{ALL_NUMBERS.get(m.group(1), m.group(1))}",
+        t,
+    )
+    # Fused prefix+digits: e.g. PR482 -> pr-482, plat101 -> plat-101
+    t = re.sub(r"\b(" + ID_PREFIX_PAT + r")(\d+)\b", r"\1-\2", t)
+    # Spoken decimals: e.g. zero point one -> 0.1, 0 point 1 -> 0.1, 3 point 7 -> 3.7
+    t = re.sub(
+        r"\b((?:" + NUM_WORDS_PAT + r"|\d+))\s+point\s+((?:" + NUM_WORDS_PAT + r"|\d+))\b",
+        lambda m: (
+            f"{ALL_NUMBERS.get(m.group(1), m.group(1))}.{ALL_NUMBERS.get(m.group(2), m.group(2))}"
+        ),
+        t,
+    )
+    t = re.sub(
+        r"\bpoint\s+((?:" + NUM_WORDS_PAT + r"|\d+))\b",
+        lambda m: f"0.{ALL_NUMBERS.get(m.group(1), m.group(1))}",
+        t,
+    )
     t = re.sub(r"\b(" + ID_PREFIX_PAT + r")\s+(\d+)\b", r"\1-\2", t)
     return t
 
@@ -413,29 +453,36 @@ def extract_canonical_numbers(text: str) -> list[dict[str, Any]]:
             mult = 1.0
 
             # Look ahead for multiplier / unit
-            if i + 1 < len(tokens):
+            while i + 1 < len(tokens):
                 next_tok = tokens[i + 1]
-                if next_tok == "crore":
-                    mult = 10_000_000.0
+                if next_tok == "hundred":
+                    mult *= 100.0
+                    i += 1
+                elif next_tok == "crore":
+                    mult *= 10_000_000.0
                     i += 1
                 elif next_tok == "lakh":
-                    mult = 100_000.0
+                    mult *= 100_000.0
                     i += 1
                 elif next_tok == "thousand":
-                    mult = 1_000.0
+                    mult *= 1_000.0
                     i += 1
                 elif next_tok == "million":
-                    mult = 1_000_000.0
+                    mult *= 1_000_000.0
                     i += 1
                 elif next_tok == "billion":
-                    mult = 1_000_000_000.0
+                    mult *= 1_000_000_000.0
                     i += 1
                 elif next_tok == "percent":
                     unit = "%"
                     i += 1
+                    break
                 elif next_tok == "bps":
                     unit = "BPS"
                     i += 1
+                    break
+                else:
+                    break
 
             # Look ahead for trailing currency if not set
             if unit == "COUNT" and i + 1 < len(tokens) and tokens[i + 1] in ("inr", "usd"):
@@ -555,7 +602,7 @@ def extract_identifiers(text: str) -> list[str]:
     """Extract canonical identifiers (e.g. ['PLAT-101', 'PR-482', 'INC-409'])."""
     norm = normalize_text(text)
     matches = re.findall(
-        r"\b(" + ID_PREFIX_PAT + r")-(\d+)\b",
+        r"\b(" + ID_PREFIX_PAT + r")-?(\d+)\b",
         norm,
     )
     return [f"{pfx.upper()}-{num}" for pfx, num in matches]
