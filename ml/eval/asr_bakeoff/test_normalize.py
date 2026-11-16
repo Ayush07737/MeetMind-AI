@@ -154,3 +154,23 @@ def test_devanagari_transliteration_and_hinglish_scoring():
     assert translit_wer < raw_wer
     assert translit_wer <= 0.25
     assert eng_wer == 0.0
+
+
+def test_fused_and_hyphenated_identifiers_and_decimals():
+    # Fused prefix+number
+    assert extract_identifiers("PR482 is ready") == ["PR-482"]
+    assert extract_identifiers("Working on PLAT101 and CORE601") == ["PLAT-101", "CORE-601"]
+
+    # Hyphenated digit sequence
+    assert extract_identifiers("Item Core 6-0-1 is assigned") == ["CORE-601"]
+    assert extract_identifiers("Review front 4-1-0 today") == ["FRONT-410"]
+
+    # Decimals
+    assert "0.1 percent" in normalize_text("below zero point one percent")
+    assert "3.7" in normalize_text("upgrade to version three point seven")
+
+    # Spoken hundreds
+    nums = extract_canonical_numbers("promote to one hundred percent")
+    assert len(nums) == 1
+    assert nums[0]["canonical_value"] == 100.0
+    assert nums[0]["unit"] == "%"
