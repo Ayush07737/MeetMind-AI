@@ -45,15 +45,15 @@ ENDPOINTS_TO_PROBE: list[dict[str, str]] = [
     },
     {
         "provider": "gladia",
-        "region_label": "Europe (Default)",
+        "region_label": "Europe (eu-west param)",
         "host": "api.gladia.io",
-        "ws_url": "wss://api.gladia.io/v2/live",
+        "ws_url": "wss://api.gladia.io/v2/live?region=eu-west",
     },
     {
         "provider": "gladia",
-        "region_label": "US West (Enterprise/Unresolved)",
-        "host": "us-west.api.gladia.io",
-        "ws_url": "wss://us-west.api.gladia.io/v2/live",
+        "region_label": "US West (us-west param)",
+        "host": "api.gladia.io",
+        "ws_url": "wss://api.gladia.io/v2/live?region=us-west",
     },
     {
         "provider": "assemblyai",
@@ -164,13 +164,13 @@ async def measure_ws_upgrade(ws_url: str) -> float:
         return (time.perf_counter() - t0) * 1000.0
 
 
-def measure_ping_rtt(host: str, count: int = 3) -> tuple[float | None, float | None]:
+def measure_ping_rtt(host: str, count: int = 20) -> tuple[float | None, float | None]:
     try:
         proc = subprocess.run(
             ["ping", "-n", str(count), "-w", "1000", host],
             capture_output=True,
             text=True,
-            timeout=5.0,
+            timeout=30.0,
         )
         rtts: list[float] = []
         for line in proc.stdout.splitlines():
@@ -180,7 +180,7 @@ def measure_ping_rtt(host: str, count: int = 3) -> tuple[float | None, float | N
         if not rtts:
             return None, None
         rtts.sort()
-        p50 = rtts[len(rtts) // 2]
+        p50 = rtts[int(len(rtts) * 0.50)]
         p95 = rtts[int(len(rtts) * 0.95)] if len(rtts) > 1 else rtts[-1]
         return p50, p95
     except Exception:
@@ -215,7 +215,7 @@ async def probe_endpoint(spec: dict[str, str]) -> ProbeResult:
         ws_ms = await measure_ws_upgrade(spec["ws_url"])
         res.ws_upgrade_ms = round(ws_ms, 1)
 
-        p50, p95 = await asyncio.to_thread(measure_ping_rtt, host, 3)
+        p50, p95 = await asyncio.to_thread(measure_ping_rtt, host, 20)
         res.ping_p50_ms = p50
         res.ping_p95_ms = p95
     except Exception as exc:
@@ -240,30 +240,31 @@ def main():
     )
     args = parser.parse_args()
 
-    print("Running multi-region endpoint probes (no audio, no cost)...")
+    print("Running multi-region endpoint probes (20 ping samples, P50/P95, no audio)...")
     results = asyncio.run(run_all_probes())
 
     args.json_out.parent.mkdir(parents=True, exist_ok=True)
     with open(args.json_out, "w", encoding="utf-8") as f:
         json.dump([asdict(r) for r in results], f, indent=2)
 
-    print("\n" + "=" * 105)
-    print("ASR PROVIDER MULTI-REGION NETWORK PROBE MATRIX (Q-0e Section E1)")
-    print("=" * 105)
+    print("\n" + "=" * 115)
+    print("ASR PROVIDER MULTI-REGION NETWORK PROBE MATRIX (Q-0e Section E1, 20 Samples)")
+    print("=" * 115)
     header = (
-        f"{'PROVIDER':<12} {'REGION':<18} {'HOST':<24} "
-        f"{'GEO':<15} {'TCP_MS':>7} {'TLS_MS':>7} {'WS_UPG':>8} {'PING50':>7}"
+        f"{'PROVIDER':<12} {'REGION':<22} {'HOST':<24} "
+        f"{'GEO':<15} {'TCP_MS':>7} {'TLS_MS':>7} {'WS_UPG':>8} {'PING50':>8} {'PING95':>8}"
     )
     print(header)
-    print("-" * 105)
+    print("-" * 115)
     for r in results:
         p50_str = f"{r.ping_p50_ms:.0f}ms" if r.ping_p50_ms is not None else "N/A"
+        p95_str = f"{r.ping_p95_ms:.0f}ms" if r.ping_p95_ms is not None else "N/A"
         print(
-            f"{r.provider:<12} {r.region_label:<18} {r.host:<24} "
+            f"{r.provider:<12} {r.region_label:<22} {r.host:<24} "
             f"{r.geo_location:<15} {r.tcp_handshake_ms:>6.1f}m {r.tls_handshake_ms:>6.1f}m "
-            f"{r.ws_upgrade_ms:>7.1f}m {p50_str:>7}"
+            f"{r.ws_upgrade_ms:>7.1f}m {p50_str:>8} {p95_str:>8}"
         )
-    print("=" * 105)
+    print("=" * 115)
     print(f"Results saved to: {args.json_out}")
 
 
