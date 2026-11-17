@@ -212,7 +212,8 @@ Evaluated pre-recorded accuracy candidates on the identical `N_eff = 150` corpus
 ### 7.1 Verbatim `--help` Output (`uv run python ml/eval/asr_bakeoff/run_bakeoff.py --help`)
 
 ```text
-usage: run_bakeoff.py [-h] [--mode {streaming,async,both}]
+usage: run_bakeoff.py [-h] [--providers PROVIDERS] [--manifest MANIFEST]
+                      [--mode {streaming,async,both}]
                       [--sample-size SAMPLE_SIZE] [--reps REPS]
                       [--configs CONFIGS] [--concurrency CONCURRENCY]
                       [--seed SEED] [--dry-run] [--json-out JSON_OUT]
@@ -221,6 +222,12 @@ MeetMind AI ASR Bake-off Evaluation Runner
 
 options:
   -h, --help            show this help message and exit
+  --providers PROVIDERS
+                        Comma-separated list of candidate providers to
+                        evaluate (e.g. 'deepgram_nova3,smallest_pulse' or
+                        'deepgram,gladia,smallest'). Defaults to all keyed
+                        providers.
+  --manifest MANIFEST   Path to audio evaluation manifest JSONL
   --mode {streaming,async,both}
                         Evaluation mode: live streaming, async pre-recorded,
                         or both (default: streaming)
@@ -243,10 +250,13 @@ options:
 # Check env var presence & aliases without leaking secrets
 uv run python scripts/check_provider_keys.py 2>&1 | Tee-Object logs/check_provider_keys_q0d.log
 
-# Zero-cost preflight (keys, stratification, TLS/TCP, Gladia live diarization HTTP 400 probe)
+# Zero-cost preflight with provider selection, audio-seconds & cost estimation
 uv run python ml/eval/asr_bakeoff/run_bakeoff.py --dry-run --sample-size 150 --json-out logs/bakeoff_dry_run_q0d.json 2>&1 | Tee-Object logs/bakeoff_dry_run_q0d.log
 
-# Full interleaved streaming bake-off (Deepgram Nova-3 en-IN & multi, Flux, Gladia Solaria-1, AssemblyAI U-3.6 Pro)
+# Filtered candidate run (e.g. Smallest Pulse & Deepgram Nova-3)
+uv run python ml/eval/asr_bakeoff/run_bakeoff.py --providers smallest_pulse,deepgram_nova3 --mode streaming --sample-size 150 --reps 3 --configs default,aggressive --concurrency 8 --json-out logs/bakeoff_streaming_q0d.json 2>&1 | Tee-Object logs/bakeoff_streaming_q0d.log
+
+# Full interleaved streaming bake-off across all keyed candidates
 uv run python ml/eval/asr_bakeoff/run_bakeoff.py --mode streaming --sample-size 150 --reps 3 --configs default,aggressive --concurrency 8 --json-out logs/bakeoff_streaming_q0d.json 2>&1 | Tee-Object logs/bakeoff_streaming_q0d.log
 
 # Async accuracy-lane bake-off (Deepgram Nova-3 Async, AssemblyAI U-3.5 Pro Async, Gladia Solaria-1/3 Async)

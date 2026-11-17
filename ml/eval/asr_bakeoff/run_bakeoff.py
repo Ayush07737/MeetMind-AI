@@ -19,11 +19,13 @@ import array
 import asyncio
 import contextlib
 import json
+import math
 import os
 import random
 import re
 import socket
 import ssl
+import struct
 import sys
 import time
 import urllib.parse
@@ -87,6 +89,8 @@ PROVIDER_ENV_ALIASES: dict[str, list[str]] = {
     "deepgram": ["DEEPGRAM_API_KEY", "DG_API_KEY"],
     "gladia": ["GLADIA_API_KEY", "GLADIA_KEY"],
     "assemblyai": ["ASSEMBLYAI_API_KEY", "AAI_API_KEY"],
+    "smallest": ["SMALLEST_API_KEY", "SMALLESTAI_API_KEY"],
+    "soniox": ["SONIOX_API_KEY"],
     "sarvam": ["SARVAM_API_KEY", "SARVAM_API_SUBSCRIPTION_KEY"],
     "openai": ["OPENAI_API_KEY", "OPENAI_KEY"],
 }
@@ -244,6 +248,24 @@ VENDOR_METADATA: dict[str, dict[str, Any]] = {
         "price_2ch_usd_hr": round(2 * 0.16 * EUR_TO_USD_REF, 3),
         "pricing_note": "EUR 0.16/hr (~$0.173/hr) single EU lang only, no CS; gladia.io/pricing",
     },
+    "smallest_pulse": {
+        "name": "Smallest.ai Pulse (streaming)",
+        "region": "waves-api.smallest.ai (India ap-south-1) / api.smallest.ai",
+        "india_residency": True,
+        "live_diarization": False,
+        "custom_vocab": False,
+        "zero_retention": True,
+        "price_mono_usd_hr": 0.240,  # $0.004/min ($0.24/hr) streaming; docs.smallest.ai
+        "price_addon_diar_usd_hr": 0.0,
+        "price_addon_kt_usd_hr": 0.0,
+        "price_with_addons_usd_hr": 0.240,
+        "price_2ch_usd_hr": 0.480,
+        "price_2ch_with_addons_usd_hr": 0.480,
+        "pricing_note": (
+            "$0.004/min ($0.24/hr) streaming; diarization requires sales enablement; "
+            "docs.smallest.ai"
+        ),
+    },
 }
 
 # Streaming configuration profiles (vendor default vs official-docs aggressive endpointing)
@@ -276,7 +298,75 @@ STREAMING_CONFIG_SPECS: dict[str, dict[str, str]] = {
             "interruption_delay=0,eot_conf=0.4,speaker_labels=true"
         ),
     },
+    "smallest_pulse": {
+        "default": "model=pulse,language=en,word_timestamps=true",
+        "aggressive": ("model=pulse,language=en,word_timestamps=true,finalize_immediate=true"),
+    },
 }
+
+ALL_STREAMING_CANDIDATES = [
+    "deepgram_nova3",
+    "deepgram_nova3_multi",
+    "deepgram_flux",
+    "gladia_solaria1",
+    "assemblyai_universal",
+    "smallest_pulse",
+]
+
+CANDIDATE_KEY_MAP: dict[str, str] = {
+    "deepgram_nova3": "deepgram",
+    "deepgram_nova3_multi": "deepgram",
+    "deepgram_flux": "deepgram",
+    "gladia_solaria1": "gladia",
+    "assemblyai_universal": "assemblyai",
+    "smallest_pulse": "smallest",
+}
+
+PROVIDER_ALIAS_MAP: dict[str, list[str]] = {
+    "deepgram": ["deepgram_nova3", "deepgram_nova3_multi", "deepgram_flux"],
+    "deepgram_nova3": ["deepgram_nova3"],
+    "deepgram_nova3_multi": ["deepgram_nova3_multi"],
+    "deepgram_flux": ["deepgram_flux"],
+    "gladia": ["gladia_solaria1"],
+    "gladia_solaria1": ["gladia_solaria1"],
+    "assemblyai": ["assemblyai_universal"],
+    "assemblyai_universal": ["assemblyai_universal"],
+    "smallest": ["smallest_pulse"],
+    "smallest_pulse": ["smallest_pulse"],
+    "smallestai": ["smallest_pulse"],
+}
+
+
+def resolve_requested_candidates(providers_arg: str | None = None) -> list[str]:
+    """Resolve candidate list from --providers argument or default to all keyed providers."""
+    if not providers_arg:
+        return [
+            c
+            for c in ALL_STREAMING_CANDIDATES
+            if resolve_provider_key(CANDIDATE_KEY_MAP.get(c, c))[0] is not None
+        ]
+
+    selected: list[str] = []
+    tokens = [t.strip().lower() for t in providers_arg.split(",") if t.strip()]
+    for tok in tokens:
+        if tok in PROVIDER_ALIAS_MAP:
+            for c in PROVIDER_ALIAS_MAP[tok]:
+                if c not in selected:
+                    selected.append(c)
+        elif tok in ALL_STREAMING_CANDIDATES:
+            if tok not in selected:
+                selected.append(tok)
+        else:
+            print(
+                f"WARNING: Unknown candidate '{tok}'. Available: {ALL_STREAMING_CANDIDATES}",
+                file=sys.stderr,
+            )
+    return selected or [
+        c
+        for c in ALL_STREAMING_CANDIDATES
+        if resolve_provider_key(CANDIDATE_KEY_MAP.get(c, c))[0] is not None
+    ]
+
 
 BAKEOFF_KEYTERMS: list[str] = list(
     dict.fromkeys(
@@ -369,6 +459,31 @@ def load_pcm16_audio(wav_path: Path) -> tuple[bytes, bytes, int, float]:
             acc = -32768
         mono.append(acc)
     return mono.tobytes(), raw, nch, dur_s
+
+
+def find_last_speech_chunk_index(
+    pcm: bytes, chunk_bytes: int = 3200, rms_silence_threshold: float = 80.0
+) -> int:
+    """Find the 0-based chunk index of the last chunk containing speech audio.
+
+    Scans backward from the end of the PCM buffer. If no chunk exceeds threshold,
+    defaults to the last chunk index.
+    """
+    n_chunks = len(pcm) // chunk_bytes
+    if n_chunks <= 1:
+        return 0
+
+    for idx in range(n_chunks - 1, -1, -1):
+        chunk = pcm[idx * chunk_bytes : (idx + 1) * chunk_bytes]
+        n_samples = len(chunk) // 2
+        if n_samples == 0:
+            continue
+        samples = struct.unpack(f"<{n_samples}h", chunk)
+        sum_sq = sum(s * s for s in samples)
+        rms = math.sqrt(sum_sq / n_samples)
+        if rms >= rms_silence_threshold:
+            return idx
+    return n_chunks - 1
 
 
 def compute_interim_stability_metrics(
@@ -1174,6 +1289,153 @@ async def eval_assemblyai(
     }
 
 
+async def eval_smallest_pulse(
+    pcm: bytes,
+    keyterms: list[str],
+    config_mode: str = "default",
+    language: str = "en",
+    channels: int = 1,
+) -> dict[str, Any]:
+    """Stream audio over WebSocket to Smallest.ai Pulse STT (waves/v1/stt/live)."""
+    api_key, _ = resolve_provider_key("smallest")
+    if not api_key:
+        return {
+            "status": "NOT_RUN",
+            "error": "missing SMALLEST_API_KEY",
+            "reconnects": 0,
+        }
+
+    params = [
+        ("model", "pulse"),
+        ("language", language),
+        ("sample_rate", "16000"),
+        ("encoding", "linear16"),
+        ("word_timestamps", "true"),
+    ]
+    url = f"wss://api.smallest.ai/waves/v1/stt/live?{urllib.parse.urlencode(params)}"
+    chunk_bytes = 3200 * channels
+    finals: list[str] = []
+    partials: list[tuple[float, str]] = []
+    speakers_seen: set[int] = set()
+    channels_seen: set[int] = set()
+    first_chunk_perf: float | None = None
+    first_interim_perf: float | None = None
+    last_speech_perf: float | None = None
+    last_final_perf: float | None = None
+    error_msg: str | None = None
+    audio_dur_s = len(pcm) / float(32000 * channels)
+
+    t_conn0 = time.perf_counter()
+    try:
+        async with websockets.connect(
+            url,
+            additional_headers={"Authorization": f"Bearer {api_key}"},
+            open_timeout=20.0,
+            family=socket.AF_INET,
+        ) as ws:
+            connect_ms = (time.perf_counter() - t_conn0) * 1000.0
+            done_evt = asyncio.Event()
+            eot_evt = asyncio.Event()
+
+            async def _recv() -> None:
+                nonlocal first_interim_perf, last_final_perf, error_msg
+                try:
+                    async for msg in ws:
+                        d = json.loads(msg)
+                        if d.get("type") == "error":
+                            error_msg = (
+                                d.get("message") or d.get("error_code") or "Unknown Pulse error"
+                            )
+                            done_evt.set()
+                            break
+                        now_p = time.perf_counter()
+                        txt = (d.get("transcript") or d.get("transcription") or "").strip()
+                        is_fin = bool(d.get("is_final", False))
+                        if txt and not is_fin:
+                            partials.append((now_p, " ".join([*finals, txt]).strip()))
+                            if first_interim_perf is None:
+                                first_interim_perf = now_p
+                        if is_fin:
+                            if txt:
+                                finals.append(txt)
+                                partials.append((now_p, " ".join(finals)))
+                            last_final_perf = now_p
+                            if last_speech_perf and now_p >= last_speech_perf:
+                                eot_evt.set()
+                            for w in d.get("words", []):
+                                if "speaker" in w and w["speaker"] is not None:
+                                    with contextlib.suppress(Exception):
+                                        speakers_seen.add(int(w["speaker"]))
+                            if d.get("from_finalize") or d.get("is_last"):
+                                done_evt.set()
+                except Exception:
+                    pass
+                finally:
+                    done_evt.set()
+                    eot_evt.set()
+
+            rtask = asyncio.create_task(_recv())
+            last_speech_idx = find_last_speech_chunk_index(pcm, chunk_bytes)
+
+            for i in range(0, len(pcm), chunk_bytes):
+                chunk_idx = i // chunk_bytes
+                if first_chunk_perf is None:
+                    first_chunk_perf = time.perf_counter()
+                await ws.send(pcm[i : i + chunk_bytes])
+                if chunk_idx == last_speech_idx:
+                    last_speech_perf = time.perf_counter()
+                await asyncio.sleep(0.1)
+
+            if last_speech_perf is None:
+                last_speech_perf = time.perf_counter()
+
+            # Finalize control message flushes audio buffer and closes turn
+            await ws.send(json.dumps({"type": "finalize"}))
+            with contextlib.suppress(TimeoutError):
+                await asyncio.wait_for(done_evt.wait(), timeout=3.5)
+            rtask.cancel()
+    except Exception as exc:
+        return {
+            "status": "ERROR",
+            "error": f"{type(exc).__name__}: {exc}",
+            "reconnects": 1,
+        }
+
+    if error_msg:
+        return {
+            "status": "ERROR",
+            "error": error_msg,
+            "reconnects": 1,
+        }
+
+    transcript = " ".join(finals).strip()
+    stab = compute_interim_stability_metrics(
+        partials, transcript, first_chunk_perf, last_final_perf, audio_dur_s
+    )
+    ttfb_ms = (
+        max(0.0, (first_interim_perf - first_chunk_perf) * 1000.0)
+        if first_interim_perf and first_chunk_perf
+        else None
+    )
+    eot_ms = (
+        max(0.0, (last_final_perf - last_speech_perf) * 1000.0)
+        if last_final_perf and last_speech_perf
+        else 0.0
+    )
+    return {
+        "status": "OK",
+        "transcript": transcript,
+        "connect_ms": round(connect_ms, 2),
+        "ttfb_interim_ms": round(ttfb_ms, 2) if ttfb_ms is not None else None,
+        "end_of_turn_latency_ms": round(eot_ms, 2),
+        "speakers_detected": len(speakers_seen),
+        "speaker_labels": sorted(str(x) for x in speakers_seen),
+        "channels_detected": sorted(channels_seen),
+        "reconnects": 0,
+        "stability": stab,
+    }
+
+
 async def probe_sarvam_availability() -> tuple[str, str]:
     api_key, _ = resolve_provider_key("sarvam")
     if not api_key:
@@ -1834,8 +2096,18 @@ def _ipv4_client(timeout: float = 20.0) -> httpx.AsyncClient:
     )
 
 
-async def run_dry_run_checks(sample: list[dict[str, Any]]) -> dict[str, Any]:
-    """Validate keys, host reachability, HTTP auth & Gladia diarization=true (0 audio billed)."""
+async def run_dry_run_checks(
+    sample: list[dict[str, Any]],
+    candidates: list[str] | None = None,
+    configs: list[str] | None = None,
+    reps: int = 1,
+) -> dict[str, Any]:
+    """Validate keys, reachability, HTTP auth, provider list, audio-seconds & cost."""
+    if candidates is None:
+        candidates = resolve_requested_candidates(None)
+    if configs is None:
+        configs = ["default", "aggressive"]
+
     key_info = {p: (resolve_provider_key(p)[1] or "ABSENT") for p in PROVIDER_ENV_ALIASES}
     var_counts = dict(Counter(r["variant"] for r in sample))
     sc_counts = dict(Counter(r["scenario"] for r in sample))
@@ -1845,6 +2117,7 @@ async def run_dry_run_checks(sample: list[dict[str, Any]]) -> dict[str, Any]:
     gl_key, _ = resolve_provider_key("gladia")
     aai_key, _ = resolve_provider_key("assemblyai")
     sk_key, _ = resolve_provider_key("sarvam")
+    sm_key, _ = resolve_provider_key("smallest")
 
     auth_checks: dict[str, Any] = {}
     async with _ipv4_client(timeout=15.0) as client:
@@ -1884,6 +2157,15 @@ async def run_dry_run_checks(sample: list[dict[str, Any]]) -> dict[str, Any]:
                 auth_checks["assemblyai"] = {"transcript_list_status": r.status_code}
             except Exception as exc:
                 auth_checks["assemblyai"] = {"error": f"{type(exc).__name__}: {exc}"}
+        if sm_key:
+            try:
+                r = await client.get(
+                    "https://api.smallest.ai",
+                    headers={"Authorization": f"Bearer {sm_key}"},
+                )
+                auth_checks["smallest"] = {"status": r.status_code}
+            except Exception as exc:
+                auth_checks["smallest"] = {"error": f"{type(exc).__name__}: {exc}"}
         if sk_key:
             try:
                 r = await client.post(
@@ -1903,9 +2185,73 @@ async def run_dry_run_checks(sample: list[dict[str, Any]]) -> dict[str, Any]:
         "aai_global": await measure_endpoint_network(
             "AssemblyAI", "streaming.assemblyai.com", "", skip_ws=True
         ),
+        "smallest_in": await measure_endpoint_network(
+            "Smallest Pulse", "waves-api.smallest.ai", "", skip_ws=True
+        ),
     }
+
+    # Volume and cost estimation across sample, configs, and repetitions
+    sample_audio_s = sum(
+        (float(r.get("end_ms", 0)) - float(r.get("start_ms", 0))) / 1000.0
+        for r in sample
+        if float(r.get("end_ms", 0)) > float(r.get("start_ms", 0))
+    )
+    if sample_audio_s <= 0:
+        sample_audio_s = len(sample) * 6.5
+
+    total_audio_s_per_cand = round(sample_audio_s * len(configs) * reps, 2)
+    total_audio_hrs_per_cand = round(total_audio_s_per_cand / 3600.0, 4)
+
+    cost_breakdown: dict[str, Any] = {}
+    total_cost_usd = 0.0
+
+    for c in candidates:
+        meta = VENDOR_METADATA.get(c, {})
+        rate_hr = meta.get("price_with_addons_usd_hr", meta.get("price_mono_usd_hr", 0.0))
+        cand_cost = round(total_audio_hrs_per_cand * rate_hr, 4)
+        total_cost_usd += cand_cost
+        prov_key = CANDIDATE_KEY_MAP.get(c, c)
+        has_key, env_var = resolve_provider_key(prov_key)
+        cost_breakdown[c] = {
+            "candidate_name": meta.get("name", c),
+            "provider_key_var": env_var,
+            "has_key": bool(has_key),
+            "rate_usd_hr": rate_hr,
+            "audio_seconds": total_audio_s_per_cand,
+            "audio_hours": total_audio_hrs_per_cand,
+            "estimated_cost_usd": cand_cost,
+            "pricing_note": meta.get("pricing_note", ""),
+        }
+    total_cost_usd = round(total_cost_usd, 4)
+
+    print("\n" + "=" * 115)
+    print("ESTIMATED BAKE-OFF AUDIO VOLUME & COST (DRY RUN)")
+    print(f"Candidates ({len(candidates)}): {', '.join(candidates)}")
+    print(f"Sample Size: {len(sample)} segments | Configs: {configs} | Repetitions: {reps}")
+    print(
+        f"Audio per Candidate: {total_audio_s_per_cand:.1f}s "
+        f"({total_audio_hrs_per_cand:.3f} hrs | {total_audio_s_per_cand / 60.0:.1f} mins)"
+    )
+    print("-" * 115)
+    print(
+        f"{'Candidate':<26} {'Key Env Var':<20} {'Status':<12} "
+        f"{'Rate ($/hr)':>12} {'Audio (s)':>11} {'Est Cost ($)':>14}"
+    )
+    print("-" * 115)
+    for c, info in cost_breakdown.items():
+        status_str = "CONFIGURED" if info["has_key"] else "MISSING KEY"
+        print(
+            f"{c:<26} {str(info['provider_key_var']):<20} {status_str:<12} "
+            f"${info['rate_usd_hr']:>10.3f} {info['audio_seconds']:>10.1f}s "
+            f"${info['estimated_cost_usd']:>13.4f}"
+        )
+    print("-" * 115)
+    print(f"TOTAL ESTIMATED COST: ${total_cost_usd:.4f} USD across {len(candidates)} candidates")
+    print("=" * 115 + "\n")
+
     res = {
         "dry_run": True,
+        "providers": candidates,
         "key_vars": key_info,
         "sample_size": len(sample),
         "variant_counts": var_counts,
@@ -1914,6 +2260,16 @@ async def run_dry_run_checks(sample: list[dict[str, Any]]) -> dict[str, Any]:
         "auth_checks": auth_checks,
         "gladia_live_diarization_probe": gladia_diar,
         "network_tcp_tls": net,
+        "cost_estimation": {
+            "sample_size": len(sample),
+            "sample_unique_audio_s": round(sample_audio_s, 2),
+            "configs": configs,
+            "reps": reps,
+            "total_audio_seconds_per_candidate": total_audio_s_per_cand,
+            "total_audio_hours_per_candidate": total_audio_hrs_per_cand,
+            "total_estimated_cost_usd": total_cost_usd,
+            "breakdown": cost_breakdown,
+        },
     }
     print("DRY_RUN_DATA:", json.dumps(res, indent=2))
     return res
@@ -2095,11 +2451,16 @@ async def run_streaming_bakeoff(
     reps: int,
     configs: list[str],
     concurrency: int,
+    candidates: list[str] | None = None,
 ) -> dict[str, Any]:
     """Run interleaved live streaming bake-off across both default & aggressive configs."""
+    if candidates is None:
+        candidates = resolve_requested_candidates(None)
+
     dg_key, _ = resolve_provider_key("deepgram")
     gl_key, _ = resolve_provider_key("gladia")
     aai_key, _ = resolve_provider_key("assemblyai")
+    sm_key, _ = resolve_provider_key("smallest")
 
     net_probes: dict[str, dict[str, Any]] = {}
     if dg_key:
@@ -2140,6 +2501,13 @@ async def run_streaming_bakeoff(
             "wss://streaming.assemblyai.com/v3/ws?sample_rate=16000&speech_model=universal-3-6-pro",
             headers={"Authorization": aai_key},
         )
+    if sm_key:
+        net_probes["smallest_india"] = await measure_endpoint_network(
+            "Smallest Pulse India",
+            "waves-api.smallest.ai",
+            "wss://api.smallest.ai/waves/v1/stt/live?model=pulse",
+            headers={"Authorization": f"Bearer {sm_key}"},
+        )
 
     dg_rtt_base = net_probes.get("deepgram_in", {}).get("ping_rtt_p50_ms", 0.0)
     rtt_deltas: dict[str, float | None] = {
@@ -2156,21 +2524,19 @@ async def run_streaming_bakeoff(
             if "assemblyai_global" in net_probes
             else None
         ),
+        "smallest_pulse": (
+            round(net_probes["smallest_india"]["ping_rtt_p50_ms"] - dg_rtt_base, 2)
+            if "smallest_india" in net_probes
+            else None
+        ),
     }
 
     sarvam_status, sarvam_reason = await probe_sarvam_availability()
     _, oa_var = resolve_provider_key("openai")
     gladia_diar_http = await probe_gladia_live_diarization_param()
 
-    base_candidates = [
-        "deepgram_nova3",
-        "deepgram_nova3_multi",
-        "deepgram_flux",
-        "gladia_solaria1",
-        "assemblyai_universal",
-    ]
     results_by_entry: dict[str, list[dict[str, Any]]] = {
-        f"{c}:{cfg}": [] for cfg in configs for c in base_candidates
+        f"{c}:{cfg}": [] for cfg in configs for c in candidates
     }
 
     # Bounded semaphores keep concurrency inside vendor ceilings while staying fast
@@ -2178,12 +2544,14 @@ async def run_streaming_bakeoff(
     dg_sem = asyncio.Semaphore(max(4, concurrency * 2))
     gl_sem = asyncio.Semaphore(min(4, max(2, concurrency)))
     aai_sem = asyncio.Semaphore(min(5, max(2, concurrency)))
+    sm_sem = asyncio.Semaphore(min(5, max(2, concurrency)))
 
     print(
         f"BAKEOFF_CONFIG: corpus=synthetic_eng N_eff={len(sample)} "
         f"scenarios_covered={len({r['scenario'] for r in sample})} "
         f"variants_covered={dict(Counter(r['variant'] for r in sample))} "
-        f"configs={configs} reps={reps} total_trials_per_entry={len(sample) * reps} "
+        f"candidates={candidates} configs={configs} reps={reps} "
+        f"total_trials_per_entry={len(sample) * reps} "
         f"translit={TRANSLIT_LIBRARY}({TRANSLIT_LICENSE})",
         flush=True,
     )
@@ -2229,15 +2597,21 @@ async def run_streaming_bakeoff(
             async with aai_sem:
                 return await eval_assemblyai(pcm_mono, BAKEOFF_KEYTERMS, config_mode=cfg_mode)
 
+        async def _sm() -> dict[str, Any]:
+            async with sm_sem:
+                return await eval_smallest_pulse(pcm_mono, BAKEOFF_KEYTERMS, config_mode=cfg_mode)
+
         fn_map = {
             "deepgram_nova3": _dg1,
             "deepgram_nova3_multi": _dg2,
             "deepgram_flux": _dgf,
             "gladia_solaria1": _gl,
             "assemblyai_universal": _aai,
+            "smallest_pulse": _sm,
         }
-        rot = (rep + seg_idx) % len(base_candidates)
-        ordered = base_candidates[rot:] + base_candidates[:rot]
+        active_in_order = [c for c in candidates if c in fn_map]
+        rot = (rep + seg_idx) % len(active_in_order) if active_in_order else 0
+        ordered = active_in_order[rot:] + active_in_order[:rot]
         async with seg_sem:
             res_list = await asyncio.gather(*(fn_map[k]() for k in ordered))
 
@@ -2302,27 +2676,36 @@ async def run_streaming_bakeoff(
     else:
         pcm_stereo = pcm_s0
 
-    seq_probes = await asyncio.gather(
-        eval_deepgram_nova3(pcm_2spk_seq, BAKEOFF_KEYTERMS, language="en-IN", max_keyterms=100),
-        eval_deepgram_nova3(pcm_2spk_seq, BAKEOFF_KEYTERMS, language="multi", max_keyterms=65),
-        eval_deepgram_flux(pcm_2spk_seq, BAKEOFF_KEYTERMS),
-        eval_gladia_solaria1(pcm_2spk_seq, BAKEOFF_KEYTERMS),
-        eval_assemblyai(pcm_2spk_seq, BAKEOFF_KEYTERMS),
-    )
-    if seq_probes[4].get("status") != "OK":
-        seq_probes[4] = await eval_assemblyai(pcm_2spk_seq, BAKEOFF_KEYTERMS)
-    diar_seq_results = dict(zip(base_candidates, seq_probes, strict=True))
+    probe_fn_map = {
+        "deepgram_nova3": lambda: eval_deepgram_nova3(
+            pcm_2spk_seq, BAKEOFF_KEYTERMS, language="en-IN", max_keyterms=100
+        ),
+        "deepgram_nova3_multi": lambda: eval_deepgram_nova3(
+            pcm_2spk_seq, BAKEOFF_KEYTERMS, language="multi", max_keyterms=65
+        ),
+        "deepgram_flux": lambda: eval_deepgram_flux(pcm_2spk_seq, BAKEOFF_KEYTERMS),
+        "gladia_solaria1": lambda: eval_gladia_solaria1(pcm_2spk_seq, BAKEOFF_KEYTERMS),
+        "assemblyai_universal": lambda: eval_assemblyai(pcm_2spk_seq, BAKEOFF_KEYTERMS),
+        "smallest_pulse": lambda: eval_smallest_pulse(pcm_2spk_seq, BAKEOFF_KEYTERMS),
+    }
+    cand_with_probes = [c for c in candidates if c in probe_fn_map]
+    seq_results_raw = await asyncio.gather(*(probe_fn_map[c]() for c in cand_with_probes))
+    diar_seq_results = dict(zip(cand_with_probes, seq_results_raw, strict=True))
 
-    ovl_probes = await asyncio.gather(
-        eval_deepgram_nova3(pcm_ovl, BAKEOFF_KEYTERMS, language="en-IN", max_keyterms=100),
-        eval_deepgram_nova3(pcm_ovl, BAKEOFF_KEYTERMS, language="multi", max_keyterms=65),
-        eval_deepgram_flux(pcm_ovl, BAKEOFF_KEYTERMS),
-        eval_gladia_solaria1(pcm_ovl, BAKEOFF_KEYTERMS),
-        eval_assemblyai(pcm_ovl, BAKEOFF_KEYTERMS),
-    )
-    if ovl_probes[4].get("status") != "OK":
-        ovl_probes[4] = await eval_assemblyai(pcm_ovl, BAKEOFF_KEYTERMS)
-    diar_ovl_results = dict(zip(base_candidates, ovl_probes, strict=True))
+    ovl_fn_map = {
+        "deepgram_nova3": lambda: eval_deepgram_nova3(
+            pcm_ovl, BAKEOFF_KEYTERMS, language="en-IN", max_keyterms=100
+        ),
+        "deepgram_nova3_multi": lambda: eval_deepgram_nova3(
+            pcm_ovl, BAKEOFF_KEYTERMS, language="multi", max_keyterms=65
+        ),
+        "deepgram_flux": lambda: eval_deepgram_flux(pcm_ovl, BAKEOFF_KEYTERMS),
+        "gladia_solaria1": lambda: eval_gladia_solaria1(pcm_ovl, BAKEOFF_KEYTERMS),
+        "assemblyai_universal": lambda: eval_assemblyai(pcm_ovl, BAKEOFF_KEYTERMS),
+        "smallest_pulse": lambda: eval_smallest_pulse(pcm_ovl, BAKEOFF_KEYTERMS),
+    }
+    ovl_results_raw = await asyncio.gather(*(ovl_fn_map[c]() for c in cand_with_probes))
+    diar_ovl_results = dict(zip(cand_with_probes, ovl_results_raw, strict=True))
 
     stereo_probes = await asyncio.gather(
         eval_deepgram_nova3(pcm_stereo, BAKEOFF_KEYTERMS, language="en-IN", channels=ch_n),
@@ -2343,15 +2726,15 @@ async def run_streaming_bakeoff(
 
     summaries: dict[str, Any] = {}
     for cfg_mode in configs:
-        for c in base_candidates:
+        for c in candidates:
             ek = f"{c}:{cfg_mode}"
             summaries[ek] = summarize_candidate(
                 ek,
                 c,
                 cfg_mode,
                 results_by_entry[ek],
-                diarize_probe=diar_seq_results[c],
-                diarize_ovl_probe=diar_ovl_results[c],
+                diarize_probe=diar_seq_results.get(c, {}),
+                diarize_ovl_probe=diar_ovl_results.get(c, {}),
                 rtt_delta_ms=rtt_deltas.get(c),
             )
 
@@ -2427,9 +2810,9 @@ async def run_streaming_bakeoff(
     print("\n" + "=" * 124)
     print(f"GLADIA POST /v2/live DIARIZATION=TRUE PROBE (A1.5): {json.dumps(gladia_diar_http)}")
     print(f"STEREO 2-CH CHECK: {json.dumps(two_channel_live)}")
-    for c in base_candidates:
-        sq = diar_seq_results[c]
-        ov = diar_ovl_results[c]
+    for c in candidates:
+        sq = diar_seq_results.get(c, {})
+        ov = diar_ovl_results.get(c, {})
         sq_lbl = sq.get("speaker_labels") or ["UNSUPPORTED"]
         ov_lbl = ov.get("speaker_labels") or ["UNSUPPORTED"]
         print(
@@ -2504,29 +2887,37 @@ async def run_streaming_bakeoff(
 
 async def run_bakeoff_async(args: argparse.Namespace) -> dict[str, Any]:
     load_dotenv(REPO_ROOT / ".env", override=False)
-    if not MANIFEST_PATH.exists():
-        print(f"ERROR: Manifest not found: {MANIFEST_PATH}")
+    manifest_path = Path(args.manifest) if getattr(args, "manifest", None) else MANIFEST_PATH
+    if not manifest_path.exists():
+        print(f"ERROR: Manifest not found: {manifest_path}")
         return {"error": "manifest_not_found"}
 
-    with MANIFEST_PATH.open("r", encoding="utf-8") as f:
+    with manifest_path.open("r", encoding="utf-8") as f:
         all_records = [json.loads(line) for line in f if line.strip()]
 
     sample = select_stratified_corpus(all_records, sample_size=args.sample_size, seed=args.seed)
+    candidates = resolve_requested_candidates(getattr(args, "providers", None))
+    configs = [c.strip() for c in args.configs.split(",") if c.strip()]
 
     if args.dry_run:
-        res = await run_dry_run_checks(sample)
+        res = await run_dry_run_checks(
+            sample, candidates=candidates, configs=configs, reps=args.reps
+        )
         out_path = Path(args.json_out)
         out_path.parent.mkdir(parents=True, exist_ok=True)
         out_path.write_text(json.dumps(res, indent=2), encoding="utf-8")
         print(f"JSON_ARTIFACT_WRITTEN: {out_path}")
         return res
 
-    configs = [c.strip() for c in args.configs.split(",") if c.strip()]
     out_report: dict[str, Any] = {}
 
     if args.mode in ("streaming", "both"):
         stream_rep = await run_streaming_bakeoff(
-            sample, reps=args.reps, configs=configs, concurrency=args.concurrency
+            sample,
+            reps=args.reps,
+            configs=configs,
+            concurrency=args.concurrency,
+            candidates=candidates,
         )
         out_report = stream_rep if args.mode == "streaming" else {"streaming": stream_rep}
 
@@ -2546,6 +2937,22 @@ async def run_bakeoff_async(args: argparse.Namespace) -> dict[str, Any]:
 
 def main() -> int:
     parser = argparse.ArgumentParser(description="MeetMind AI ASR Bake-off Evaluation Runner")
+    parser.add_argument(
+        "--providers",
+        type=str,
+        default=None,
+        help=(
+            "Comma-separated list of candidate providers to evaluate "
+            "(e.g. 'deepgram_nova3,smallest_pulse' or 'deepgram,gladia,smallest'). "
+            "Defaults to all keyed providers."
+        ),
+    )
+    parser.add_argument(
+        "--manifest",
+        type=Path,
+        default=MANIFEST_PATH,
+        help="Path to audio evaluation manifest JSONL",
+    )
     parser.add_argument(
         "--mode",
         choices=["streaming", "async", "both"],
