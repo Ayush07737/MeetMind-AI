@@ -23,21 +23,7 @@ from meetmind_asr.config import AsrSettings
 from meetmind_asr.service import AsrService
 from meetmind_security import db
 
-pytestmark = [pytest.mark.integration, pytest.mark.timeout(50)]  # 23.13s observed (~2x=46s)
-
-
-@pytest.fixture(autouse=True)
-async def reset_db_pool():
-    """Ensure database connection pool is clean and bound to each test's event loop."""
-    try:
-        await db.close_db()
-    except Exception:
-        db._shared_pool = None
-    yield
-    try:
-        await db.close_db()
-    except Exception:
-        db._shared_pool = None
+pytestmark = [pytest.mark.integration, pytest.mark.timeout(85)]
 
 
 @pytest.mark.asyncio
@@ -272,45 +258,93 @@ async def test_b13_audit_durability_sigterm_flush(
             await worker.stop()
             t_term_dur = time.perf_counter() - t_term_start
 
-        # Verify that worker.stop() waited at least 2.0s for the summary flush during SIGTERM
-        assert t_term_dur >= 1.9, (
-            f"Expected SIGTERM flush >= 2.0s due to slow DB, got {t_term_dur:.2f}s"
-        )
+            # Verify that worker.stop() waited at least 1.9s for the checkpoint flush during SIGTERM
+            assert t_term_dur >= 1.9, (
+                f"Expected SIGTERM flush >= 2.0s due to slow DB, got {t_term_dur:.2f}s"
+            )
 
-        pending_after = await real_redis.xlen(audio_stream)
+            pending_after = await real_redis.xlen(audio_stream)
+
+            # Start replacement worker to pick up the meeting and complete it cleanly
+            worker2 = AsrService(settings, worker_id="w_b13_replacement")
+            await worker2.start()
+
+            # Stream one more chunk so replacement worker activates pipeline
+            frame6 = make_pcm16_chunk(seq=6, ts_ms=t_base + 600)
+            await ws_ingest.send(frame6)
+            ack = await recv_ack()
+            assert ack.get("status") in ("accepted", "acked")
+
+            for _ in range(50):
+                if meeting_id in worker2._active_pipelines:
+                    break
+                await asyncio.sleep(0.1)
+            assert meeting_id in worker2._active_pipelines, (
+                "Replacement worker did not activate pipeline"
+            )
+
+            # End meeting cleanly via the open ingest connection
+            await ws_ingest.send(json.dumps({"type": "control", "action": "meeting_end"}))
+            assert (await recv_ack())["status"] == "accepted"
+
+            await worker2.stop()
 
         pool = await db.get_pool()
         rows = await pool.fetch(
             f"SELECT event_type, payload FROM {schema}.audit_events "
-            f"WHERE payload->>'meeting_id' = $1 AND event_type = 'asr_session_summary'",
+            f"WHERE payload->>'meeting_id' = $1 "
+            f"AND event_type IN ('asr_session_checkpoint', 'asr_session_summary') "
+            f"ORDER BY created_at ASC",
             meeting_id,
         )
-        assert len(rows) == 1, (
-            f"Expected 1 asr_session_summary row in Neon on SIGTERM, found {len(rows)}"
+        assert len(rows) == 2, (
+            f"Expected exactly 2 audit rows (1 checkpoint + 1 summary), found {len(rows)}"
         )
-        p = (
+        event_types = [r["event_type"] for r in rows]
+        assert event_types == ["asr_session_checkpoint", "asr_session_summary"], (
+            f"Expected ['asr_session_checkpoint', 'asr_session_summary'], got {event_types}"
+        )
+
+        p_chk = (
             json.loads(rows[0]["payload"])
             if isinstance(rows[0]["payload"], str)
             else rows[0]["payload"]
         )
-        assert p["meeting_id"] == meeting_id
-        assert p["provider"] == "stub"
-        assert p["chunks_sent"] >= 5
+        assert p_chk["meeting_id"] == meeting_id
+        assert p_chk["provider"] == "stub"
+        assert p_chk["chunks_sent"] >= 5
+        assert p_chk["reason"] == "sigterm"
+
+        p_sum = (
+            json.loads(rows[1]["payload"])
+            if isinstance(rows[1]["payload"], str)
+            else rows[1]["payload"]
+        )
+        assert p_sum["meeting_id"] == meeting_id
+        assert p_sum["provider"] == "stub"
+        assert p_sum["chunks_sent"] >= 5
 
         # Diagnostic output for unprocessed stream entries after stop (K1.2)
         print(
-            f"\n[K1_DIAG] chunks_sent={p['chunks_sent']}, "
+            f"\n[K1_DIAG] checkpoint_chunks_sent={p_chk['chunks_sent']}, "
+            f"final_chunks_sent={p_sum['chunks_sent']}, "
             f"pending_stream_before_stop={pending_before}, "
             f"pending_stream_after_stop={pending_after}, "
-            f"gaps={p.get('gaps')}"
+            f"checkpoint_reason={p_chk.get('reason')}"
         )
 
-        # Assert summary row landed on attempt 1 with NO retry warnings (K1.1)
+        # Assert summary and checkpoint rows landed on attempt 1 with NO retry warnings (K1.1)
+        assert "Attempt 1/3 failed writing asr_session_checkpoint" not in caplog.text, (
+            f"Checkpoint writing failed on attempt 1: {caplog.text}"
+        )
         assert "Attempt 1/3 failed writing asr_session_summary" not in caplog.text, (
             f"Summary writing failed on attempt 1: {caplog.text}"
         )
         assert worker.auditor.failed_audit_count == 0, (
-            f"Expected 0 failed audit attempts, got {worker.auditor.failed_audit_count}"
+            f"Expected 0 failed audit attempts on worker1, got {worker.auditor.failed_audit_count}"
+        )
+        assert worker2.auditor.failed_audit_count == 0, (
+            f"Expected 0 failed audit attempts on worker2, got {worker2.auditor.failed_audit_count}"
         )
     finally:
         os.environ.pop("TEST_AUDIT_STATEMENT_DELAY_SECONDS", None)

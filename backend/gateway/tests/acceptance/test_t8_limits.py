@@ -66,7 +66,7 @@ async def test_t8_idle_watchdog_timeout(
     ticket = resp["ticket"]
 
     # Request short idle watchdog timeout for acceptance test
-    uri = f"{h.ws_url}/v1/meetings/{meeting_id}/stream?ticket={ticket}&idle_timeout=3.0"
+    uri = f"{h.ws_url}/v1/meetings/{meeting_id}/stream?ticket={ticket}&idle_timeout=4.0"
 
     async with websockets.connect(uri) as ws:
         # Send meeting_start (enters PENDING_CONSENT)
@@ -79,8 +79,22 @@ async def test_t8_idle_watchdog_timeout(
                 }
             )
         )
-        ack_start = json.loads(await ws.recv())
+        unsolicited_frames: list[dict] = []
+
+        async def recv_ack() -> dict:
+            while True:
+                msg_raw = await ws.recv()
+                msg = json.loads(msg_raw)
+                if msg.get("type") == "ack":
+                    return msg
+                unsolicited_frames.append(msg)
+
+        ack_start = await recv_ack()
         assert ack_start["status"] == "accepted"
+        if unsolicited_frames:
+            print(f"\n[T8_REPORT] Gateway sent unsolicited frames before ack: {unsolicited_frames}")
+        else:
+            print("\n[T8_REPORT] Gateway sends NO unsolicited frames before ack.")
 
         # Remain idle without confirming consent. Expect watchdog to fire after ~1.5s
         with pytest.raises(ConnectionClosed) as exc:
@@ -134,18 +148,23 @@ async def test_t8_pre_consent_flood_audit_rate_limiting(
         assert count == 5, f"Expected exactly 5 rate-limited audit rows, got {count}"
 
         # Verify disconnect summary audit for suppressed rejected-frame audits is written
-        summary_row = await conn.fetchrow(
-            """
-            SELECT payload
-            FROM audit_events
-            WHERE tenant_id = $1
-              AND event_type = 'rejected_frames_summary'
-              AND (payload->>'meeting_id') = $2
-            ORDER BY created_at DESC LIMIT 1
-            """,
-            tenant_id,
-            meeting_id,
-        )
+        summary_row = None
+        for _ in range(30):
+            summary_row = await conn.fetchrow(
+                """
+                SELECT payload
+                FROM audit_events
+                WHERE tenant_id = $1
+                  AND event_type = 'rejected_frames_summary'
+                  AND (payload->>'meeting_id') = $2
+                ORDER BY created_at DESC LIMIT 1
+                """,
+                tenant_id,
+                meeting_id,
+            )
+            if summary_row is not None:
+                break
+            await asyncio.sleep(0.2)
         assert summary_row is not None
         summary_payload = json.loads(summary_row["payload"])
         assert summary_payload["total_rejected"] == 25

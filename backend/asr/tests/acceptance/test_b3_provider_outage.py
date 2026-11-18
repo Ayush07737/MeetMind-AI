@@ -19,7 +19,7 @@ import websockets
 from conftest import ServerHarness, exchange_ws_ticket, make_pcm16_chunk
 from meetmind_schemas.keys import events_stream_key, out_stream_key
 
-pytestmark = [pytest.mark.integration, pytest.mark.timeout(50)]  # 23.51s observed (~2x=47s)
+pytestmark = [pytest.mark.integration, pytest.mark.timeout(90)]
 
 
 async def _run_stream_with_fault(

@@ -73,6 +73,8 @@ async def test_t11_audit_durability_fail_closed(
             "127.0.0.1",
             "--port",
             str(port_unreachable),
+            "--ws-ping-interval",
+            "0",
             "--log-level",
             "warning",
         ],
@@ -117,7 +119,7 @@ async def test_t11_audit_durability_fail_closed(
 
         # Connect and send meeting_start -> Audit write fails -> closed with 4503 AUDIT_UNAVAILABLE
         with pytest.raises(ConnectionClosed) as exc_audit:
-            async with websockets.connect(ws_uri) as ws:
+            async with websockets.connect(ws_uri, ping_interval=None) as ws:
                 await ws.send(
                     json.dumps(
                         {

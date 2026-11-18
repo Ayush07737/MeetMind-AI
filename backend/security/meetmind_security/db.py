@@ -17,7 +17,7 @@ import os
 import ssl
 import sys
 from collections.abc import AsyncIterator
-from contextlib import asynccontextmanager
+from contextlib import asynccontextmanager, suppress
 from typing import Any
 
 import asyncpg
@@ -166,7 +166,7 @@ async def verify_runtime_role_privileges(
     return current_user
 
 
-async def _create_pool_with_retry(dsn: str, max_retries: int = 3) -> asyncpg.Pool:
+async def _create_pool_with_retry(dsn: str, max_retries: int = 5) -> asyncpg.Pool:
     """Create connection pool with exponential backoff retry for Neon cold starts."""
     ssl_ctx = _create_ssl_context(dsn)
     backoff = 1.0
@@ -215,9 +215,23 @@ async def init_db(
 ) -> asyncpg.Pool:
     """Initialize the global shared connection pool using the app role DSN."""
     global _shared_pool
+    try:
+        current_loop = asyncio.get_running_loop()
+    except RuntimeError:
+        current_loop = None
+
     async with _get_pool_lock():
-        if _shared_pool is not None and not _shared_pool._closed:
+        if (
+            _shared_pool is not None
+            and not _shared_pool._closed
+            and getattr(_shared_pool, "_loop", None) is current_loop
+        ):
             return _shared_pool
+
+        if _shared_pool is not None:
+            with suppress(Exception):
+                _shared_pool.terminate()
+            _shared_pool = None
 
         connection_url = dsn or get_app_dsn()
         _shared_pool = await _create_pool_with_retry(connection_url)

@@ -229,14 +229,11 @@ def query_kernel_power_events(
         for item in data:
             tc_raw = str(item.get("TimeCreated", ""))
             m = re.search(r"(\d+)", tc_raw)
-            ev_dt = datetime.fromtimestamp(int(m.group(1)) / 1000.0, tz=UTC) if m else start_dt
-            ev_id = int(item.get("Id", 0))
-            tc_raw = str(item.get("TimeCreated", ""))
-            m = re.search(r"(\d+)", tc_raw)
-            ev_dt = datetime.fromtimestamp(int(m.group(1)) / 1000.0, tz=UTC) if m else start_dt
+            ev_dt = datetime.fromtimestamp(int(m.group(1)) / 1000.0) if m else start_dt
             ev_id = int(item.get("Id", 0))
             msg = item.get("Message", "").splitlines()[0] if item.get("Message") else ""
-            parsed_entries.append({"dt": ev_dt, "id": ev_id, "msg": msg})
+            if start_dt <= ev_dt <= end_dt:
+                parsed_entries.append({"dt": ev_dt, "id": ev_id, "msg": msg})
 
         # Sort by timestamp ascending
         parsed_entries.sort(key=lambda x: x["dt"])
@@ -254,10 +251,8 @@ def query_kernel_power_events(
 
         events = []
         is_invalid = False
-        start_tz = start_dt if start_dt.tzinfo else start_dt.replace(tzinfo=UTC)
         for entry in parsed_entries:
-            ev_dt = entry["dt"] if entry["dt"].tzinfo else entry["dt"].replace(tzinfo=UTC)
-            t_rel = (ev_dt - start_tz).total_seconds()
+            t_rel = (entry["dt"] - start_dt).total_seconds()
             dur_s = intervals.get(id(entry), 0.0)
             ev_id = entry["id"]
 
@@ -1702,8 +1697,16 @@ async def run_benchmark(
         )
         if delta_finals == 1:
             print("                               Explanation: Stream flush frame on CloseStream.")
+    interim_floor_samples = int(interim_stats.get("floor_samples", 0))
+    interim_n = int(interim_stats.get("n", 0))
+    interim_floor_ratio = float(
+        interim_stats.get("floor_ratio", interim_floor_samples / max(1, interim_n))
+    )
     print(f"   Negative Latency Samples:   {negative_latencies_count}")
     print(f"   Clamped Latency Samples:    {clamped_samples_count}")
+    print(
+        f"   Interim Floor Samples:      {interim_floor_samples} ({interim_floor_ratio * 100:.1f}%)"
+    )
     print("   Host Power Execution State: HELD (SetThreadExecutionState)")
     if kernel_power_events:
         print("   Kernel-Power Events:")
@@ -2261,12 +2264,25 @@ async def run_benchmark(
         f"{d_priv:<10} | {str(priv_pass):<6} | {str(mem_gate_active)}"
     )
 
-    interim_met = interim_p50 <= 500.0
-    obs_int = f"{interim_p50:.1f}ms (RTT={ws_rtt_p50:.0f}m)"
+    interim_floor_samples = int(interim_stats.get("floor_samples", 0))
+    interim_n = int(interim_stats.get("n", 0))
+    interim_floor_ratio = float(
+        interim_stats.get("floor_ratio", interim_floor_samples / max(1, interim_n))
+    )
+    interim_floor_withheld = interim_floor_ratio > 0.10
+
+    if interim_floor_withheld:
+        interim_met_str = "WITHHELD (>10% floor)"
+        interim_met = False
+    else:
+        interim_met = interim_p50 <= 500.0
+        interim_met_str = str(interim_met)
+
+    obs_int = f"{interim_p50:.1f}ms (RTT={ws_rtt_p50:.0f}m, floor={interim_floor_samples})"
     d_int = f"{interim_p50 - 500.0:+.1f} ms"
     print(
         f"   {'Interim Latency P50 (Asp.)':<26} | {'<= 500.0 ms':<14} | {obs_int:<18} | "
-        f"{d_int:<10} | {str(interim_met):<6} | False (Aspirational)"
+        f"{d_int:<10} | {interim_met_str:<21} | False (Aspirational)"
     )
     obs_power = "INVALIDATING" if power_is_invalidating else "0 sleep stalls"
     d_power = "+1" if power_is_invalidating else "0"
