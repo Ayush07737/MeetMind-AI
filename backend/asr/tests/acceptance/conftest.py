@@ -379,18 +379,18 @@ async def gateway_harness(
     threading.Thread(target=_drain, args=(proc.stderr,), daemon=True).start()
 
     healthy = False
-    for _ in range(150):
-        try:
-            async with httpx.AsyncClient() as client:
+    async with httpx.AsyncClient() as client:
+        for _ in range(150):
+            try:
                 res = await client.get(f"http://127.0.0.1:{port}/health", timeout=1.0)
                 if res.status_code == 200:
                     healthy = True
                     break
-        except Exception:
-            pass
-        if proc.poll() is not None:
-            raise RuntimeError(f"Gateway exited early: {proc.returncode}")
-        await asyncio.sleep(0.1)
+            except Exception:
+                pass
+            if proc.poll() is not None:
+                raise RuntimeError(f"Gateway exited early: {proc.returncode}")
+            await asyncio.sleep(0.1)
 
     assert healthy, "Gateway subprocess failed to become healthy"
 

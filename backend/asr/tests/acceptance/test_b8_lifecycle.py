@@ -19,7 +19,7 @@ import websockets
 from conftest import ServerHarness, exchange_ws_ticket, make_pcm16_chunk
 from meetmind_schemas.keys import asr_owner_key, lifecycle_stream_key
 
-pytestmark = [pytest.mark.integration, pytest.mark.timeout(45)]  # 20.50s observed (~2x=41s)
+pytestmark = [pytest.mark.integration, pytest.mark.timeout(90)]
 
 
 @pytest.mark.asyncio

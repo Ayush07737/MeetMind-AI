@@ -98,7 +98,7 @@ class AsrAuditor:
         dropped_chunks: int,
         degraded_seconds: float,
         gaps: list[dict[str, Any]] | None = None,
-        timeout: float = 15.0,
+        timeout: float = 30.0,
         retries: int = 3,
     ) -> bool:
         """Write asr_session_summary audit event synchronously with timeout and retries."""
@@ -160,6 +160,89 @@ class AsrAuditor:
             self.failed_audit_count += 1
             logger.error(
                 "Timed out after %.1fs writing synchronous asr_session_summary for %s",
+                timeout,
+                meeting_id,
+            )
+            return False
+
+    async def record_session_checkpoint_sync(
+        self,
+        tenant_id: str,
+        user_id: str,
+        meeting_id: str,
+        provider: str,
+        chunks_sent: int,
+        bytes_sent: int,
+        reconnects: int,
+        dropped_chunks: int,
+        degraded_seconds: float,
+        gaps: list[dict[str, Any]] | None = None,
+        reason: str = "sigterm",
+        timeout: float = 30.0,
+        retries: int = 3,
+    ) -> bool:
+        """Write asr_session_checkpoint audit event synchronously with timeout and retries."""
+        payload: dict[str, Any] = {
+            "meeting_id": meeting_id,
+            "provider": provider,
+            "chunks_sent": chunks_sent,
+            "bytes_sent": bytes_sent,
+            "reconnects": reconnects,
+            "dropped_chunks": dropped_chunks,
+            "degraded_seconds": round(degraded_seconds, 2),
+            "gaps": gaps or [],
+            "reason": reason,
+        }
+
+        async def _write() -> bool:
+            last_exc: Exception | None = None
+            delay = 0.5
+            for attempt in range(1, retries + 1):
+                try:
+                    await audit.write_audit_event(
+                        tenant_id=tenant_id,
+                        user_id=user_id,
+                        event_type="asr_session_checkpoint",
+                        payload=payload,
+                    )
+                    self.successful_audit_count += 1
+                    logger.info(
+                        "Synchronously recorded asr_session_checkpoint for %s "
+                        "(attempt %d/%d, reason=%s)",
+                        meeting_id,
+                        attempt,
+                        retries,
+                        reason,
+                    )
+                    return True
+                except Exception as exc:
+                    last_exc = exc
+                    self.failed_audit_count += 1
+                    logger.warning(
+                        "Attempt %d/%d failed writing asr_session_checkpoint for %s: %s",
+                        attempt,
+                        retries,
+                        meeting_id,
+                        exc,
+                        exc_info=True,
+                    )
+                    if attempt < retries:
+                        await asyncio.sleep(delay)
+                        delay *= 2
+            logger.error(
+                "All %d attempts failed writing asr_session_checkpoint for %s: %s",
+                retries,
+                meeting_id,
+                last_exc,
+            )
+            return False
+
+        try:
+            return await asyncio.wait_for(_write(), timeout=timeout)
+        except TimeoutError:
+            self.failed_audit_count += 1
+            logger.error(
+                "Timed out after %.1fs writing synchronous asr_session_checkpoint for %s",
                 timeout,
                 meeting_id,
             )

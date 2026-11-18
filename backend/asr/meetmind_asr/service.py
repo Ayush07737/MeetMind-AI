@@ -159,7 +159,11 @@ class AsrService:
             self._lease_tasks.pop(meeting_id).cancel()
         if meeting_id in self._active_pipelines:
             pipeline = self._active_pipelines.pop(meeting_id)
-            await pipeline.stop(is_ended=False)
+            await pipeline.stop(
+                is_ended=False,
+                reason="rebalance",
+                on_state_saved=lambda: self._release_lease(tenant_id, meeting_id),
+            )
             await self._release_lease(tenant_id, meeting_id)
 
     async def _run_lease_heartbeat(self, tenant_id: str, meeting_id: str) -> None:
@@ -169,6 +173,23 @@ class AsrService:
             await asyncio.sleep(interval)
             if not self._is_running or meeting_id not in self._active_pipelines:
                 break
+            end_key = f"mm:{tenant_id}:meeting_ended:{meeting_id}"
+            if await self.redis.exists(end_key):
+                logger.info(
+                    "Worker %s detected meeting end marker for %s/%s; stopping cleanly",
+                    self.worker_id,
+                    tenant_id,
+                    meeting_id,
+                )
+                pipeline = self._active_pipelines.pop(meeting_id, None)
+                if pipeline:
+                    t = asyncio.create_task(
+                        self._stop_pipeline_lifecycle(tenant_id, meeting_id, pipeline)
+                    )
+                    self._stopping_tasks.add(t)
+                    t.add_done_callback(self._stopping_tasks.discard)
+                break
+
             acquired = await self._acquire_lease(tenant_id, meeting_id)
             if not acquired:
                 logger.warning(
@@ -178,7 +199,7 @@ class AsrService:
                 )
                 pipeline = self._active_pipelines.pop(meeting_id, None)
                 if pipeline:
-                    asyncio.create_task(pipeline.stop(is_ended=False))
+                    asyncio.create_task(pipeline.stop(is_ended=False, reason="lease_lost"))
                 break
 
     async def _start_pipeline(
@@ -460,6 +481,8 @@ class AsrService:
 
         elif event in ("meeting_ended", "meeting_abandoned"):
             await self.redis.xack(LIFECYCLE_STREAM, "asr", eid_str)
+            end_key = f"mm:{tenant}:meeting_ended:{meeting_id}"
+            await self.redis.set(end_key, "1", ex=300)
 
             if meeting_id in self._active_pipelines:
                 lease_task = self._lease_tasks.pop(meeting_id, None)
@@ -497,7 +520,7 @@ class AsrService:
         # Stop active pipelines cleanly
         stop_tasks = []
         for mid, pipeline in list(self._active_pipelines.items()):
-            stop_tasks.append(pipeline.stop(is_ended=False))
+            stop_tasks.append(pipeline.stop(is_ended=False, reason="sigterm"))
             stop_tasks.append(self._release_lease(pipeline.tenant_id, mid))
         if stop_tasks:
             await asyncio.gather(*stop_tasks, return_exceptions=True)

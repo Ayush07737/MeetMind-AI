@@ -661,8 +661,8 @@ class MeetingPipeline:
             if self._provider_session_origin_wall is None:
                 self._provider_session_origin_wall = time.time()
 
-            await self.provider.send_audio(chunk)
             t_send = time.perf_counter()
+            await self.provider.send_audio(chunk)
             if hist_entry is not None:
                 hist_entry[5] = t_send
             self._pending_acks.append((t_send, entry_id))
@@ -1333,12 +1333,22 @@ class MeetingPipeline:
                         self._seen_interim_words_window.append(w_key)
                         self._seen_interim_words.add(w_key)
 
+                        now_perf = time.perf_counter()
                         now_w = time.time()
-                        if self._provider_session_origin_wall is None:
-                            self._provider_session_origin_wall = max(0.0, now_w - w_end_s)
-                        w_audio_end_wall = self._provider_session_origin_wall + w_end_s
-                        i_lat = max(0.1, (now_w - w_audio_end_wall) * 1000.0)
-                        self.metrics.record_interim_latency(i_lat)
+                        # Map word end timestamp to dispatched chunk send time
+                        chunk_idx = int(w_end_s * 10)  # 100ms audio chunks
+                        if 0 <= chunk_idx < len(self._sent_replay_history):
+                            t_chunk_sent = self._sent_replay_history[chunk_idx][0]
+                            raw_lat = (now_perf - t_chunk_sent) * 1000.0
+                        else:
+                            if self._provider_session_origin_wall is None:
+                                self._provider_session_origin_wall = max(0.0, now_w - w_end_s)
+                            w_audio_end_wall = self._provider_session_origin_wall + w_end_s
+                            raw_lat = (now_w - w_audio_end_wall) * 1000.0
+
+                        i_lat = max(0.1, raw_lat)
+                        is_floor = raw_lat <= 0.1001
+                        self.metrics.record_interim_latency(i_lat, is_floor=is_floor)
 
             payload = {
                 "speaker_id": spk_id,
@@ -1482,7 +1492,12 @@ class MeetingPipeline:
         with contextlib.suppress(Exception):
             await pipe.execute()
 
-    async def stop(self, is_ended: bool = True) -> None:
+    async def stop(
+        self,
+        is_ended: bool = True,
+        reason: str = "meeting_end",
+        on_state_saved: Any = None,
+    ) -> None:
         """Clean shutdown and drain audio."""
         if getattr(self, "_is_stopping", False):
             if hasattr(self, "_stop_future") and not self._stop_future.done():
@@ -1650,6 +1665,32 @@ class MeetingPipeline:
                 self.meeting_id,
                 total_sent,
             )
+
+            if on_state_saved and callable(on_state_saved):
+                with contextlib.suppress(Exception):
+                    res = on_state_saved()
+                    if asyncio.iscoroutine(res):
+                        await res
+
+            # Durable synchronous checkpoint audit row on non-final stop
+            # (e.g. SIGTERM, recycle, rebalance)
+            if self.auditor:
+                with contextlib.suppress(Exception):
+                    await self.auditor.record_session_checkpoint_sync(
+                        tenant_id=self.tenant_id,
+                        user_id="system_asr",
+                        meeting_id=self.meeting_id,
+                        provider=self.settings.asr_provider,
+                        chunks_sent=total_sent,
+                        bytes_sent=total_bytes,
+                        reconnects=total_reconn,
+                        dropped_chunks=total_dropped,
+                        degraded_seconds=total_deg,
+                        gaps=all_gaps,
+                        reason=reason,
+                        timeout=30.0,
+                        retries=3,
+                    )
         else:
             # Meeting has actually ended (is_ended=True): compute final totals including cumulative
             total_sent = self._cumulative_chunks_sent + self._chunks_sent
@@ -1693,7 +1734,7 @@ class MeetingPipeline:
                     dropped_chunks=total_dropped,
                     degraded_seconds=total_deg,
                     gaps=all_gaps,
-                    timeout=15.0,
+                    timeout=30.0,
                     retries=3,
                 )
                 with contextlib.suppress(Exception):

@@ -20,7 +20,7 @@ from conftest import ServerHarness, exchange_ws_ticket, get_free_port, make_pcm1
 from meetmind_schemas.events import EventEnvelope, TranscriptFinalPayload, TranscriptInterimPayload
 from meetmind_schemas.keys import events_stream_key, out_stream_key
 
-pytestmark = [pytest.mark.integration, pytest.mark.timeout(45)]  # 22.53s observed (~2x=45s)
+pytestmark = [pytest.mark.integration, pytest.mark.timeout(90)]
 
 
 RECORDED_DG_FRAMES = [

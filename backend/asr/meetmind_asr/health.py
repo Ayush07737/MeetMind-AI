@@ -68,6 +68,7 @@ class AsrMetrics:
     # Full counts across the entire session (untruncated by rolling deques)
     total_finals_count: int = 0
     total_interims_count: int = 0
+    interim_floor_samples_count: int = 0
     total_stage_counts: dict[str, int] = field(
         default_factory=lambda: {
             "parse": 0,
@@ -104,8 +105,10 @@ class AsrMetrics:
         if self.benchmark_mode:
             self.bench_samples["e2e"].append(latency_ms)
 
-    def record_interim_latency(self, latency_ms: float) -> None:
+    def record_interim_latency(self, latency_ms: float, is_floor: bool = False) -> None:
         self.total_interims_count += 1
+        if is_floor or latency_ms <= 0.1001:
+            self.interim_floor_samples_count += 1
         self.interim_latencies_ms.append(latency_ms)
         if self.benchmark_mode:
             self.bench_samples["interim"].append(latency_ms)
@@ -156,7 +159,10 @@ class AsrMetrics:
         return self._calc_percentiles(self.e2e_latencies_ms)
 
     def get_interim_percentiles(self) -> dict[str, Any]:
-        return self._calc_percentiles(self.interim_latencies_ms)
+        res = self._calc_percentiles(self.interim_latencies_ms)
+        res["floor_samples"] = self.interim_floor_samples_count
+        res["floor_ratio"] = round(self.interim_floor_samples_count / max(1, res["n"]), 4)
+        return res
 
     def get_provider_percentiles(self) -> dict[str, Any]:
         return self._calc_percentiles(self.provider_latencies_ms)
@@ -167,7 +173,11 @@ class AsrMetrics:
         return self._calc_percentiles(lst)
 
     def get_full_percentiles(self, metric: str) -> dict[str, Any]:
-        return self._calc_percentiles(self.bench_samples.get(metric, []))
+        res = self._calc_percentiles(self.bench_samples.get(metric, []))
+        if metric == "interim":
+            res["floor_samples"] = self.interim_floor_samples_count
+            res["floor_ratio"] = round(self.interim_floor_samples_count / max(1, res["n"]), 4)
+        return res
 
     def get_loop_lag_percentiles(self) -> dict[str, Any]:
         return self._calc_percentiles(self.loop_lag_samples_ms)
