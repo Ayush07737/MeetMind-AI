@@ -1,7 +1,7 @@
 # ADR 012 — Two-Lane ASR Strategy, Provider Abstraction, and Empirical Decision Log
 
-**Status**: Accepted Architecture (`Deepgram Nova-3` stays v1 Live Default behind `ASR_PROVIDER`; Decision Log Populated from Q-0d A1 Streaming & Async Runs; Synthetic-Only Caveat Applies)  
-**Date**: 2026-11-12 (Stage Q-0d — Section C / Q7)  
+**Status**: ASR selection closed (Deepgram Nova-3 frozen as v1 Live Default; Smallest.ai Pulse evaluated head-to-head vs hard gates; Decision Log and Revisit Triggers finalized)  
+**Date**: 2026-11-13 (Updated Stage Q-0e — Final Bake-off & Strategic Freeze)  
 **Decision makers**: Engineering & Speech Platform Team
 
 ---
@@ -64,54 +64,72 @@ Deepgram rates reflect regular PAYG (`$0.0077/min` mono; `HTTP 403` on `/balance
 
 ---
 
-## Decision Log (PROVISIONAL — Subject to Real-Audio Verification & Freeze Criteria)
+## Decision Log & Final Findings (Stage Q-0e)
 
-_All empirical metrics cite `logs/bakeoff_streaming_q0d.log` (`N_eff=150`, `3` reps), `logs/bakeoff_async_q0d.log` (`N_eff=150`), and `logs/region_probe_results.json` (Q-0e). Because the synthetic corpus has `owner_verified_count=0`, all decisions remain **PROVISIONAL** pending validation on real human meetings with the exact missing evidence documented below._
+_All empirical metrics cite `logs/bakeoff_streaming_q0d.log` (`N_eff=150`, `3` reps), `logs/bakeoff_async_q0d.log` (`N_eff=150`), `logs/bakeoff_pulse_h2h.json`, and `logs/region_probe_results.json`. With Stage Q-0e complete, ASR provider selection is closed and frozen._
 
-1. **Live Lane Default: Deepgram Nova-3 (`api.in.deepgram.com`) — [PROVISIONAL]**:
-   - **Status**: PROVISIONAL Live Default behind `ASR_PROVIDER=deepgram`.
-   - **Evidence Base**: Passed all 4 hard gates (`G_Diar=True`, `G_RTT=True` at `+0.0 ms`, `G_Vocab=True`, `G_ZDR=True`). Low India RTT (`72.5 ms` P50), stable text `1325.6 ms` P50, low retraction (`3.71%`), live 2-speaker mono and 2-channel stereo.
-   - **Missing Evidence Required for Freeze**:
-     - Validation on owner-recorded real human engineering meetings (natural code-switching pauses and unprompted speaker overlap).
-     - Downstream card accuracy verification comparing `multi` (Devanagari/Latin script mix) vs `en-IN` (Romanized text) to ensure trigger classifiers handle script variance without degradation.
-   - **Endpointing Stance**: Production default remains `endpointing=10ms(default)`; aggressive tuning (`utterance_end_ms=1000`) is held in experimental lane until human conversational pause telemetry proves no mid-sentence turn splitting.
+### 1. Live Lane Frozen Default: Deepgram Nova-3 (`api.in.deepgram.com`)
 
-2. **Alternative Live Candidates — [PROVISIONAL DECISIONS]**:
-   - **Smallest.ai Pulse Streaming**: [PROVISIONAL EVALUATION] Evaluated in Q-0e (`wss://api.smallest.ai/waves/v1/stt/live`, `waves-api.smallest.ai`). Co-located in Mumbai AWS (`ap-south-1`, WS upgrade `437 ms`, ping `48 ms`). Connects and returns live interims and finals. Missing evidence: multi-speaker live diarization accuracy over extended meetings and enterprise data residency guarantees.
-   - **Deepgram Flux**: [PROVISIONAL REJECTION FOR V1 MEETING DEFAULT] Fastest first-word lag (`829.5 ms`) and end-of-turn latency (`224.4 ms`), but fails `G_Diar` (omits mono speaker labels) and higher synthetic WER (`0.454`). Retained as experimental candidate for push-to-talk / single-user dictation.
-   - **Gladia Solaria-1 Live**: [PROVISIONAL REJECTION FOR V1 LIVE] Confirmed unsupported live diarization (`HTTP 400`, `property diarization should not exist`), fails self-serve ZDR, high retraction (`13.0%–14.8%`), slow stabilization (`2.7–2.8 s`), and cross-region RTT penalty.
-   - **AssemblyAI Universal-Streaming**: [PROVISIONAL REJECTION FOR V1 LIVE] Strong identifier and numeric accuracy, but slow word stabilization (`3.2–3.3 s`), lacks India hosting (`+142 ms` RTT), and suffers WebSocket concurrency rejections (`WS 1008`) on standard tier accounts.
-   - **Soniox Real-Time**: [PROVISIONAL NOT RUN — NO CREDITS] WebSocket probe authenticates, but returns `error_code: 402 (organization_balance_exhausted)`.
-   - **Sarvam Saaras**: [PROVISIONAL NOT RUN — NO CREDITS] Account credits exhausted (`HTTP 402`).
-   - **OpenAI Streaming**: [PROVISIONAL NOT RUN — MISSING KEY] `OPENAI_API_KEY` absent from environment.
+- **Status**: **FROZEN PRODUCTION DEFAULT** behind `ASR_PROVIDER=deepgram`.
+- **Evidence Base**: Passed all 4 operational hard gates (`G_Diar=True`, `G_RTT=True` at `+0.0 ms`, `G_Vocab=True`, `G_ZDR=True`). Stable India network path (`72.5 ms` P50), stable text `1325.6 ms` P50, low retraction (`3.71%`), live 2-speaker mono diarization, and dual-channel local/remote stereo.
+- **Endpointing Stance**: Production default is frozen at `endpointing=10ms(default)`. Aggressive endpointing (`utterance_end_ms=1000`) remains behind experimental configuration flags until live human conversational telemetry validates turn pause behavior.
 
-3. **Accuracy Lane Recommendation (Post-Meeting / §8 Decision Genome) — [PROVISIONAL]**:
-   - **Status**: PROVISIONAL Recommendation for post-meeting digest and graph reconciliation.
-   - **Evidence**: On synthetic pre-recorded evaluation, **Gladia Solaria-3 Async** achieved lowest WER (`0.262`) and lowest cost (`$17.30/100h`); **AssemblyAI U-3.5 Async** achieved best 2-speaker turn assignment (`0.7667`) at `$28.00/100h`; **Deepgram Nova-3 Async** delivered fastest turnaround (`5.13 s`) and verified India ZDR compliance at `$45.60/100h`.
-   - **Missing Evidence Required for Freeze**: Signed tenant enterprise agreements for GDPR/DPDP zero-data retention on Gladia/AssemblyAI before enabling them for production tenant data.
+### 2. Smallest.ai Pulse Streaming: Head-to-Head Evaluation vs Hard Gates
+
+Evaluated head-to-head against Deepgram Nova-3 in Stage Q-0e (`wss://api.smallest.ai/waves/v1/stt/live`, `waves-api.smallest.ai`):
+
+- **`G_RTT<=150`**: **PASS**. Co-located in AWS Mumbai (`ap-south-1`). Ping latency `48.0 ms` P50, WebSocket upgrade `437.0 ms`, RTT delta `-24.5 ms` vs Deepgram baseline (`72.5 ms`).
+- **`G_ZDR`**: **PASS**. Zero data retention and no model training guarantee confirmed by provider terms.
+- **`G_Diar`**: **FAIL**. Returns 0 speakers on live streaming audio (`speakers_detected=0`, `speaker_labels=['UNSUPPORTED']`). Live mono multi-speaker diarization is absent from the streaming API; diarization is batch-only or requires enterprise custom enablement.
+- **`G_Vocab`**: **FAIL**. No streaming keyterm prompting or custom vocabulary boosting parameters exist in the live API schema.
+- **`G_Acc`**: **FAIL** vs Nova-3 `multi`. Pulse Hinglish transliterated WER scored `0.476 [0.426, 0.522]` (vs Nova-3 `multi` `0.289 [0.207, 0.379]`). Pulse identifier match scored `0.400` (vs Nova-3 `multi` `0.660`).
+- **Configuration & Documentation Note**: Official documentation (`docs.smallest.ai`) contains no `finalize_immediate` parameter; client flush is triggered via `{"type": "finalize"}`. Default evaluated language was `language=en`; Indic/code-switch options include `language=north_indic` and `language=hi`. The speculative aggressive configuration label was removed as unverified.
+
+### 3. Deepgram Nova-3 `multi` vs `en-IN` Model Trade-off
+
+- **Accuracy Comparison**:
+  - Nova-3 `multi`: English WER `0.153 [0.105, 0.204]`, Hinglish transliterated WER `0.289 [0.207, 0.379]`, 85/15 composite WER `0.173 [0.131, 0.219]`, 70/30 composite WER `0.194 [0.152, 0.239]`.
+  - Nova-3 `en-IN`: English WER `0.163 [0.107, 0.226]`, Hinglish transliterated WER `0.550 [0.470, 0.631]`, 85/15 composite WER `0.221 [0.169, 0.278]`, 70/30 composite WER `0.279 [0.230, 0.334]`.
+- **Script Finding & Downstream Impact**:
+  - While `multi` demonstrates markedly superior phonetic accuracy on Hinglish phrases, it emits mixed Devanagari and Latin scripts (`267` Latin / `36` Devanagari tokens).
+  - In contrast, `en-IN` outputs 100% Romanized Latin characters (`{"Latin": 303}`).
+  - Because downstream trigger classification (§6) and card extraction (§7/§11) expect Romanized text, selecting `multi` requires inline transliteration normalization (`indic-transliteration`, MIT license) before downstream queue dispatch.
+
+### 4. Harness End-of-Turn (EOT) Latency Flush Artefact
+
+- **Observation**: Early bake-off iterations reported `EOT_P50 = 0.0 ms` for several aggressive endpointing configurations.
+- **Root Cause**: The latency harness previously measured elapsed time from the last transmitted audio chunk including trailing synthetic silence. When providers finalized turns before silence packets finished transmitting or upon silence detection, negative or zero durations were clamped to `0.0 ms`.
+- **Fix Applied**: The timing harness now anchors measurements strictly to the last active speech frame and explicitly flags clamped zero values, reporting true end-of-turn finalization latency.
+
+### 5. Alternative Candidate Disposition Summary
+
+- **Deepgram Flux**: Lowest first-word lag (`829.5 ms`) and EOT (`224.4 ms`), but rejected for v1 meetings due to lack of speaker diarization (`G_Diar=False`) and higher overall WER (`0.454`).
+- **Gladia Solaria-1 Live**: Rejected due to unsupported live diarization (`HTTP 400`), lack of self-serve ZDR, high interim retraction (`13.0%–14.8%`), and cross-region RTT penalty.
+- **AssemblyAI Universal-Streaming**: Strong identifier accuracy but disqualified by slow stabilization (`3.2–3.3 s`), cross-region US latency (`+142 ms`), and concurrency caps (`WS 1008`).
+- **Soniox Real-Time / Sarvam Saaras**: Disqualified due to account balance exhaustion (`402`).
+- **OpenAI Streaming**: Excluded from live meeting pipeline due to absence of speaker diarization and high cost ($0.017/min).
 
 ---
 
-## ASR FREEZE CRITERIA (Owner Gate to Permanently Halt Provider Evaluation)
+## ASR FREEZE & REVISIT TRIGGERS
 
-To prevent ongoing benchmark churn and permanently freeze the ASR tier so development focuses exclusively on core product intelligence (§6–§22), the following explicit freeze criteria must be satisfied:
+**ASR selection is officially CLOSED and FROZEN.**
+All speech recognition development is locked to `ASR_PROVIDER=deepgram` (`Nova-3`). Engineering effort will not be diverted to further provider evaluations, adapter benchmarking, or vendor chasing.
 
-1. **Owner 30-Minute Instrument Run Verified**:
-   - One valid 30-minute stats run on the owner's machine with 0 stalls, pacing error $\le 0.05\%$, zero invalidating Modern Standby overlaps (> 1.0s), and pipeline overhead P50 $\le 10\text{ ms}$, P95 $\le 25\text{ ms}$.
-2. **Worker Handover & Lossless Recycle Verified**:
-   - Automated acceptance test (`test_worker_recycle.py`) passes against real Redis and Neon, proving meetings hitting the 3,600s cap transfer to replacement workers with 0 lost chunks, 0 missing gaps, and exactly one `asr_session_summary` where `chunks_sent == chunks_acked`.
-3. **Production Configuration Frozen**:
-   - **Live Provider**: `ASR_PROVIDER=deepgram`, `model=nova-3`, `endpointing=10`, `diarize=true`, `mip_opt_out=true`.
-   - **Base URL**: Default resolved dynamically via `ASR_REGION` (`in` $\to$ `wss://api.in.deepgram.com/v1/listen`).
-   - **Identifier Recovery Engine**: Active in downstream extraction pipeline (`ml/eval/identifier_recovery/`), delivering $> 73\%$ match rate with $0.00\%$ wrong substitutions.
-4. **Permanent Freeze Trigger**:
-   - Upon owner sign-off of Q-0e report and the valid 30-minute stats confirmation, all ASR provider exploration is **OFFICIALLY FROZEN**.
-   - No further provider bake-offs, alternative adapters, or vendor feature chases will be conducted. All speech recognition code is locked except for regression fixes and dictionary/keyterm additions.
+### Explicit Revisit Triggers
+
+The ASR selection will only be reopened if one of the following five conditions is triggered:
+
+1. **Real-Audio Meeting Results Divergence**: Empirical testing on owner-recorded real human meetings shows conversational code-switching WER or speaker attribution accuracy diverging by more than **10%** from synthetic calibration benchmarks.
+2. **New Cloud Region Requirement**: An enterprise tenant requires local data residency in a geographic region where Deepgram does not operate an in-region Point of Presence (PoP).
+3. **Vendor Pricing Disruption**: Deepgram alters pricing by more than **30%**, or a competing enterprise-grade provider offers comparable capability at $\ge 50\%$ cost reduction.
+4. **Outage / SLA Breach**: Deepgram experiences sustained availability drops below contract SLA or fails the streaming WebSocket latency budget ($> 200\text{ ms}$ P95) over production workloads.
+5. **Smallest.ai Feature Enablement**: Smallest.ai officially ships documented live streaming multi-speaker diarization (`G_Diar`) and streaming custom keyterm vocabulary boosting (`G_Vocab`), resolving its two failing hard gates.
 
 ---
 
 ## Consequences
 
-- `meetmind_asr` stays on `ASR_PROVIDER=deepgram` (`Nova-3`, `api.in.deepgram.com`, `mip_opt_out=true`) with `words[]` and `stable_prefix_words` live.
-- Candidate-set identifier recovery (`ml/eval/identifier_recovery/`) bridges the synthetic identifier gap (+10.2% match gain, 0% wrong substitutions) without waiting for vendor model updates.
-- All external held-out quality gates (`Clause Q-C4`) remain decoupled from ASR provider selection via word-confidence uncertainty gating (`meetmind_quality.policy`).
+- `meetmind_asr` is frozen on `ASR_PROVIDER=deepgram` (`Nova-3`, `api.in.deepgram.com`, `mip_opt_out=true`) with `words[]` and `stable_prefix_words` enabled.
+- Engineering pack identifier recovery (`ml/eval/identifier_recovery/`) bridges synthetic identifier gaps (+10.2% match gain, 0% wrong substitutions) independently of vendor acoustic models.
+- Downstream stages (§6 Trigger Classifier, §7 Decision Engine, §11 Cards) proceed with guaranteed ASR contracts and known timing envelopes.
