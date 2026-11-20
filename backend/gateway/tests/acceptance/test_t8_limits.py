@@ -53,56 +53,71 @@ async def test_t8_oversize_frame_rejected(
         assert exc.value.rcvd.code == WSCloseCode.PROTOCOL_VIOLATION
 
 
+@pytest.mark.timeout(180)
 @pytest.mark.asyncio
 async def test_t8_idle_watchdog_timeout(
     gateway_harness: ServerHarness,
 ) -> None:
     h = gateway_harness
-    meeting_id = f"mtg_t8_idle_{uuid.uuid4().hex[:6]}"
+    all_unsolicited: list[dict] = []
 
-    token = h.jwks.mint_token(sub="user_idle", org_id=h.org_a, org_role="org:admin")
-    status, resp = await exchange_ws_ticket(h.http_url, token, meeting_id, role="ingest")
-    assert status == 200
-    ticket = resp["ticket"]
-
-    # Request short idle watchdog timeout for acceptance test
-    uri = f"{h.ws_url}/v1/meetings/{meeting_id}/stream?ticket={ticket}&idle_timeout=4.0"
-
-    async with websockets.connect(uri) as ws:
-        # Send meeting_start (enters PENDING_CONSENT)
-        await ws.send(
-            json.dumps(
-                {
-                    "type": "control",
-                    "action": "meeting_start",
-                    "adapter_type": "chrome_extension",
-                }
-            )
+    for iteration in range(1, 21):
+        meeting_id = f"mtg_t8_idle_{iteration}_{uuid.uuid4().hex[:6]}"
+        token = h.jwks.mint_token(
+            sub=f"user_idle_{iteration}", org_id=h.org_a, org_role="org:admin"
         )
-        unsolicited_frames: list[dict] = []
+        status, resp = await exchange_ws_ticket(h.http_url, token, meeting_id, role="ingest")
+        assert status == 200
+        ticket = resp["ticket"]
 
-        async def recv_ack() -> dict:
-            while True:
-                msg_raw = await ws.recv()
-                msg = json.loads(msg_raw)
-                if msg.get("type") == "ack":
-                    return msg
-                unsolicited_frames.append(msg)
+        # Request 3.0s idle watchdog timeout for robust 20-run verification across remote DB latency
+        uri = f"{h.ws_url}/v1/meetings/{meeting_id}/stream?ticket={ticket}&idle_timeout=3.0"
 
-        ack_start = await recv_ack()
-        assert ack_start["status"] == "accepted"
-        if unsolicited_frames:
-            print(f"\n[T8_REPORT] Gateway sent unsolicited frames before ack: {unsolicited_frames}")
-        else:
-            print("\n[T8_REPORT] Gateway sends NO unsolicited frames before ack.")
+        async with websockets.connect(uri) as ws:
+            # Send meeting_start (enters PENDING_CONSENT)
+            await ws.send(
+                json.dumps(
+                    {
+                        "type": "control",
+                        "action": "meeting_start",
+                        "adapter_type": "chrome_extension",
+                    }
+                )
+            )
+            unsolicited_frames: list[dict] = []
 
-        # Remain idle without confirming consent. Expect watchdog to fire after ~1.5s
-        with pytest.raises(ConnectionClosed) as exc:
-            while True:
-                await asyncio.wait_for(ws.recv(), timeout=5.0)
+            async def recv_ack(target: list[dict]) -> dict:
+                while True:
+                    msg_raw = await ws.recv()
+                    msg = json.loads(msg_raw)
+                    if msg.get("type") == "ack":
+                        return msg
+                    target.append(msg)
 
-        assert exc.value.rcvd is not None
-        assert exc.value.rcvd.code == WSCloseCode.IDLE_TIMEOUT
+            ack_start = await recv_ack(unsolicited_frames)
+            assert ack_start["status"] == "accepted"
+            frame_types = [f.get("type", "unknown") for f in unsolicited_frames]
+            print(
+                f"[T8_IDLE_RUN {iteration:02d}/20] frames_before_ack={frame_types} "
+                f"unsolicited_count={len(unsolicited_frames)}"
+            )
+            if unsolicited_frames:
+                all_unsolicited.extend(unsolicited_frames)
+
+            # Remain idle without confirming consent. Expect watchdog to fire after 3.0s
+            with pytest.raises(ConnectionClosed) as exc:
+                while True:
+                    await asyncio.wait_for(ws.recv(), timeout=6.0)
+
+            assert exc.value.rcvd is not None
+            assert exc.value.rcvd.code == WSCloseCode.IDLE_TIMEOUT
+
+        await asyncio.sleep(0.1)
+
+    if all_unsolicited:
+        print(f"\n[T8_REPORT_SUMMARY] Unsolicited frames across 20 runs: {all_unsolicited}")
+    else:
+        print("\n[T8_REPORT_SUMMARY] ZERO unsolicited frames before ack across all 20 runs.")
 
 
 @pytest.mark.asyncio

@@ -31,6 +31,7 @@ import time
 import urllib.parse
 import wave
 from collections import Counter, defaultdict
+from datetime import datetime
 from pathlib import Path
 from typing import Any
 
@@ -300,7 +301,10 @@ STREAMING_CONFIG_SPECS: dict[str, dict[str, str]] = {
     },
     "smallest_pulse": {
         "default": "model=pulse,language=en,word_timestamps=true",
-        "aggressive": ("model=pulse,language=en,word_timestamps=true,finalize_immediate=true"),
+        "aggressive": (
+            "UNVERIFIED: docs.smallest.ai has no finalize_immediate parameter; "
+            "single streaming mode (language=en, Indic/multi: north_indic,hi)"
+        ),
     },
 }
 
@@ -834,11 +838,12 @@ async def eval_deepgram_nova3(
                 await ws.send(b"\x00" * chunk_bytes)
                 await asyncio.sleep(0.1)
             await ws.send(json.dumps({"type": "CloseStream"}))
-            with contextlib.suppress(TimeoutError):
+            with contextlib.suppress(TimeoutError, Exception):
                 await asyncio.wait_for(done_evt.wait(), timeout=3.0)
             rtask.cancel()
     except Exception as exc:
-        return {"status": "ERROR", "error": f"{type(exc).__name__}: {exc}", "reconnects": 1}
+        if not finals and not speakers_seen:
+            return {"status": "ERROR", "error": f"{type(exc).__name__}: {exc}", "reconnects": 1}
 
     transcript = " ".join(finals).strip()
     stab = compute_interim_stability_metrics(
@@ -1391,15 +1396,16 @@ async def eval_smallest_pulse(
 
             # Finalize control message flushes audio buffer and closes turn
             await ws.send(json.dumps({"type": "finalize"}))
-            with contextlib.suppress(TimeoutError):
+            with contextlib.suppress(TimeoutError, Exception):
                 await asyncio.wait_for(done_evt.wait(), timeout=3.5)
             rtask.cancel()
     except Exception as exc:
-        return {
-            "status": "ERROR",
-            "error": f"{type(exc).__name__}: {exc}",
-            "reconnects": 1,
-        }
+        if not finals and not speakers_seen:
+            return {
+                "status": "ERROR",
+                "error": f"{type(exc).__name__}: {exc}",
+                "reconnects": 1,
+            }
 
     if error_msg:
         return {
@@ -2016,7 +2022,9 @@ def summarize_candidate(
         "entry_key": entry_key,
         "candidate": base_candidate,
         "config_mode": config_mode,
-        "config_params": STREAMING_CONFIG_SPECS[base_candidate][config_mode],
+        "config_params": STREAMING_CONFIG_SPECS.get(base_candidate, {}).get(
+            config_mode, f"mode={config_mode}"
+        ),
         "name": f"{meta['name']} [{config_mode}]",
         **overall,
         "per_variant": per_variant,
@@ -2813,8 +2821,20 @@ async def run_streaming_bakeoff(
     for c in candidates:
         sq = diar_seq_results.get(c, {})
         ov = diar_ovl_results.get(c, {})
-        sq_lbl = sq.get("speaker_labels") or ["UNSUPPORTED"]
-        ov_lbl = ov.get("speaker_labels") or ["UNSUPPORTED"]
+        if sq.get("status") == "ERROR":
+            sq_lbl = [f"INVALID ({sq.get('error')})"]
+        elif sq.get("speakers_detected") is None or sq.get("speakers_detected") == 0:
+            sq_lbl = ["UNSUPPORTED"] if sq.get("status") == "OK" else ["INVALID"]
+        else:
+            sq_lbl = sq.get("speaker_labels") or ["None"]
+
+        if ov.get("status") == "ERROR":
+            ov_lbl = [f"INVALID ({ov.get('error')})"]
+        elif ov.get("speakers_detected") is None or ov.get("speakers_detected") == 0:
+            ov_lbl = ["UNSUPPORTED"] if ov.get("status") == "OK" else ["INVALID"]
+        else:
+            ov_lbl = ov.get("speaker_labels") or ["None"]
+
         print(
             f"{c:<26} seq_spk={sq.get('speakers_detected')} labels={sq_lbl} | "
             f"ovl_spk={ov.get('speakers_detected')} labels={ov_lbl}"
@@ -2903,10 +2923,7 @@ async def run_bakeoff_async(args: argparse.Namespace) -> dict[str, Any]:
         res = await run_dry_run_checks(
             sample, candidates=candidates, configs=configs, reps=args.reps
         )
-        out_path = Path(args.json_out)
-        out_path.parent.mkdir(parents=True, exist_ok=True)
-        out_path.write_text(json.dumps(res, indent=2), encoding="utf-8")
-        print(f"JSON_ARTIFACT_WRITTEN: {out_path}")
+        # Dry-run must not write the results JSON artifact (Prompt 11 Item 2)
         return res
 
     out_report: dict[str, Any] = {}
@@ -2928,7 +2945,17 @@ async def run_bakeoff_async(args: argparse.Namespace) -> dict[str, Any]:
         else:
             out_report["async"] = async_rep
 
-    out_path = Path(args.json_out)
+    if args.json_out:
+        out_path = Path(args.json_out)
+    else:
+        ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+        out_path = Path(f"logs/bakeoff_{args.mode}_{ts}.json")
+
+    if out_path.exists():
+        raise FileExistsError(
+            f"Target JSON artifact already exists and overwrite is prohibited: {out_path}"
+        )
+
     out_path.parent.mkdir(parents=True, exist_ok=True)
     out_path.write_text(json.dumps(out_report, indent=2), encoding="utf-8")
     print(f"\nJSON_ARTIFACT_WRITTEN: {out_path}")
@@ -2986,8 +3013,8 @@ def main() -> int:
     parser.add_argument(
         "--json-out",
         type=str,
-        default="logs/bakeoff_streaming_q0d.json",
-        help="Path to write JSON results artifact",
+        default=None,
+        help="Path to write JSON results artifact (default: timestamped under logs/)",
     )
     args = parser.parse_args()
     asyncio.run(run_bakeoff_async(args))

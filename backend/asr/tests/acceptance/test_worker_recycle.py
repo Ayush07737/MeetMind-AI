@@ -296,8 +296,8 @@ async def test_worker_recycle_interim_latency_with_known_delay(
     total_n = interim_stats.get("n", 0)
 
     assert total_n > 0, f"Expected interim latency samples, got n={total_n}"
-    assert interim_p50 > 10.0, (
-        f"Expected interim P50 > 10.0ms (reflecting 40ms stub delay), got {interim_p50}ms"
+    assert 35.0 <= interim_p50 <= 70.0, (
+        f"Expected interim P50 in [35.0, 70.0] ms (reflecting 40ms stub delay), got {interim_p50}ms"
     )
     floor_ratio = floor_samples / max(1, total_n)
     assert floor_ratio <= 0.10, (
